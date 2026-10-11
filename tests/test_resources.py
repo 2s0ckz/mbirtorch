@@ -113,3 +113,19 @@ def test_estimate_reports_the_split_layout():
     # With almost no GPU memory, nothing fits on fewer than all 4, so one group of 4.
     estimate = mbirtorch.estimate_resources(model, gpu_model='H100', num_gpus=4, gpu_memory_gb=2.5)
     assert 'groups' not in estimate.split.note
+
+
+def test_estimate_reports_forward_and_back_projection():
+    estimate = mbirtorch.estimate_resources(_small_model('cone'), gpu_model='H100', num_gpus=2)
+    for step in (estimate.forward, estimate.back):
+        assert step.gpu_memory_gib > 0
+        assert step.time_minutes > 0
+    assert 'forward projection' in str(estimate) and 'back projection' in str(estimate)
+
+
+@pytest.mark.filterwarnings('ignore:Cone angle')
+def test_back_projection_memory_of_the_hexagonal_scan():
+    # The arrays that back_project holds on each of 4 H100 GPUs sum to 80.2 GiB before the margin.
+    model = _hexagonal_scan_model()
+    need = resources._gpu_memory_gib(model, 4, 'back', weights=False) / (1 + model.memory_check_margin)
+    assert need == pytest.approx(80.2, abs=1.0)

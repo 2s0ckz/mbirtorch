@@ -764,7 +764,7 @@ class ConeBeamModel(TomographyModel):
         sinogram = self._shard_sinogram(sinogram)
         filtered_sinogram = self.fdk_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
-        recon = self.back_project(filtered_sinogram, output_sharded=True)
+        recon = self._back_project(filtered_sinogram, output_sharded=True)
         helical_z_shifts = np.asarray(self.get_params('view_params_array'))[:, 1]
         if float(np.max(helical_z_shifts) - np.min(helical_z_shifts)) > 0:
             recon = self.helical_fdk_z_weight(recon, sinogram)

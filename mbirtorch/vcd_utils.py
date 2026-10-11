@@ -374,7 +374,7 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
         metal_mask = (np.asarray(init_recon) > metal_threshold).astype(np.float32)
         # This call chooses the GPUs before the projection copies anything to them.
         ct_model._apply_device_policy()
-        metal_mask_projected = ct_model.forward_project(metal_mask)
+        metal_mask_projected = ct_model._forward_project(metal_mask)
 
         delta_metal = (np.asarray(metal_mask_projected) > 0.0).astype(np.float32)
 

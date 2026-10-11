@@ -34,7 +34,8 @@ _DEFAULT_DRIVER_RESERVE_GIB = 2.0
 #: The time estimate is meant to be within this factor of the measured time.
 _TIME_ACCURACY_FACTOR = 1.5
 
-_STEP_NAMES = {'direct': 'direct reconstruction', 'recon': 'full reconstruction',
+_STEP_NAMES = {'forward': 'forward projection', 'back': 'back projection',
+               'direct': 'direct reconstruction', 'recon': 'full reconstruction',
                'split': 'split reconstruction'}
 
 
@@ -67,6 +68,8 @@ class _ResourceEstimate:
     direct: _StepEstimate
     recon: _StepEstimate
     split: _StepEstimate
+    forward: _StepEstimate
+    back: _StepEstimate
     speed_data: str
     notes: list
 
@@ -83,7 +86,7 @@ class _ResourceEstimate:
                      f'weights {host["weights"]:.0f}, reconstruction {host["recon"]:.0f})')
         lines.append('')
         lines.append(f'{"":30s}{"GPU memory needed":21s}{"fits":8s}time, {self.max_iterations} iterations')
-        for key in ('direct', 'recon', 'split'):
+        for key in ('forward', 'back', 'direct', 'recon', 'split'):
             step = getattr(self, key)
             memory = 'not available' if step.gpu_memory_gib is None else f'{step.gpu_memory_gib:.1f} GiB'
             fits = '?' if step.fits is None else ('yes' if step.fits else 'no')
@@ -115,7 +118,8 @@ def estimate_resources(ct_model, gpu_model='H100', num_gpus=1, gpu_memory_gb=Non
     """This function estimates the GPU memory and the compute time that a
     reconstruction needs on hardware that the user names.  The function makes estimates for
     the direct reconstruction, the full reconstruction, and the split reconstruction
-    (``recon_split_sino``).
+    (``recon_split_sino``).  It also makes estimates for one call of ``forward_project`` and
+    one call of ``back_project``.
 
     The memory estimate uses the same memory check that mbirtorch runs at the start of every
     reconstruction.  If the estimate says that a reconstruction fits, then that check passes.
@@ -133,8 +137,8 @@ def estimate_resources(ct_model, gpu_model='H100', num_gpus=1, gpu_memory_gb=Non
             to 15.
 
     Returns:
-        An estimate.  Printing it gives the report.  ``estimate.direct``, ``estimate.recon``,
-        and ``estimate.split`` each have these values:
+        An estimate.  Printing it gives the report.  ``estimate.forward``, ``estimate.back``,
+        ``estimate.direct``, ``estimate.recon``, and ``estimate.split`` each have these values:
 
         - ``gpu_memory_gib``: the memory each GPU needs, in GiB.
         - ``fits``: True if that memory fits on each GPU, False if not, and None if the GPU
@@ -183,12 +187,14 @@ def estimate_resources(ct_model, gpu_model='H100', num_gpus=1, gpu_memory_gb=Non
     direct = step(ct_model, 'direct', 1)
     recon = step(ct_model, 'recon', max_iterations)
     split = _split_estimate(ct_model, num_gpus, usable, step, max_iterations)
+    forward = step(ct_model, 'forward', 1)
+    back = step(ct_model, 'back', 1)
 
     speed_data = None if speeds is None else (
         f'the nightly runs of {speeds["source"]["date"]} on {speeds["reference_gpu"]} GPUs')
     return _ResourceEstimate(type(ct_model).__name__, sinogram_shape, recon_shape, gpu_model, num_gpus,
                             gpu_memory_gb, usable, max_iterations, host, direct, recon, split,
-                            speed_data, notes)
+                            forward, back, speed_data, notes)
 
 
 def projection_work(ct_model):
@@ -416,7 +422,7 @@ def _time_minutes(ct_model, speeds, speed_reason, gpu_model, num_gpus, workload,
     line = lines[str(count)]
     work = projection_work(ct_model)
     seconds = (line['a'] + line['b'] * work) * gpu['time_factor']
-    if workload != 'direct':
+    if workload == 'recon':
         seconds *= iterations
     notes = []
     if count != num_gpus:

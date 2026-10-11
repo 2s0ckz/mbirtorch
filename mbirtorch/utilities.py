@@ -2155,7 +2155,7 @@ def gen_demo_data(
         phantom = phantom_core
 
     print('Creating sinogram on the {} devices'.format(device_provenance))
-    sinogram_sharded = ct_model_for_generation.forward_project(phantom, output_sharded=True)
+    sinogram_sharded = ct_model_for_generation._forward_project(phantom, output_sharded=True)
     sinogram = ct_model_for_generation._gather_sinogram(sinogram_sharded)
 
     del ct_model_for_generation
@@ -2234,7 +2234,7 @@ def gen_demo_data_4d(
     sinogram = np.zeros(sinogram_shape, dtype=np.float32)
     for step in range(num_steps):
         views = step_of_view == step
-        sinogram[views] = ct_model.forward_project(phantom_4d[step])[views]
+        sinogram[views] = ct_model._forward_project(phantom_4d[step])[views]
     return phantom_4d, sinogram, params
 
 

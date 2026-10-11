@@ -1027,7 +1027,7 @@ class TomographyModel(ParameterHandler):
         """This method chooses the GPUs for the reconstruction that is about to run, and it
         returns the memory estimate for those GPUs.  It chooses the GPUs once per model, and
         again when the shapes change.  The argument ``workload`` is ``'recon'``, ``'direct'``,
-        or ``'denoise'``.
+        ``'forward'``, ``'back'``, or ``'denoise'``.
         """
         calibrating = _memory_estimate.calibration_enabled()
         # The devices are chosen for a full reconstruction.  A denoiser is the exception,
@@ -1463,7 +1463,7 @@ class TomographyModel(ParameterHandler):
         """This method returns the initial pair (error_sinogram, init_recon).  Both are scaled
         by the scale factor alpha that best fits the projection to the sinogram."""
         self.logger.info('Initializing error sinogram')
-        fwd = self.forward_project(init_recon, output_sharded=True)
+        fwd = self._forward_project(init_recon, output_sharded=True)
         if isinstance(fwd, _sharding.Shards):
             def dots_worker(i, d):
                 # The sums run over one block of views at a time, so no full array of products
@@ -1649,7 +1649,19 @@ class TomographyModel(ParameterHandler):
 
         Returns:
             The sinogram, with shape (num_views, num_det_rows, num_det_channels).
+
+        Note:
+            If the user has not chosen the devices of the model, this call chooses the GPUs
+            and checks the memory that the projection needs, as ``recon_direct`` does.
         """
+        # The GPUs are chosen before the volume is copied to the devices.
+        self._apply_device_policy(workload='forward')
+        return self._forward_project(recon, output_sharded=output_sharded)
+
+    def _forward_project(self, recon, output_sharded=False):
+        """This method performs the forward projection of :meth:`forward_project` on the
+        current devices.  It does not choose GPUs or check memory.  Code inside mbirtorch calls
+        this method."""
         recon_shape = self.get_params('recon_shape')
         recon = self._shard_recon(recon)
         indices = self.full_indices_device()
@@ -1683,7 +1695,19 @@ class TomographyModel(ParameterHandler):
         Returns:
             The back projection, with shape (num_recon_rows, num_recon_cols,
             num_recon_slices).
+
+        Note:
+            If the user has not chosen the devices of the model, this call chooses the GPUs
+            and checks the memory that the projection needs, as ``recon_direct`` does.
         """
+        # The GPUs are chosen before the sinogram is copied to the devices.
+        self._apply_device_policy(workload='back')
+        return self._back_project(sinogram, output_sharded=output_sharded)
+
+    def _back_project(self, sinogram, output_sharded=False):
+        """This method performs the back projection of :meth:`back_project` on the current
+        devices.  It does not choose GPUs or check memory.  Code inside mbirtorch calls this
+        method."""
         recon_shape = self.get_params('recon_shape')
         sinogram = self._shard_sinogram(sinogram)
         indices = self.full_indices_device()

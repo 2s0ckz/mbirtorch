@@ -251,7 +251,8 @@ class MemoryEstimateInputs:
     # ── what this call runs and what the caller supplies ────────────────────
     # The workload names the call that the plan describes.  'recon' is a full
     # reconstruction.  'direct' is a direct reconstruction alone.  'denoise' is one
-    # call of QGGMRFDenoiser.
+    # call of QGGMRFDenoiser.  'forward' and 'back' are one call of forward_project and
+    # back_project.
     workload: str = 'recon'
     weights_supplied: bool = False
     fm_hessian_supplied: bool = False
@@ -306,7 +307,8 @@ def estimate_peak_device_bytes(plan):
     The function does not query any device and does not allocate anything.  The result
     depends only on ``plan``.  ``plan.workload`` selects the steps.  The default is a full
     reconstruction.  ``'direct'`` gives the filter and one back projection.  ``'denoise'``
-    gives one call of the denoiser.
+    gives one call of the denoiser.  ``'forward'`` and ``'back'`` give one call of
+    ``forward_project`` and ``back_project``.
 
     Returns:
         MemoryEstimate: The steps and the bytes of each step on each device.
@@ -628,16 +630,21 @@ def estimate_peak_device_bytes(plan):
 
     phases = []
 
-    def back_phases(name, held_terms, num_pixels, base, base_terms):
+    def back_phases(name, held_terms, num_pixels, base, base_terms,
+                    back_output=None):
         """This function returns the steps of one back projection.
 
         On several devices, the back projection has two steps.  The first step is the
         projection, and the second step sums the results across devices.  The step names
         start with ``name``.  On a single device, the function returns one step named
-        ``name``.
+        ``name``.  The optional function ``back_output(i)`` replaces ``back_fixed`` for the
+        bytes of the output arrays.
         """
+        if back_output is None:
+            def back_output(i):
+                return back_fixed(i, num_pixels)
         worker_terms = list(held_terms) + [
-            ('back output', per_dev(lambda i: back_fixed(i, num_pixels))),
+            ('back output', per_dev(back_output)),
             ('finished own band',
              per_dev(lambda i: back_own_band(i, num_pixels))),
             ('back batch', per_dev(lambda i: back_batch(i, num_pixels))),
@@ -753,6 +760,51 @@ def estimate_peak_device_bytes(plan):
             base=base, base_terms=base_terms))
         return MemoryEstimate(devices=list(plan.devices), phases=phases,
                       num_pixels_full=int(plan.num_pixels_full))
+
+    # A call of forward_project or back_project holds only the arrays of that one projection.
+    # It holds no weights, no filtered sinogram, and no reconstruction state.  Both calls hold
+    # the pixel indices on every device.
+    if plan.workload in ('forward', 'back'):
+        p_full = plan.num_pixels_full
+        base_terms = [workspace_term]
+        base = list(workspace_term[1])
+        index_term = ('pixel indices', per_dev(lambda i: p_full * _INT64_BYTES))
+        if plan.workload == 'forward':
+            # forward_fixed counts the output twice on several devices.  This call holds one
+            # output, so the output is counted here with sino_dev.
+            forward_terms = [
+                index_term,
+                ('recon', per_dev(recon_dev)),
+                ('voxel gather', per_dev(lambda i: cyl(i, p_full))),
+                ('transferred cylinders', per_dev(
+                    lambda i: forward_transferred_cylinders(i, p_full))),
+                ('forward output', per_dev(
+                    lambda i: sino_dev(i) if is_view_owner(i) else 0)),
+                ('forward block', per_dev(lambda i: forward_block(i, p_full))),
+                ('forward batch', per_dev(lambda i: forward_batch(i, p_full))),
+            ]
+            phases.append(_phase('forward projection', forward_terms, n,
+                                 base=base, base_terms=base_terms))
+        else:
+            held_arrays = [index_term, ('sinogram', per_dev(sino_dev))]
+
+            # back_fixed counts three output arrays on a single device.  This call holds two.
+            def back_output(i):
+                if n == 1:
+                    return 2 * back_block(i, p_full) if is_slice_owner(i) else 0
+                return back_fixed(i, p_full)
+
+            phases.extend(back_phases('back projection (loop)', held_arrays,
+                                      p_full, base, base_terms,
+                                      back_output=back_output))
+            scatter_terms = held_arrays + [
+                ('back cylinders', per_dev(lambda i: cyl(i, p_full))),
+                ('scatter volume', per_dev(recon_dev)),
+            ]
+            phases.append(_phase('back projection (scatter)', scatter_terms, n,
+                                 base=base, base_terms=base_terms))
+        return MemoryEstimate(devices=list(plan.devices), phases=phases,
+                              num_pixels_full=int(plan.num_pixels_full))
 
     # This step is the direct reconstruction.  It runs only when the caller supplies no
     # initial reconstruction.  Its back projection uses all pixels, so it is the largest
@@ -969,7 +1021,8 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
     the current count of the model.  ``workload`` names the call that the plan describes.
     ``'recon'`` is a full reconstruction, and it is the default.  ``'direct'`` is a direct
     reconstruction, which is the filter and one back projection.  ``'denoise'`` is one call
-    of QGGMRFDenoiser.  For a denoiser, the function checks that the sinogram shape equals
+    of QGGMRFDenoiser.  ``'forward'`` and ``'back'`` are one call of ``forward_project`` and
+    ``back_project``.  For a denoiser, the function checks that the sinogram shape equals
     the image shape.
     """
     sinogram_shape = tuple(int(s) for s in model.get_params('sinogram_shape'))
@@ -1049,10 +1102,13 @@ def workload_covers(checked, incoming):
     """This function returns True when a device count that passed the check for the workload
     ``checked`` needs no new check before the workload ``incoming`` runs.
 
-    A device count that passed a ``'recon'`` check also passes a ``'direct'`` check.  Every
-    workload covers itself.  ``'denoise'`` covers no other workload.
+    A device count that passed a ``'recon'`` check also passes a ``'direct'``, ``'forward'``,
+    or ``'back'`` check.  A device count that passed a ``'direct'`` check also passes a
+    ``'back'`` check.  Every workload covers itself.  ``'denoise'`` covers no other workload.
     """
-    return checked == incoming or (checked, incoming) == ('recon', 'direct')
+    return checked == incoming or (checked, incoming) in (
+        ('recon', 'direct'), ('recon', 'forward'), ('recon', 'back'),
+        ('direct', 'back'))
 
 
 def torch_projector_directions(model):

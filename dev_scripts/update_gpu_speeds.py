@@ -6,8 +6,9 @@ A developer runs this script before each release:
 
 The script downloads the newest nightly records for the prerelease branch from the
 cabouman/mbirtorch_metrics repository.  It fits straight lines of run time against projection
-work, and ``mbirtorch.estimate_resources`` uses these lines.  The script prints the old and new
-times and then writes the speed file.  If the records are missing or have changed format, the
+work for the full reconstruction, the direct reconstruction, the forward projection, and the
+back projection.  ``mbirtorch.estimate_resources`` uses these lines.  The script prints the old
+and new times and then writes the speed file.  If the records are missing or have changed format, the
 script stops and writes nothing.
 
 The "gpus" section of the speed file lists the card memory, driver reserve, and time factor of
@@ -116,8 +117,16 @@ def main():
                 cells[(op, size_label, int(count))] = record['min_ms']['value'] / 1000.0
             except (KeyError, TypeError, ValueError):
                 fail(f'record {key} has no min_ms value.')
-        lines = {'recon': {}, 'direct': {}}
+        lines = {'recon': {}, 'direct': {}, 'forward': {}, 'back': {}}
         for count in sorted({c for (_, _, c) in cells}):
+            # The forward and back lines are fit from the times of one forward or back projection.
+            for op in ('forward', 'back'):
+                sizes = sorted({s for (o, s, c) in cells if c == count and o == op})
+                work = [projection_work(nightly_model(geometry, tuple(int(n) for n in s.split('x'))))
+                        for s in sizes]
+                if len(work) >= 2:
+                    a, b = fit_line(work, [cells[(op, s, count)] for s in sizes])
+                    lines[op][str(count)] = {'a': a, 'b': b, 'largest_work': max(work)}
             sizes = sorted({s for (op, s, c) in cells if c == count and op == 'vcd_nonconst'})
             work, iteration, direct = [], [], []
             for size_label in sizes:

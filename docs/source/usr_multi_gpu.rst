@@ -48,7 +48,8 @@ It reports the direct, full, and split reconstructions::
     split reconstruction          44.9 GiB             yes     about 71 minutes
 
 Here the full reconstruction does not fit, so use ``recon_split_sino``.  Times are accurate to
-about a factor of 1.5.
+about a factor of 1.5.  The report also gives the memory and time of one call of
+``forward_project`` and one call of ``back_project``.
 
 The full reference for ``estimate_resources`` is on the :ref:`TomographyModelDocs` page.
 

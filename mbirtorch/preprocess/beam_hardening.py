@@ -167,14 +167,14 @@ def _est_plastic_metal_sinos_from_recon(recon, num_metal, ct_model,
         bottom_margin=bottom_margin)
 
     plastic_sino_est = _ps_map(lambda t: plastic_scale * t,
-                               ct_model.forward_project(plastic_mask, output_sharded=True))
+                               ct_model._forward_project(plastic_mask, output_sharded=True))
 
     metal_sino_est = []
     for mask in metal_masks:
         masked = (_sharding.Shards([mk * t for mk, t in zip(mask.tensors, recon.tensors)],
                                    recon.placement)
                   if isinstance(recon, _sharding.Shards) else mask * recon)
-        m = ct_model.forward_project(masked, output_sharded=True)
+        m = ct_model._forward_project(masked, output_sharded=True)
         metal_sino_est.append(m)
 
     return plastic_sino_est, metal_sino_est

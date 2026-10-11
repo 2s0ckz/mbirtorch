@@ -275,7 +275,7 @@ class ParallelBeamModel(TomographyModel):
         sinogram = self._shard_sinogram(sinogram)
         filtered_sinogram = self.fbp_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
-        recon = self.back_project(filtered_sinogram, output_sharded=True)
+        recon = self._back_project(filtered_sinogram, output_sharded=True)
         return recon if output_sharded else self._gather_recon(recon)
 
     def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):

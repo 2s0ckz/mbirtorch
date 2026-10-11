@@ -177,7 +177,7 @@ def generate_hyper_sinogram(ct_model, material_maps, material_basis, dosage_rate
     if material_maps.shape[0] != material_basis.shape[0]:
         raise ValueError(f'material_maps has {material_maps.shape[0]} materials and material_basis '
                          f'{material_basis.shape[0]}; they must match.')
-    material_sinograms = np.stack([np.asarray(ct_model.forward_project(volume)) for volume in material_maps],
+    material_sinograms = np.stack([np.asarray(ct_model._forward_project(volume)) for volume in material_maps],
                                   axis=-1)
     attenuation = (material_sinograms @ material_basis).astype(np.float32)
     open_beam = np.full(attenuation.shape, dosage_rate, dtype=np.float32)

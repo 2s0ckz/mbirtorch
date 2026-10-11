@@ -199,7 +199,7 @@ def compute_view_basis_functions(ct_model, ref_object, r_1, data_store_dir, seed
     eps = 1e-12
 
     print('Creating sinogram for reference object of shape {}'.format(ref_object.shape))
-    ref_sino = ct_model.forward_project(ref_object)
+    ref_sino = ct_model._forward_project(ref_object)
 
     if roi is None:
         mask = mt.get_2d_ror_mask(ref_object[:, :, 0].shape)
