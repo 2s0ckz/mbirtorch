@@ -1,10 +1,6 @@
-"""Parameter storage and access.
-
-The public surface is ``get_params`` (one name or a list),
-``set_params(**kwargs)`` with its recompile and auto-regularization semantics,
-``verify_valid_params``, ``print_params``, and the shared geometry-params
-namedtuple cache.  Not implemented: YAML save/load and the ParamNames Literal
-typing machinery.
+"""This module stores the model parameters.  The user reads and changes the parameters with
+``get_params``, ``set_params``, ``verify_valid_params``, and ``print_params``.  The module also
+sets up the log for each reconstruction.
 """
 
 import io
@@ -24,41 +20,39 @@ _instance_counter = itertools.count(1)
 
 
 class ParameterHandler:
-    """Store and access model parameters.  ``TomographyModel`` inherits its
-    parameter interface -- ``get_params``, ``set_params``, and
-    ``print_params`` -- from this class."""
+    """This class is used to store and access the model parameters.  ``TomographyModel``
+    inherits ``get_params``, ``set_params``, and ``print_params`` from this class."""
 
     def __init__(self):
         self.params = _utils.get_default_params()
-        # The logger name must be different for each instance, because Python logging
-        # keeps one logger per name and two instances would share handlers.  The counter
-        # is used instead of id(self), because Python reuses an id after a free.
+        # Python logging keeps one logger per name, so each instance needs its own name.  The
+        # name uses a counter, because Python reuses an object id after the object is freed.
         self.logger_name = 'mbirtorch.{}.{}'.format(type(self).__name__,
                                                     next(_instance_counter))
-        # Until a run calls setup_logger, messages go to the console only.
+        # Until a reconstruction calls setup_logger, the logger writes to the console only.
         self.logger = logging.getLogger(self.logger_name)
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(logging.Formatter('%(message)s'))
         self.logger.addHandler(console_handler)
         self.logger.setLevel(logging.INFO)
         self.log_buffer = None
-        # This holds the log file of the run in progress, so that a call which
-        # continues the run can reopen it.
+        # The log file of the current reconstruction.  A later call that continues the
+        # reconstruction reopens this file.
         self._logfile_path = None
 
     def setup_logger(self, *, logfile_path: str = "~/.mbirtorch/logs/recon.log", print_logs: bool = True):
         """
-        Set up this instance's logger (self.logger) and self.log_buffer for a run.
-        The logging level comes from the model's 'verbose' parameter (0 -> WARNING, 1 -> INFO, 2+ -> DEBUG).
+        This method sets up the logger and the log buffer for a reconstruction.  The 'verbose'
+        parameter sets the logging level.  A value of 0 gives WARNING, 1 gives INFO, and 2 or
+        more gives DEBUG.
 
         Args:
-            logfile_path: Path to the log file ('~' is expanded to the user's home, so the
-                default lands in the per-user mbirtorch directory rather than littering the
-                current working directory). If None or empty, file logging is skipped.
-            print_logs: If True, emit logs to console.
+            logfile_path: The path to the log file.  The method expands '~' to the user's home
+                directory.  If the path is None or empty, the method writes no file.
+            print_logs: If True, the logger also writes to the console.
 
         Raises:
-            Exception: If logfile_path directory cannot be created.
+            Exception: If the directory of logfile_path cannot be created.
         """
         if logfile_path:
             logfile_path = os.path.expanduser(logfile_path)
@@ -72,10 +66,8 @@ class ParameterHandler:
 
         logger = self.logger
         logger.setLevel(level)
-        # The handlers attached below are the complete set of outputs.  Setting
-        # propagate to False keeps records from also reaching the root logger.
+        # The logger writes only to the handlers added below, and not to parent loggers.
         logger.propagate = False
-        # Close existing handlers to avoid leaking file descriptors.
         for h in list(logger.handlers):
             try:
                 h.flush()
@@ -97,15 +89,14 @@ class ParameterHandler:
             console_handler.setFormatter(console_formatter)
             logger.addHandler(console_handler)
 
-        # Mode 'w' starts a new log for a new run.
+        # Mode 'w' starts a new log file for each new reconstruction.
         self._logfile_path = logfile_path if logfile_path else None
         if logfile_path:
             self._add_log_file_handler(logfile_path, mode='w', level=level)
 
     def _add_log_file_handler(self, logfile_path, mode, level):
-        """Attach a handler that copies the log to ``logfile_path``.
-
-        The handler uses delay=True, so a run that logs nothing creates no file.
+        """This method attaches a handler that writes the log to ``logfile_path``.  The handler
+        creates the file only when the first message is logged.
         """
         from .utilities import makedirs
         makedirs(logfile_path)
@@ -115,18 +106,9 @@ class ParameterHandler:
         self.logger.addHandler(file_handler)
 
     def close_log_file(self):
-        """Finish the log file: flush it, close it, and detach its handler.
-
-        Called when a run has written its last line.  An open file handler
-        keeps writing to whatever file it opened, even after that file has
-        been renamed or deleted, and on Windows it would block the delete
-        outright.  So the composite runs that merge and then delete the log of
-        each part (recon_split_sino, recon_plastic_metal) need each part's
-        file closed first.
-
-        The in-memory buffer handler is left alone, so the run's log text is
-        still available for recon_dict['recon_log'].  A later call continuing
-        the same run reopens the file in append mode; see ``_reopen_log_file``.
+        """This method flushes the log file, closes it, and removes its handler.  After this
+        call, other code can merge and delete the file.  The log text stays in the log buffer
+        for recon_dict['recon_log'].  ``_reopen_log_file`` reopens the file for a later call.
         """
         if self.logger is None:
             return
@@ -139,9 +121,9 @@ class ParameterHandler:
                     self.logger.removeHandler(h)
 
     def _reopen_log_file(self):
-        """Reattach the log file that ``close_log_file`` closed, opening it in
-        append mode.  Do nothing if the run has no log file, or if a file
-        handler is already attached."""
+        """This method reopens in append mode the log file that ``close_log_file`` closed.
+        The method does nothing if the reconstruction has no log file or if a file handler is
+        already attached."""
         if self.logger is None or not self._logfile_path:
             return
         if any(isinstance(h, logging.FileHandler) for h in self.logger.handlers):
@@ -150,13 +132,10 @@ class ParameterHandler:
                                    level=self.logger.level)
 
     def _log_run_header(self, first_iteration, logfile_path, print_logs):
-        """Set up the run logger if needed and log the MBIRTorch version.
-
-        Both recon and prox_map call this method.  The devices are logged
-        separately by :meth:`_log_device_report`, once the layout is final.
+        """This method sets up the logger for a reconstruction if needed.  Then it logs the
+        MBIRTorch version.
         """
-        # The log buffer, not the logger, tells whether setup_logger has run.
-        # The constructor always fills the logger slot with a console logger.
+        # If the log buffer is None, setup_logger has not run.
         if first_iteration == 0 or self.log_buffer is None:
             self.setup_logger(logfile_path=logfile_path, print_logs=print_logs)
         else:
@@ -165,25 +144,21 @@ class ParameterHandler:
         self.logger.info('MBIRTorch Version = {}'.format(__version__))
 
     def _log_device_report(self):
-        """Log the devices the reconstruction will use.  Call only once the
-        device layout is final, which is after the run header is written."""
+        """This method logs the devices that the reconstruction uses.  mbirtorch calls this
+        method after it chooses the devices."""
         self.logger.info('Reconstruction devices: {}'.format(
             self._device_report()))
 
     def _device_report(self):
-        """Return a summary of the reconstruction devices for the log, in the
-        form 'N x PLATFORM (sharded)'."""
+        """This method returns a summary of the reconstruction devices for the log.  The
+        summary has the form 'N x PLATFORM (sharded)'."""
         devices = self.recon_placement.devices
         platform = devices[0].type.upper()
         report = '{} x {} (sharded)'.format(len(devices), platform)
-        # When the library chose the layout itself and used fewer than the visible
-        # devices, the report names each rejected device count and the reason.
         rejected = getattr(self, 'device_choice_rejections', None)
         automatic = getattr(self, 'device_layout_is_automatic', False)
         if rejected and automatic:
             visible = max([count for count, _why in rejected] + [len(devices)])
-            # One recorded entry can name the count that is actually in use, so
-            # each entry is labelled either 'used' or 'rejected'.
             report += ' (using {} of {} {} devices: {})'.format(
                 len(devices), visible, platform,
                 '; '.join('{} {}, {}'.format(
@@ -191,9 +166,11 @@ class ParameterHandler:
                     why) for count, why in rejected))
         return report
 
-    # ── access ────────────────────────────────────────────────────────────────
+    # ── access to parameters ──────────────────────────────────────────────────
     def get_params(self, parameter_names):
-        """Return the value of one parameter (a string) or a list of values."""
+        """This method returns the values of the named parameters.  If ``parameter_names`` is a
+        string, the method returns one value.  If ``parameter_names`` is a list, the method
+        returns a list of values."""
         if isinstance(parameter_names, str):
             if parameter_names not in self.params:
                 raise NameError(f"'{parameter_names}' not a recognized parameter")
@@ -207,28 +184,31 @@ class ParameterHandler:
 
     @staticmethod
     def normalize_scalar(val):
-        """Convert numpy scalar types to plain python scalars; arrays and
-        other values pass through."""
+        """This method converts a numpy scalar to a plain Python scalar.  The method returns
+        other values unchanged."""
         if isinstance(val, np.generic):
             return val.item()
         return val
 
     def set_params(self, no_warning=False, no_compile=False, **kwargs):
         """
-        Set parameters by keyword, as in ``model.set_params(sharpness=0.7)``.
+        This method sets parameters by keyword, as in ``model.set_params(sharpness=0.7)``.
 
-        Setting a geometry parameter rebuilds the projectors but does not recompute the
-        reconstruction geometry: after changing a detector parameter such as
-        ``delta_det_channel``, call ``auto_set_recon_geometry``, or the reconstruction comes out
-        at the wrong scale.  Setting ``sigma_y``, ``sigma_x``,
-        or ``sigma_prox`` directly turns off automatic regularization and warns; setting
-        ``sharpness`` or ``snr_db`` turns it back on.  An unknown parameter name raises ValueError.
+        When the user sets a geometry parameter, this method rebuilds the projectors.  The
+        method does not recompute the reconstruction geometry.  After a change to a detector
+        parameter such as ``delta_det_channel``, call ``auto_set_recon_geometry``.
+
+        When the user sets ``sigma_y``, ``sigma_x``, or ``sigma_prox``, this method turns off
+        automatic regularization and issues a warning.  When the user sets ``sharpness`` or
+        ``snr_db``, this method turns automatic regularization back on.
 
         Args:
-            no_warning (bool, optional): If True, store the values without warnings and without
-                changing automatic regularization.  Defaults to False.
-            no_compile (bool, optional): If True, do not rebuild the projectors.  Defaults to False.
-            **kwargs: parameter names and values.
+            no_warning (bool, optional): If True, the method stores the values without warnings.
+                Setting ``sigma_y``, ``sigma_x``, or ``sigma_prox`` then leaves automatic
+                regularization unchanged.  Defaults to False.
+            no_compile (bool, optional): If True, the method does not rebuild the projectors.
+                Defaults to False.
+            **kwargs: The parameter names and values.  An unknown name raises ValueError.
 
         Example:
             >>> model.set_params(recon_shape=(128, 128, 128), sharpness=0.7)
@@ -238,11 +218,10 @@ class ParameterHandler:
         meta_parameter_change = False
 
         for key, val in kwargs.items():
-            # New parameters force a recompile.
             recompile_flag = True
             if key in self.params:
                 recompile_flag = self.params[key].recompile_flag
-            elif not no_warning:   # disabled for initialization
+            elif not no_warning:   # Initialization sets no_warning to skip this check.
                 error_message = '{} is not a recognized parameter'.format(key)
                 error_message += '\nValid parameters are: \n'
                 for valid_key in self.params.keys():
@@ -277,18 +256,16 @@ class ParameterHandler:
         if recompile and not no_compile:
             self.refresh_device_bindings()
 
-    # ── hooks implemented by TomographyModel / geometry classes ──────────────
+    # ── methods that TomographyModel and the geometry classes implement ───────
     def create_projectors(self):
         raise NotImplementedError
 
     def refresh_device_bindings(self):
-        # TomographyModel overrides this to rebuild device placements from the
-        # current shapes before recreating the projectors.
         self.create_projectors()
 
     def verify_valid_params(self):
-        """Check parameter consistency; geometry classes extend this.  Called at
-        reconstruction entry, not from set_params."""
+        """This method checks that the parameters are consistent at the start of a
+        reconstruction.  Each geometry class extends this method."""
         sinogram_shape = self.get_params('sinogram_shape')
         if len(sinogram_shape) != 3:
             raise ValueError(f'sinogram_shape must be (views, rows, channels); '
@@ -296,12 +273,9 @@ class ParameterHandler:
 
     def print_params(self):
         """
-        Print the current parameter values in the model.
-
-        This method prints all parameters stored in the model's internal
-        dictionary.  If the model's verbosity level is less than 3, the view
-        parameter array (e.g. the angles) is summarized rather than printed
-        in full.
+        This method prints the current parameter values of the model.  When ``verbose`` is
+        less than 3, the method prints only the shape and dtype of the view parameter array,
+        such as the angles.
 
         Example:
             >>> ct_model = mbirtorch.ParallelBeamModel(sinogram_shape, angles)
@@ -320,8 +294,8 @@ class ParameterHandler:
                 print(f'{key} = {entry.val}')
         print('----')
 
-    # The namedtuple class is cached and shared for each set of field names, so
-    # that equality and repr behave the same way for all instances.
+    # This dict holds one namedtuple class for each set of field names.  All instances
+    # share it.
     _geometry_param_classes = {}
 
     @classmethod

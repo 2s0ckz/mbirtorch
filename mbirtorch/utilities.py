@@ -1,13 +1,7 @@
-"""Phantom generation: the low-dynamic-range Shepp-Logan used by the demos.
-
-The build is plain numpy, because the phantom is a host-side reference object.
-The ellipsoid definitions and the attenuation-scale formula are fixed values
-that the golden tests depend on.
-
-Boundary note: each ellipsoid is a <= 1 threshold on a float quadratic, so
-voxels exactly at an ellipsoid boundary can flip with the grid precision (f32
-vs f64).  The golden test therefore allows a small fraction of differing
-boundary voxels.
+"""This module holds utility functions for mbirtorch users.  The functions generate
+phantoms and demo data, and they read and write reconstructions in HDF5 files.  Other
+functions copy and build models, download data, save volumes as GIF movies, and join
+arrays along an axis.
 """
 
 import os
@@ -22,26 +16,16 @@ from . import _sharding
 
 
 def clear_cache(_root=None):
-    """Delete mbirtorch's on-disk state: the ``~/.mbirtorch`` directory.
-
-    Today that directory holds only the persistent torch.compile cache
-    (``~/.mbirtorch/torch_cache``; see the setup block in
-    ``mbirtorch/__init__.py``), and anything the package adds under
-    ``~/.mbirtorch`` in the future is removed with it.  The directory is
-    recreated empty, so a running process is unaffected beyond paying the
-    compile cost again on its next cold compile.  A cache redirected
-    elsewhere via the ``TORCHINDUCTOR_CACHE_DIR`` environment variable is
-    NOT touched -- that location is user-managed.
-
-    The per-model pixel-index cache is unrelated: it is in-memory only (a
-    single entry on the model instance, freed with the model) and never
-    reaches disk.
+    """This function deletes the ``~/.mbirtorch`` directory and creates it again empty.
+    This directory holds the files that mbirtorch keeps on disk, including the torch.compile
+    cache.  If ``TORCHINDUCTOR_CACHE_DIR`` moves the cache elsewhere, the function does not
+    delete that cache.
 
     Args:
-        _root: internal/testing override of the directory to clear.
+        _root: The directory to clear in place of ``~/.mbirtorch``.  Tests use this argument.
 
     Returns:
-        str: the path that was cleared.
+        str: The path that was cleared.
     """
     root = os.path.expanduser("~/.mbirtorch") if _root is None else str(_root)
     if os.path.isdir(root):
@@ -51,8 +35,7 @@ def clear_cache(_root=None):
 
 
 def _as_float32(mask):
-    """Return a boolean mask as float32.  The mask is either a numpy array or a
-    torch tensor."""
+    """This function converts a numpy or torch boolean mask to float32."""
     if torch.is_tensor(mask):
         return mask.to(torch.float32)
     return mask.astype(np.float32)
@@ -61,28 +44,26 @@ def _as_float32(mask):
 def add_ellipsoid(current_volume, grids, z_locations, x0, y0, z0, a, b, c,
                   angle=0, intensity=1.0):
     """
-    Add an ellipsoid to an existing volume.
-
-    The volume, the grids and ``z_locations`` are either all numpy arrays or all
-    torch tensors on one device.  Every step is elementwise, so the two forms
-    produce the same values from the same coordinates.
+    This function adds an ellipsoid to an existing volume.  The volume, the grids, and
+    ``z_locations`` must be either all numpy arrays or all torch tensors on one device.
 
     Args:
-        current_volume (ndarray or Tensor): 3D volume, (rows, cols, slices).
-        grids (tuple): (x_grid, y_grid) in-plane coordinate grids, (rows, cols).
-        z_locations (ndarray or Tensor): 1D array of z coordinates of the slices.
-        x0, y0, z0 (float): ellipsoid center.
-        a, b, c (float): x, y, z radii.
-        angle (float): rotation of the ellipsoid in the xy plane around
-            (x0, y0), in degrees.
-        intensity (float): the constant value of the ellipsoid to be added.
+        current_volume (ndarray or Tensor): The 3D volume, with axes (rows, cols, slices).
+        grids (tuple): The in-plane coordinate grids (x_grid, y_grid), each with shape
+            (rows, cols).
+        z_locations (ndarray or Tensor): The 1D array of z coordinates of the slices.
+        x0, y0, z0 (float): The center of the ellipsoid.
+        a, b, c (float): The radii along x, y, and z.
+        angle (float): The rotation of the ellipsoid in the xy plane around (x0, y0), in
+            degrees.
+        intensity (float): The constant value added inside the ellipsoid.
 
     Returns:
-        ndarray or Tensor: current_volume + ellipsoid, matching the input type.
+        ndarray or Tensor: The sum of current_volume and the ellipsoid, with the type of the
+        input.
     """
     x_grid, y_grid = grids
-    # These are Python floats rather than numpy scalars, so that the
-    # multiplications stay in the array library that the grids came from.
+    # Python floats keep the multiplications in the array library of the grids.
     cos_angle = float(np.cos(np.deg2rad(angle)))
     sin_angle = float(np.sin(np.deg2rad(angle)))
     Xr = cos_angle * (x_grid - x0) + sin_angle * (y_grid - y0)
@@ -95,8 +76,9 @@ def add_ellipsoid(current_volume, grids, z_locations, x0, y0, z0, a, b, c,
 
 
 def _add_shepp_logan_ellipsoids(phantom, grids, z_locations):
-    """Add the nine standard low dynamic range Shepp-Logan ellipsoids to
-    ``phantom``.  The golden tests depend on these fixed definitions."""
+    """This function adds the nine ellipsoids of the low dynamic range Shepp-Logan phantom
+    to ``phantom``.  The tests compare against stored values that depend on these
+    definitions."""
     phantom = add_ellipsoid(phantom, grids, z_locations, 0, 0, 0, 0.69, 0.92, 0.9, intensity=1)
     phantom = add_ellipsoid(phantom, grids, z_locations, 0, 0.0184, 0, 0.6624, 0.874, 0.88, intensity=-0.8)
     phantom = add_ellipsoid(phantom, grids, z_locations, 0.22, 0, 0, 0.41, 0.16, 0.21, angle=108, intensity=-0.2)
@@ -109,15 +91,15 @@ def _add_shepp_logan_ellipsoids(phantom, grids, z_locations):
     return phantom
 
 
-# These are the semi-axes in (rows, cols, slices) of the largest Shepp-Logan
-# ellipsoid.  They must match the first ellipsoid added above.
+# The semi-axes (rows, cols, slices) of the largest ellipsoid.  They must match the first
+# ellipsoid added above.
 _MAIN_ELLIPSOID_SEMI_AXES = (0.69, 0.92, 0.9)
 
 
 def _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation):
-    """Return the intensity scale that makes the peak forward projection of the
-    phantom approximately ``target_max_attenuation``.  This assumes a voxel
-    spacing near 1, since the phantom does not know the projector spacing."""
+    """This function returns the intensity scale that makes the largest forward projection
+    value of the phantom about ``target_max_attenuation``.  The function assumes a voxel
+    spacing near 1."""
     longest_path_voxels = max(s * n for s, n in
                               zip(_MAIN_ELLIPSOID_SEMI_AXES, phantom_shape))
     interior_intensity = 0.28  # Approximate average intensity along the center.
@@ -125,22 +107,17 @@ def _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation):
 
 
 def _phantom_devices(devices):
-    """Return the devices that the phantom build runs on.
-
-    A value of None means every permitted device.  The permitted devices are
-    every visible CUDA device, capped by MBIRTORCH_NUM_DEVICES when that
-    variable is set.  An explicit list overrides that default.
+    """This function returns the devices that build the phantom.  If ``devices`` is None,
+    the function returns every visible CUDA device, up to the number set by
+    MBIRTORCH_NUM_DEVICES.
     """
     from .preprocess import _pipeline
     return _pipeline.permitted_devices(devices)
 
 
 def _phantom_block_rows(band_shape, max_block_gb):
-    """Return the number of rows in one block of a band build.
-
-    The budget allows four float32 copies of a block, which is sixteen bytes
-    per voxel.  The heaviest step of the build uses about thirteen bytes per
-    voxel, so that budget bounds it.
+    """This function returns the number of rows in one block when the phantom is built a
+    block at a time.  The function allows sixteen bytes of temporary memory per voxel.
     """
     n_rows, n_cols, n_band = band_shape
     band_bytes = n_rows * n_cols * n_band * 4
@@ -149,32 +126,24 @@ def _phantom_block_rows(band_shape, max_block_gb):
 
 
 def _shepp_logan_band(phantom_shape, slice_range, device, max_block_gb, scale=1.0):
-    """Build the slices ``[start, stop)`` of the phantom on one device.
-
-    The rows of the band are built one block at a time, which bounds the
-    temporary arrays the build holds.  ``scale`` multiplies each block, so the
-    scaled phantom never exists as a separate array.
+    """This function builds the slices ``[start, stop)`` of the phantom on one device.  The
+    function builds one block of rows at a time.
 
     Returns:
-        Tensor: a float32 tensor of shape (rows, cols, stop - start) on
-        ``device``.
+        Tensor: A float32 tensor of shape (rows, cols, stop - start) on ``device``.
     """
     n_rows, n_cols, n_slices = phantom_shape
     start, stop = slice_range
     if stop <= start:
-        # When there are more devices than slices, the trailing devices get an
-        # empty band.  The gather concatenates an empty band like any other.
+        # When there are more devices than slices, the last devices get no slices.
         return torch.zeros((n_rows, n_cols, 0), dtype=torch.float32, device=device)
 
-    # Each coordinate vector covers its whole axis, and the bands and blocks take slices of it,
-    # so a band or block holds the same values as the matching part of a build done all at once.
     x_axis = torch.linspace(-1, 1, n_rows, dtype=torch.float32, device=device)
     y_axis = torch.linspace(-1, 1, n_cols, dtype=torch.float32, device=device)
     z_band = torch.linspace(-1, 1, n_slices, dtype=torch.float32,
                             device=device)[start:stop]
 
-    # The scale is float32, so that scaling a block gives the same values as
-    # scaling the whole phantom.
+    # A float32 scale gives each block the same values as a build of the whole phantom.
     scale32 = float(np.float32(scale))
     band = torch.empty((n_rows, n_cols, stop - start), dtype=torch.float32,
                        device=device)
@@ -192,22 +161,18 @@ def _shepp_logan_band(phantom_shape, slice_range, device, max_block_gb, scale=1.
 
 
 def _gen_shepp_logan_3d_blocked(phantom_shape, device, max_block_gb, scale=1.0):
-    """Build the phantom on one device, with the rows taken in blocks.  The
-    whole slice axis forms a single band.  Return a host numpy array."""
+    """This function builds the phantom on one device, one block of rows at a time.  The
+    function returns the phantom as a host numpy array."""
     band = _shepp_logan_band(phantom_shape, (0, phantom_shape[2]), device,
                              max_block_gb, scale)
     phantom = _to_host(band)
-    del band                    # Free the device array.
+    del band                    # This frees the device array.
     return phantom
 
 
 def _gen_shepp_logan_3d_sharded(phantom_shape, devices, max_block_gb, scale=1.0):
-    """Build the phantom with the slices split into one band per device.
-
-    The bands are the contiguous blocks that :meth:`Placement.shard_ranges`
-    gives the slice axis.  They sum to the slice axis exactly, so nothing is
-    padded or cropped.  Each band runs in its own thread, because a torch call
-    runs on the thread that issues it.  Return a host numpy array.
+    """This function builds the phantom on several devices and returns it as a host numpy
+    array.  Each device builds a contiguous range of slices in its own thread.
     """
     placement = _sharding.Placement(devices, axis=-1, axis_len=phantom_shape[2])
     band_ranges = [slice_range for _, slice_range in placement.shard_ranges()]
@@ -217,7 +182,7 @@ def _gen_shepp_logan_3d_sharded(phantom_shape, devices, max_block_gb, scale=1.0)
                                             max_block_gb, scale))
     shards = _sharding.Shards(bands, placement)
     phantom = _to_host(shards)
-    del bands, shards           # Free the device arrays.
+    del bands, shards           # This frees the device arrays.
     return phantom
 
 
@@ -225,42 +190,25 @@ def gen_shepp_logan_3d(phantom_shape, devices=None,
                                               max_block_gb=4.0,
                                               target_max_attenuation=None):
     """
-    Generates a 3D Shepp-Logan phantom with specified dimensions.
-
-    The phantom is a reference object, so it is always returned as a host numpy
-    array.  The build itself runs on devices.  Each device builds one contiguous
-    band of slices, the bands are then gathered to the host, and the device
-    arrays are freed.  Every voxel depends only on its own coordinates, so the
-    bands exchange nothing and the phantom does not depend on the device count.
+    This function generates a 3D Shepp-Logan phantom with the given shape.  Each device
+    builds a contiguous range of slices, and the function returns the phantom as a host numpy
+    array.  The result does not depend on the number of devices.
 
     Args:
-        phantom_shape (tuple): Phantom shape in (rows, columns, slices).
-        devices (sequence of devices, optional): Devices to build the phantom
-            across.  Defaults to None, which uses every permitted device: every
-            visible CUDA device, capped by MBIRTORCH_NUM_DEVICES when that
-            variable is set.  This is the rule the preprocessing functions
-            follow, and the phantom follows it because one band is bounded work
-            at any phantom size.  More than one device gives a band per device;
-            one device gives a single band covering every slice.  Every device
-            type can build the phantom, because the build is float32.
-        max_block_gb (float, optional): Rough upper bound in GB on the temporary
-            memory one row block of a band uses.  Defaults to 4.0.  It bounds a
-            band of any length, so it applies to a multi-device build as well as
-            to a single-device one.
-        target_max_attenuation (float, optional): If given, scale the phantom so
-            that the peak line integral through it (its forward projection) is
-            roughly this value, independent of the array shape.  Without it, the
-            sinogram grows linearly with the array size (a ray crosses more
-            voxels); real -log-attenuation sinograms sit around 0 to 6-8.
-            Default None leaves the phantom unscaled.
+        phantom_shape (tuple): The phantom shape (rows, columns, slices).
+        devices (sequence of devices, optional): The devices that build the phantom.
+            Defaults to None, which uses every visible CUDA device.  If MBIRTORCH_NUM_DEVICES
+            is set, it limits the number of devices.
+        max_block_gb (float, optional): The approximate largest temporary memory, in GB, that
+            one block of rows uses.  Defaults to 4.0.
+        target_max_attenuation (float, optional): If given, the function scales the phantom
+            so that its largest line integral is about this value for any array shape.  The
+            line integrals are the values of its forward projection.  Real -log attenuation
+            sinograms have values from about 0 to 6 or 8.  Defaults to None, which leaves the
+            phantom unscaled.
 
     Returns:
-        numpy.ndarray: a float32 array of shape ``phantom_shape`` with the voxel
-        intensities of the phantom.
-
-    Note:
-        The build holds a few phantom-sized transients, so very large shapes use
-        proportionally more peak memory.
+        numpy.ndarray: A float32 array of shape ``phantom_shape`` that holds the phantom.
     """
     scale = 1.0 if target_max_attenuation is None \
         else _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation)
@@ -273,17 +221,15 @@ def gen_shepp_logan_3d(phantom_shape, devices=None,
 
 
 def makedirs(file_path):
-    """Create the parent directories of ``file_path`` if they do not exist."""
+    """This function creates the parent directories of ``file_path`` if needed."""
     parent_dir = os.path.dirname(os.path.abspath(file_path))
     os.makedirs(parent_dir, exist_ok=True)
 
 
 def _to_host(array):
-    """Move a numpy array, torch tensor (any device), or sharded volume to a
-    host numpy array.  A sharded volume is concatenated on the host, so the
-    result equals the single-device volume."""
+    """This function copies a numpy array, a torch tensor on any device, or a Shards to a host
+    numpy array."""
     if isinstance(array, _sharding.Shards):
-        # The gather method already returns a numpy array.
         return array.gather()
     if hasattr(array, 'detach'):
         return array.detach().cpu().numpy()
@@ -291,7 +237,8 @@ def _to_host(array):
 
 
 def _load_array_hdf5(file_path):
-    """Return (array, attributes) from a file holding one dataset, the attributes as stored."""
+    """This function reads an HDF5 file that holds one dataset.  The function returns
+    (array, attributes)."""
     import h5py
     with h5py.File(file_path, "r") as f:
         array_names = [key for key in f.keys()]
@@ -307,17 +254,15 @@ def _load_array_hdf5(file_path):
 
 
 def load_data_hdf5(file_path):
-    """Deprecated: use :func:`import_recon_hdf5`."""
+    """This function is deprecated.  :func:`import_recon_hdf5` replaces it."""
     warnings.warn('load_data_hdf5 is deprecated; use import_recon_hdf5.', FutureWarning, stacklevel=2)
     return _load_array_hdf5(file_path)
 
 
 def _shard_axis_block(shards, i0, i1):
-    """Return a host copy of the range [i0, i1) along the sharded axis of a
-    sharded volume, with all other axes full.  Only this block is copied from
-    the devices, so a caller that walks the axis in slabs never holds the whole
-    volume on the host.  The shard extents are read from the tensors rather
-    than the placement, so this works whether or not ``axis_len`` was given."""
+    """This function returns a host copy of the indices [i0, i1) along the sharded axis of a
+    Shards.  The copy includes all indices of the other axes.  The function copies only this
+    block from the devices."""
     pl = shards.placement
     ndim = shards.tensors[0].ndim
     axis = pl.axis % ndim
@@ -335,8 +280,8 @@ def _shard_axis_block(shards, i0, i1):
 
 
 def _sharded_host_shape_dtype(shards):
-    """Return the shape and numpy dtype of the host form of a sharded volume,
-    with the sharded axis at its full length.  Nothing is gathered."""
+    """This function returns the shape and the numpy dtype that a Shards would have as a host
+    array.  The function does not copy the data to the host."""
     pl = shards.placement
     ndim = shards.tensors[0].ndim
     axis = pl.axis % ndim
@@ -347,15 +292,14 @@ def _sharded_host_shape_dtype(shards):
     return tuple(shape), np_dtype
 
 
-# This is the number of bytes in one streamed HDF5 write.  Tests reduce it so
-# that small arrays are written in more than one slab.
+# The number of bytes in one HDF5 write.  Tests reduce this value to force several writes.
 _HDF5_SLAB_BYTES = 1 << 30
 
 
 def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict=None, chunks=None):
-    """Create an HDF5 dataset with the given shape and dtype, then fill it one
-    slab at a time along axis 0.  The call produce_slab(i0, i1) returns the
-    contiguous slab written to dset[i0:i1].  Only one slab is held at a time.
+    """This function creates an HDF5 dataset and fills it one slab at a time along axis 0.
+    A slab is a contiguous range of indices along axis 0.  ``produce_slab(i0, i1)`` returns
+    the data written to dset[i0:i1].
     """
     import h5py
     from .view_utils import convert_subdicts_to_strings
@@ -376,9 +320,9 @@ def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab,
 
 
 def _save_array_hdf5(file_path, array, array_name='array', attributes_dict=None):
-    """Write one array, of any shape, as the dataset ``array_name`` with the entries of
-    ``attributes_dict`` as text attributes.  A numpy array, a tensor, or a sharded volume is
-    written one slab at a time, so no full copy is made on the host."""
+    """This function writes one array to an HDF5 file as the dataset ``array_name``.  The
+    function writes the entries of ``attributes_dict`` as text attributes.  It writes the
+    array one slab at a time along axis 0."""
     if isinstance(array, _sharding.Shards):
         out_shape, dtype, produce_slab = _sharded_slab_source(array)
         _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict)
@@ -386,8 +330,6 @@ def _save_array_hdf5(file_path, array, array_name='array', attributes_dict=None)
 
     array = _to_host(array) if hasattr(array, 'detach') else array
 
-    # The array is written one slab at a time, so no full contiguous copy is
-    # made, even for a strided view.
     def produce_slab(i0, i1):
         return np.asarray(array) if array.ndim == 0 else np.ascontiguousarray(array[i0:i1])
 
@@ -395,27 +337,19 @@ def _save_array_hdf5(file_path, array, array_name='array', attributes_dict=None)
 
 
 def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
-    """Deprecated: use :func:`export_recon_hdf5`."""
+    """This function is deprecated.  :func:`export_recon_hdf5` replaces it."""
     warnings.warn('save_data_hdf5 is deprecated; use export_recon_hdf5.', FutureWarning, stacklevel=2)
     _save_array_hdf5(file_path, array, array_name, attributes_dict)
 
 
 def _sharded_slab_source(shards):
-    """Return the shape, the numpy dtype, and a slab producer for streaming a
-    sharded volume.
-
-    The call ``produce_slab(i0, i1)`` returns exactly ``_to_host(shards)[i0:i1]``
-    while reading only the shard data that the slab needs.  There are two cases.
-    When the volume is sharded on axis 0, each shard contributes its overlap
-    with the slab, and the pieces are concatenated in shard order.  When the
-    volume is sharded on any other axis, every shard contributes rows
-    ``[i0:i1]``, and the pieces are concatenated on the sharded axis.
+    """This function returns the shape, the numpy dtype, and the function ``produce_slab``
+    for a Shards.  ``produce_slab(i0, i1)`` returns ``_to_host(shards)[i0:i1]``.
+    ``produce_slab`` reads only the shard data that this range needs.
     """
     pl = shards.placement
     ndim = shards.tensors[0].ndim
     axis = pl.axis % ndim
-    # The shard extents are read from the tensors rather than the placement, so
-    # this works whether or not axis_len was given.
     sizes = [int(t.shape[axis]) for t in shards.tensors]
     starts = np.cumsum([0] + sizes)
     axis_len = int(starts[-1])
@@ -423,8 +357,6 @@ def _sharded_slab_source(shards):
     out_shape = list(shards.tensors[0].shape)
     out_shape[axis] = axis_len
     out_shape = tuple(out_shape)
-    # The dtype comes from an empty slice, which gives the dtype the host
-    # copies will have.
     dtype = shards.tensors[0][:0].detach().cpu().numpy().dtype
 
     if axis == 0:
@@ -443,16 +375,16 @@ def _sharded_slab_source(shards):
     return out_shape, dtype, produce_slab
 
 
-# The layout of a reconstruction file.  The volume is the dataset 'recon' in right-hand axis
-# order, (slice, col, row) for a 3D volume and (time, slice, col, row) for a 4D one, and the
-# attribute 'axes' states that order.  The transposes map memory order to file order and back.
+# The reconstruction file holds the dataset 'recon' with axes (slice, col, row), or
+# (time, slice, col, row) for 4D.  The attribute 'axes' states the axis order.
 _RECON_FORMAT = 'mbirtorch_recon_v2'
 _RECON_AXES = {3: 'slice,col,row', 4: 'time,slice,col,row'}
 _RECON_TRANSPOSE = {3: (2, 1, 0), 4: (0, 3, 2, 1)}
 
 
 def _json_default(value):
-    """Encode what json cannot: arrays, tensors, numpy scalars, sets, and anything else as text."""
+    """This function converts a value that json cannot encode.  The function handles arrays,
+    tensors, numpy scalars, sets, and tuples.  It converts any other value to text."""
     if hasattr(value, 'detach'):
         value = value.detach().cpu().numpy()
     if isinstance(value, np.ndarray):
@@ -471,9 +403,9 @@ def _json_object_hook(obj):
 
 
 def _recon_attributes(recon_dict, ndim):
-    """Return the attributes of a reconstruction file: the format tag, the axis order, the
-    package version, and one attribute per entry of recon_dict.  A dict entry becomes JSON text
-    so that it reads back; a string stays as it is; anything else becomes text."""
+    """This function returns the attributes of a reconstruction file.  The attributes are the
+    format name, the axis order, the package version, and one attribute for each entry of
+    recon_dict."""
     import json
     from . import __version__
     attrs = {'format': _RECON_FORMAT, 'axes': _RECON_AXES[ndim], 'mbirtorch_version': __version__}
@@ -489,42 +421,44 @@ def _recon_attributes(recon_dict, ndim):
 
 def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, radial_margin=10, top_margin=10, bottom_margin=10):
     """
-    Write a reconstruction and its recon_dict to an HDF5 file.
+    This function writes a reconstruction and its recon_dict to an HDF5 file.
 
-    The file holds the volume as the dataset ``recon`` in right-hand axis order, (slice, col, row)
-    for a 3D volume and (time, slice, col, row) for a 4D one, so that other programs read it the
-    natural way; the attribute ``axes`` states the order.  The entries of ``recon_dict`` are
-    attributes, the dicts as JSON and the log and notes as text.  :func:`import_recon_hdf5` reads
-    the file back, and the slice viewers open it.
+    The file stores the volume as the dataset ``recon``.  The axes are (slice, col, row) for
+    3D, or (time, slice, col, row) for 4D.  The attribute ``axes`` states the axis order.
+    :func:`import_recon_hdf5` reads the file, and the slice viewers open it.
 
     Args:
-        file_path (str): Path of the output file.  Missing directories are created.
-        recon (ndarray, tensor, or Shards): the volume in (row, col, slice) order, or a 4D volume in
-            (time, row, col, slice) order.  A volume sharded by slice is streamed from the devices
-            without a host copy.
-        recon_dict (dict, optional): the dict returned by :meth:`~mbirtorch.TomographyModel.recon`.
-        remove_flash (bool, optional): If True, zero the voxels outside a cylinder and the top and
-            bottom slices before writing.  Defaults to False.
-        radial_margin (int, optional): Voxels taken off the cylinder radius.  Defaults to 10.
-        top_margin (int, optional): Slices zeroed at the top.  Defaults to 10.
-        bottom_margin (int, optional): Slices zeroed at the bottom.  Defaults to 10.
+        file_path (str): The path of the output file.  The function creates missing
+            directories.
+        recon (ndarray, tensor, or Shards): The volume with axes (row, col, slice), or a 4D
+            volume with axes (time, row, col, slice).  If the volume is a Shards divided by
+            slice, the function writes it from the devices without a full host copy.
+        recon_dict (dict, optional): The dict returned by
+            :meth:`~mbirtorch.TomographyModel.recon`.
+        remove_flash (bool, optional): If True, the function sets to zero the voxels outside
+            a cylinder and the top and bottom slices before it writes.  Defaults to False.
+        radial_margin (int, optional): The number of voxels removed from the cylinder radius.
+            Defaults to 10.
+        top_margin (int, optional): The number of slices set to zero at the top.  Defaults
+            to 10.
+        bottom_margin (int, optional): The number of slices set to zero at the bottom.
+            Defaults to 10.
 
     Example:
         >>> recon, recon_dict = ct_model.recon(sinogram)
         >>> mbirtorch.export_recon_hdf5('output/recon.h5', recon, recon_dict)
-        >>> mbirtorch.export_recon_hdf5('output/recon.h5', recon, recon_dict, remove_flash=True)
     """
     from . import preprocess
 
     def mask(block, s0, s1):
-        # block holds slices [s0, s1) of a volume of num_slices slices, in (row, col, slice) order.
+        # block holds slices [s0, s1) with axes (row, col, slice).
         ds = s1 - s0
         local_top = min(max(top_margin - s0, 0), ds)
         local_bottom = min(max(s1 - (num_slices - bottom_margin), 0), ds)
         return preprocess.apply_cylindrical_mask(block, radial_margin, local_top, local_bottom)
 
-    # A 3D volume sharded on the slice axis is streamed one slab at a time from the devices.
-    # Every other input is copied to a single host array first.
+    # A 3D Shards divided by slice is written directly from the devices.  Other inputs are
+    # copied to the host first.
     if (isinstance(recon, _sharding.Shards) and recon.tensors[0].ndim == 3
             and recon.placement.axis % 3 == 2):
         (num_rows, num_cols, num_slices), np_dtype = _sharded_host_shape_dtype(recon)
@@ -546,14 +480,13 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
         else:
             raise ValueError(f'recon must be a 3D or 4D volume; got shape {recon.shape}')
 
-    # Each slab is masked, transposed, and written on its own, so no full transposed volume is
-    # built.  A 3D slab holds all rows and columns, so the circular mask is the same for every slab.
     if ndim == 3:
         def produce_slab(s0, s1):
             block = get_block(s0, s1)
             if remove_flash:
                 block = mask(block, s0, s1)
-            return np.ascontiguousarray(np.transpose(block, _RECON_TRANSPOSE[3]))   # (ds, cols, rows)
+            # (ds, cols, rows)
+            return np.ascontiguousarray(np.transpose(block, _RECON_TRANSPOSE[3]))
 
         out_shape = (num_slices, num_cols, num_rows)
         chunks = (1, num_cols, num_rows)
@@ -562,7 +495,8 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
             block = recon[t0:t1]
             if remove_flash:
                 block = np.stack([mask(frame, 0, num_slices) for frame in block])
-            return np.ascontiguousarray(np.transpose(block, _RECON_TRANSPOSE[4]))   # (dt, slices, cols, rows)
+            # (dt, slices, cols, rows)
+            return np.ascontiguousarray(np.transpose(block, _RECON_TRANSPOSE[4]))
 
         out_shape = (num_times, num_slices, num_cols, num_rows)
         chunks = (1, 1, num_cols, num_rows)
@@ -572,8 +506,7 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
 
 
 def _resolve_geometry_class(geometry_type):
-    """Return the model class named by a ``geometry_type`` string.  That string
-    is recorded by ``get_all_params`` and by the scanner loaders."""
+    """This function returns the model class that a ``geometry_type`` string names."""
     import mbirtorch
     geometry_type = str(geometry_type)
     for name in ('ConeBeamModel', 'MultiAxisParallelBeamModel',
@@ -587,7 +520,7 @@ def _resolve_geometry_class(geometry_type):
     raise ValueError(f"Cannot resolve a model class for geometry_type {geometry_type!r}.")
 
 
-# These are the reconstruction geometry parameters that the automatic pass sets.
+# The reconstruction geometry parameters that ``auto_set_recon_geometry`` sets.
 _RECON_GEOMETRY_NAMES = ('recon_shape', 'delta_voxel', 'recon_slice_offset')
 
 
@@ -596,9 +529,9 @@ def _is_parallel_beam(model):
 
 
 def _recon_shape_at_pitch(recon_shape, automatic_pitch, pitch, slices_are_rows=False):
-    """Rescale ``recon_shape``, which was sized at ``automatic_pitch``, so that it covers the same
-    extent at ``pitch``.  With ``slices_are_rows`` the slice count is unchanged, because parallel
-    beam always uses one slice per detector row."""
+    """This function rescales ``recon_shape`` from the voxel pitch ``automatic_pitch`` to the
+    voxel pitch ``pitch``.  The new shape covers the same physical extent.  If
+    ``slices_are_rows`` is True, the number of slices does not change."""
     if np.isclose(pitch, automatic_pitch):
         return tuple(int(n) for n in recon_shape)
     scaled = [int(np.ceil(n * automatic_pitch / pitch)) for n in recon_shape]
@@ -609,43 +542,39 @@ def _recon_shape_at_pitch(recon_shape, automatic_pitch, pitch, slices_are_rows=F
 
 def build_model(required_params, optional_params=None, regularization=None):
     """
-    Construct a model from the parameter dicts returned by
-    ``get_all_params``.
-
-    The model class is taken from the ``geometry_type`` entry of ``required_params``.  The model is
-    constructed, the optional parameters and regularization are applied, and ``auto_set_recon_geometry``
-    sets the reconstruction geometry the dicts do not carry.  A ``recon_shape``, ``delta_voxel``, or
-    ``recon_slice_offset`` the dicts do carry, from a scanner loader or from a model whose values were set by
-    hand, is kept; when a pitch is supplied without a shape, the automatic shape is sized at that pitch.
+    This function constructs a model from the parameter dicts returned by
+    ``get_all_params``.  The model class comes from ``geometry_type``.  The function keeps
+    the reconstruction geometry parameters that the dicts contain.
+    ``auto_set_recon_geometry`` sets the other reconstruction geometry parameters.
 
     Args:
-        required_params (dict): The model constructor's arguments, including ``geometry_type`` (as
-            returned in the first element of ``get_all_params``).
-        optional_params (dict, optional): Additional parameters applied with ``set_params`` (detector
-            pitches, offsets, ``delta_voxel``, ``recon_shape``, ...).  Defaults to None.
-        regularization (dict, optional): Recon-time regularization parameters applied with
-            ``set_params``.  Defaults to None (the model's default regularization).
+        required_params (dict): The arguments of the model constructor, including
+            ``geometry_type``.  This dict is the first element returned by
+            ``get_all_params``.
+        optional_params (dict, optional): Additional parameters that the function applies
+            with ``set_params``, such as detector pitches, offsets, ``delta_voxel``, and
+            ``recon_shape``.  Defaults to None.
+        regularization (dict, optional): Regularization parameters that the function applies
+            with ``set_params``.  Defaults to None, which keeps the default regularization of
+            the model.
 
     Returns:
-        TomographyModel: the constructed model, with ``auto_set_recon_geometry`` applied.
+        TomographyModel: The constructed model.
     """
     required_params = dict(required_params)
     model_class = _resolve_geometry_class(required_params.pop('geometry_type'))
     model = model_class(**required_params)
 
     optional_params = dict(optional_params) if optional_params else {}
-    # Any supplied reconstruction geometry is held back and applied after the
-    # automatic pass, because the automatic pass would otherwise overwrite it.
+    # The given reconstruction geometry must be applied after auto_set_recon_geometry,
+    # because auto_set_recon_geometry would overwrite it.
     supplied = {name: optional_params.pop(name) for name in _RECON_GEOMETRY_NAMES if name in optional_params}
-    # The optional parameters are applied with name validation, so a misspelled key raises.
-    # The regularization parameters are applied with no_warning, because this is a rebuild.
+    # set_params raises an error for a misspelled optional parameter.
     if optional_params:
         model.set_params(**optional_params)
     if regularization:
         model.set_params(no_warning=True, **regularization)
     model.auto_set_recon_geometry()
-    # When a pitch is supplied without a shape, the automatic shape is rescaled
-    # so that it covers the same extent at the supplied pitch.
     if 'delta_voxel' in supplied and 'recon_shape' not in supplied:
         supplied['recon_shape'] = _recon_shape_at_pitch(
             model.get_params('recon_shape'), float(model.get_params('delta_voxel')),
@@ -657,30 +586,25 @@ def build_model(required_params, optional_params=None, regularization=None):
 
 def download_and_extract(download_url, save_dir):
     """
-    Download or copy a file from a URL or local file path. If the file is a tarball (.tar, .tar.gz, etc.), extract it
-    into the specified directory. Supports Google Drive links, standard HTTP/HTTPS URLs, and local paths.
-
-    If the file already exists in the save directory, it will not be re-downloaded or copied.
+    This function downloads a file from a URL, or copies it from a local path, into
+    ``save_dir``.  If the file is a tar archive, the function extracts it into ``save_dir``.
+    If the file is already in ``save_dir``, the function does not download it again.
 
     Args:
-        download_url (str): URL or local file path to the file. Supported formats include:
-            - Google Drive shared links
-            - HTTP/HTTPS URLs
-            - Local file paths
-        save_dir (str): Directory where the file will be saved and extracted (if applicable).
+        download_url (str): A Google Drive shared link, an HTTP or HTTPS URL, or a local path.
+        save_dir (str): The directory where the function saves and extracts the file.
 
     Returns:
-        str:
-            - For tar files: Path to the extracted top-level directory.
-            - For other files: Path to the downloaded or copied file.
+        str: For a tar file, the path of the extracted top-level directory.  For other files,
+        the path of the downloaded or copied file.
 
     Raises:
         RuntimeError: If the file cannot be downloaded, copied, or extracted.
-        ValueError: If the Google Drive URL is invalid or tar file has no top-level directory.
+        ValueError: If the Google Drive URL is invalid, or if the tar file has no top-level
+            directory.
 
     Examples:
         >>> extracted_dir = download_and_extract("https://example.com/data.tar.gz", "./data")
-        >>> file_path = download_and_extract("https://drive.google.com/file/d/1ABC123/view", "./data")
         >>> result = download_and_extract("/path/to/local/data.tar.gz", "./data")
     """
     import re
@@ -691,16 +615,16 @@ def download_and_extract(download_url, save_dir):
     from urllib.parse import urlparse
 
     def is_google_drive_url(url):
-        """Check if URL is a Google Drive link"""
+        """This function returns True if ``url`` is a Google Drive link."""
         return "drive.google.com" in url
 
     def is_tar_file(filename):
-        """Check if file is a tar archive based on extension"""
+        """This function returns True if ``filename`` has a tar archive extension."""
         tar_extensions = ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz']
         return any(filename.lower().endswith(ext) for ext in tar_extensions)
 
     def extract_google_drive_id(url):
-        """Extract Google Drive file ID from URL"""
+        """This function returns the Google Drive file ID in a URL."""
         pattern = r"(?:https?:\/\/)?(?:www\.)?drive\.google\.com\/(?:file\/d\/|open\?id=)([a-zA-Z0-9_-]+)"
         match = re.search(pattern, url)
         if match:
@@ -825,19 +749,15 @@ def download_and_extract(download_url, save_dir):
 
 def get_top_level_tar_dir(tar_path, max_entries=1):
     """
-    Determine the top-level directory inside a tarball file by sampling up to max_entries members.
+    This function returns the name of the top-level directory in a tar file.  The function
+    reads at most ``max_entries`` members of the archive.
 
-    Parameters
-    ----------
-    tar_path : str
-        Path to the tarball file.
-    max_entries : int
-        Maximum number of entries to sample.
+    Args:
+        tar_path (str): The path to the tar file.
+        max_entries (int): The maximum number of members to read.
 
-    Returns
-    -------
-    dir_name : str
-        The name of the top-level directory.
+    Returns:
+        str: The name of the top-level directory.
     """
     import tarfile
     top_levels = set()
@@ -861,54 +781,39 @@ def get_top_level_tar_dir(tar_path, max_entries=1):
 def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice_index=None,
                        vmin=None, vmax=None, fps=5):
     """
-    Save a 3D or 4D volume as an animated GIF by looping over one axis.
+    This function saves a 3D or 4D volume as an animated GIF.  Each frame of the GIF is
+    one index along a chosen axis.
 
-    ``frame_axis`` is the looping axis, and the GIF gets one frame per index along it.
-    For a 3D volume, each frame shows the two remaining axes.  A 4D volume must first be
-    reduced to 3D, so ``slice_axis`` is held fixed at ``slice_index``.  With the defaults,
-    a 4D volume of shape (num_times, nx, ny, nz) plays over time at the middle x slice,
-    and a 3D volume of shape (nx, ny, nz) plays over x.
-
-    Choosing both axes selects the displayed plane.  For a 4D volume, the four useful
-    combinations give a movie of a YZ, XZ or XY plane playing over time, or a movie that
-    steps through the slices of a single time frame (``slice_axis=0``).
-
-    A frame shows its two axes in increasing order, with the lower-numbered axis
-    vertical.  This is the layout that :func:`mbirtorch.view_utils.slice_viewer` uses
-    for the same plane.  The axes are selected by indexing and reordering only, so the volume is not
-    copied.
-
-    The frames are drawn with matplotlib and written with Pillow, which matplotlib
-    already requires.  A GIF stores its frame durations in hundredths of a second and
-    holds at most 256 colors, so an ``fps`` that does not divide 100 is rounded and the
-    frames are quantized; both are properties of the format.
+    Each frame shows the two remaining axes.  The axis with the lower number is vertical, as
+    in :func:`mbirtorch.view_utils.slice_viewer`.  The function reduces a 4D volume to 3D by
+    holding ``slice_axis`` at ``slice_index``.  With the default arguments, a 4D volume
+    (num_times, nx, ny, nz) plays over time at the middle x slice.  A 3D volume plays over x.
 
     Args:
-        volume (numpy): 3D array (nx, ny, nz) or 4D array (num_times, nx, ny, nz).
-        filename (str): Output path for the GIF file.
-        frame_axis (int, optional): The looping axis, numbered as in ``volume``.  Negative
-            values count from the end.  Defaults to None, which means axis 0, or axis 1
-            when axis 0 is held fixed by ``slice_axis``.
+        volume (numpy): A 3D array (nx, ny, nz) or a 4D array (num_times, nx, ny, nz).
+        filename (str): The output path of the GIF file.
+        frame_axis (int, optional): The axis that the movie steps through, numbered as in
+            ``volume``.  Negative values count from the end.  Defaults to None, which means
+            axis 0.  If ``slice_axis`` is 0, the default is axis 1.
         slice_axis (int, optional): The axis held fixed to reduce a 4D volume to 3D.
-            Negative values count from the end.  Must differ from ``frame_axis``.
-            Defaults to None, which means axis 1 (x).  Passing this for a 3D volume is an
-            error, since it would leave a single image rather than a movie.
-        slice_index (int, optional): Index along ``slice_axis``.  Defaults to None, the
-            middle of that axis.
-        vmin (float, optional): Min pixel value for display normalization.  Defaults to
-            None, the minimum over the frames shown.  The window is computed once for the
-            whole movie, not per frame, so intensity changes from frame to frame remain
-            visible.
-        vmax (float, optional): Max pixel value for display normalization.  Defaults to
-            None, the maximum over the frames shown.
-        fps (float, optional): Frames per second in the saved GIF.  Defaults to 5.
+            Negative values count from the end.  It must differ from ``frame_axis``.
+            Defaults to None, which means axis 1 (x).  It is not allowed for a 3D volume.
+        slice_index (int, optional): The index along ``slice_axis``.  Defaults to None, which
+            means the middle of that axis.
+        vmin (float, optional): The pixel value shown as black.  Defaults to None, which
+            means the minimum over the frames shown.  The whole movie uses the same display
+            range.
+        vmax (float, optional): The pixel value shown as white.  Defaults to None, which
+            means the maximum over the frames shown.
+        fps (float, optional): The number of frames per second in the GIF.  Defaults to 5.
+            A GIF stores frame times in hundredths of a second, so the function rounds the
+            frame time.
 
     Raises:
-        ValueError: If ``volume`` is not 3D or 4D, ``frame_axis`` and ``slice_axis`` are
-            the same axis, ``slice_axis`` or ``slice_index`` is given for a 3D volume, or
-            ``fps`` is not positive.
-        IndexError: If an axis or index is out of range for ``volume``.  These come from
-            numpy when the volume is indexed, not from a check here.
+        ValueError: If ``volume`` is not 3D or 4D, if ``frame_axis`` and ``slice_axis`` are
+            the same axis, if ``slice_axis`` or ``slice_index`` is given for a 3D volume, or
+            if ``fps`` is not positive.
+        IndexError: If an axis or an index is out of range for ``volume``.
 
     Example:
         >>> # A 3D reconstruction, scaled to its own data range.
@@ -923,22 +828,19 @@ def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice
     """
 
     def _save_frames_as_gif(frames, filename, titles, vmin, vmax, fps):
-        """Write a stack of 2D frames, indexed along axis 0, as an animated GIF.
-        Each frame is rendered one at a time, so the stack is never copied as a
-        whole.  The argument titles gives one label per frame."""
+        """This function writes a stack of 2D frames as an animated GIF.  Axis 0 indexes the
+        frames.  Each frame gets its label from ``titles``."""
         if vmin is None or vmax is None:
-            # The window is scaled to the frames that are shown, so a slice that
-            # is never displayed cannot consume the dynamic range.
+            # The display range is set from the frames shown.
             with warnings.catch_warnings():
-                warnings.simplefilter('ignore', RuntimeWarning)  # An all-NaN frame warns.
+                warnings.simplefilter('ignore', RuntimeWarning)  # A frame of all NaN gives a warning.
                 data_min, data_max = float(np.nanmin(frames)), float(np.nanmax(frames))
             if not (np.isfinite(data_min) and np.isfinite(data_max)):
-                data_min, data_max = 0.0, 1.0   # Nothing finite to scale to.
+                data_min, data_max = 0.0, 1.0   # The frames have no finite values.
             vmin = data_min if vmin is None else vmin
             vmax = data_max if vmax is None else vmax
         if vmin == vmax:
-            # A constant volume gives imshow a window of zero width, so the
-            # window is widened here.
+            # A constant volume would give imshow a display range of zero width.
             scale = max(1e-6 * abs(vmax), 1e-6)
             vmin, vmax = vmin - scale, vmax + scale
 
@@ -946,8 +848,7 @@ def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice
         from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
         from PIL import Image
 
-        # One figure is used for the whole movie, so that every frame has the
-        # same size.  A GIF requires frames of equal size.
+        # The whole movie uses one figure, because a GIF needs frames of equal size.
         fig, ax = plt.subplots()
         canvas = FigureCanvas(fig)
         image_artist = ax.imshow(frames[0], cmap='gray', vmin=vmin, vmax=vmax)
@@ -958,8 +859,7 @@ def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice
             image_artist.set_data(frame)
             title_artist.set_text(titles[i])
             canvas.draw()
-            # The RGBA buffer is reused on the next draw, so each frame is
-            # copied rather than viewed.  The alpha channel is dropped.
+            # The next draw reuses the RGBA buffer, so the code copies each frame.
             buf = canvas.get_renderer().buffer_rgba()
             image = np.frombuffer(buf, dtype=np.uint8).reshape(
                 canvas.get_width_height()[::-1] + (4,))
@@ -977,15 +877,13 @@ def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice
     if fps <= 0:
         raise ValueError('fps must be positive; got {}.'.format(fps))
 
-    # Negative axes count from the end, as they do throughout numpy.  Only a negative value
-    # that is in range is wrapped, so that numpy rejects a value that is out of range.
+    # The code converts only a negative axis that is in range.  numpy then raises an error
+    # for an axis that is out of range.
     if frame_axis is not None and -volume.ndim <= frame_axis < 0:
         frame_axis += volume.ndim
     if slice_axis is not None and -volume.ndim <= slice_axis < 0:
         slice_axis += volume.ndim
 
-    # The axis names are fixed by the mbirtorch layout, so the frame titles name
-    # the axes rather than print numbers.
     axis_names = ('x', 'y', 'z') if volume.ndim == 3 else ('t', 'x', 'y', 'z')
 
     if volume.ndim == 3:
@@ -999,7 +897,6 @@ def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice
     else:
         if slice_axis is None:
             slice_axis = 1
-        # The default is axis 0, except when axis 0 is held fixed.
         if frame_axis is None:
             frame_axis = 0 if slice_axis != 0 else 1
         if frame_axis == slice_axis:
@@ -1009,8 +906,7 @@ def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice
         if slice_index is None:
             slice_index = num_slices // 2
 
-        # Basic indexing and moveaxis both return views, so a large 4D volume is never copied.
-        # Removing slice_axis renumbers the axes above it, so frame_axis shifts down by one.
+        # Removing slice_axis lowers the number of each axis above it by one.
         index = [slice(None)] * 4
         index[slice_axis] = slice_index
         frames = np.moveaxis(volume[tuple(index)], frame_axis - (frame_axis > slice_axis), 0)
@@ -1023,46 +919,30 @@ def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice
 
 def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     """
-    Concatenate arrays along one axis while linearly blending a fixed overlap
-    between adjacent arrays.
+    This function concatenates arrays along one axis.  Adjacent arrays overlap by a fixed
+    number of elements, and the function blends the overlap with linear weights.
 
-    This behaves like a concatenate except that for each adjacent pair, the
-    first `overlap` elements of the second array and the last
-    `overlap` elements of the current result are combined by a piece-wise linear cross‑fade.
-
-    All non‑`axis` dimensions must match across inputs.
-
-    Accepted forms: a list of NumPy arrays, or a list of torch tensors that are all on one device,
-    possibly mixed with NumPy arrays (the NumPy arrays are moved to that device).  Two forms are
-    refused rather than handled: tensors spread over more than one device, and an array in the
-    divided device form (a ``Shards`` container, as produced by the multi-GPU projectors).  In both
-    cases the caller decides where the data should go -- by moving the tensors to a common device,
-    or by gathering the shards to the host -- because the right choice depends on how much memory
-    the stitched result needs and where it is used next.
+    The inputs may be numpy arrays, torch tensors on one device, or a mix of the two.  The
+    function does not accept tensors on several devices or ``Shards`` containers.  All
+    dimensions other than ``axis`` must match.
 
     Args:
-        array_list (list of ndarray or tensor): Sequence of 2+ arrays to stitch.  The result is
-            built on the inputs' own array module, so host (NumPy) inputs stitch on the host (no
-            gather to a single device) and device tensors stitch on-device.  All tensors must be
-            on the same device, and none of the elements may be a ``Shards`` container.
-        overlap (int): Number of elements overlapped between arrays.
-            Must not exceed the length of any input along `axis`.
-        axis (int, optional): Axis along which to stitch. Defaults to 2.
-        ramp_overlap (int, optional): Target number of blended (0 < w < 1) elements. Defaults to None.
+        array_list (list of ndarray or tensor): The two or more arrays to join.
+        overlap (int): The number of elements that adjacent arrays share.  It must not exceed
+            the length of any input along `axis`.
+        axis (int, optional): The axis along which to join.  Defaults to 2.
+        ramp_overlap (int, optional): The target number of blended elements, whose weights
+            are strictly between 0 and 1.  Defaults to None.
 
     Returns:
-        ndarray or tensor: Stitched array, on the inputs' own array module (host NumPy in -> host
-        out, tensor in -> on-device out). Its shape equals the input shape with the
-        length along `axis` equal to:
-
-            sum(len_k) - (len(array_list) - 1) * overlap
-
-        where `len_k` are the lengths of each input along `axis`.
+        ndarray or tensor: The joined array.  It is a numpy array for numpy input.
+        Otherwise it is a tensor on the device of the input tensors.  Its length along `axis`
+        is ``sum(len_k) - (len(array_list) - 1) * overlap``.
 
     Raises:
-        ValueError: If fewer than two arrays are provided, if non‑`axis`
-            dimensions differ, if any array is shorter than
-            `overlap` along `axis`, or if the tensors are not all on one device.
+        ValueError: If fewer than two arrays are given, if the dimensions other than `axis`
+            differ, if any array is shorter than `overlap` along `axis`, or if the tensors
+            are not all on one device.
         TypeError: If any element is a ``Shards`` container.
 
     Example:
@@ -1072,24 +952,19 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
         >>> out = stitch_arrays([a0, a1], overlap=3, axis=2)
         >>> out.shape
         (2, 2, 8)
-
-        # 8 comes from 5 + 6 - 3 (one overlap between two arrays).
     """
     import torch
 
     if not isinstance(array_list, list) or len(array_list) < 2:
         raise ValueError('array_list must be a list of 2 or more arrays.')
 
-    # A Shards container holds one tensor per device, so it has no shape of its
-    # own.  It is refused here to give the caller a clear message.
     for array in array_list:
         if isinstance(array, _sharding.Shards):
             raise TypeError(
                 'stitch_arrays does not accept an array in the divided device form.  Gather the '
                 'shards to the host first with shards.gather(), then stitch the host arrays.')
 
-    # Torch cannot combine tensors on different devices.  Choosing a device here could move a
-    # whole volume onto a GPU that cannot hold it, so the caller chooses the device instead.
+    # The caller must choose the device, because a whole volume may not fit on one GPU.
     tensor_devices = {array.device for array in array_list if isinstance(array, torch.Tensor)}
     if len(tensor_devices) > 1:
         found = ', '.join(sorted(str(device) for device in tensor_devices))
@@ -1107,9 +982,8 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
             if np.amin(lengths) < overlap:
                 raise ValueError('Each array must have length at least overlap in the dimension specified by axis.')
 
-    # The value ramp_overlap is the target number of blended elements, meaning those with a
-    # weight strictly between 0 and 1.  It is adjusted to have the same parity as overlap,
-    # which makes the flat plateaus on the two sides equal in length.
+    # ramp_overlap is the target number of elements with a weight strictly between 0 and 1.
+    # The code gives it the parity of overlap, so the two flat parts have equal length.
     if ramp_overlap is None:
         ramp_overlap = overlap // 2
     ramp_overlap = min(ramp_overlap, overlap)
@@ -1117,12 +991,11 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     ramp_overlap = max(ramp_overlap, overlap % 2)
     flat_pad = (overlap - ramp_overlap) // 2
 
-    # The weights are built with the same array library as the inputs, so numpy inputs stitch
-    # on the host and device tensors stitch on the device.  The weights are float32, so a
-    # float32 input is not promoted to float64.
+    # The weights are float32 in the array library of the inputs, so a float32 input stays
+    # float32.
     is_torch = any(isinstance(a, torch.Tensor) for a in array_list)
     if is_torch:
-        device = next(iter(tensor_devices))  # Exactly one device, checked above.
+        device = next(iter(tensor_devices))  # The check above ensures exactly one device.
         ramp = (torch.arange(ramp_overlap, dtype=torch.float32, device=device) + 1) / (ramp_overlap + 1)
         weights = torch.cat([torch.zeros(flat_pad, dtype=torch.float32, device=device), ramp,
                              torch.ones(flat_pad, dtype=torch.float32, device=device)])
@@ -1134,7 +1007,6 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
                                   np.ones(flat_pad, dtype=np.float32)])
         swap, cat = np.swapaxes, np.concatenate
 
-    # The weights are reshaped so that they broadcast along the stitching axis.
     weights_shape = [1] * array_list[0].ndim
     weights_shape[0] = len(weights)
     weights = weights.reshape(weights_shape)
@@ -1156,9 +1028,9 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
 
 
 def _automatic_recon_geometry(required, optional, regularization):
-    """Return the reconstruction geometry that the automatic pass gives a model built from these
-    parameter dicts, as (recon_shape, recon_slice_offset).  The offset is None for a geometry that
-    has no such parameter.  A value that differs from this one was set by hand."""
+    """This function returns the (recon_shape, recon_slice_offset) that
+    ``auto_set_recon_geometry`` sets for a model built from these parameter dicts.  The
+    offset is None for a geometry that has no ``recon_slice_offset``."""
     optional = {name: value for name, value in optional.items() if name not in _RECON_GEOMETRY_NAMES}
     optional['verbose'] = 0
     with warnings.catch_warnings():
@@ -1173,64 +1045,56 @@ def _automatic_recon_geometry(required, optional, regularization):
 def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_det_rows=None, new_num_det_cols=None,
                   new_translation_vectors=None, no_warning=False):
     """
-    Create a TomographyModel with the same type and parameters as the given ct_model except with the new per-view
-    parameters and a corresponding sinogram shape.  Supports the ParallelBeam, ConeBeam, MultiAxisParallel and
-    Translation models.
+    This function creates a model with the same type and parameters as ct_model.  The new
+    model can have new view parameters and a matching sinogram shape.  The function supports
+    ParallelBeamModel, ConeBeamModel, MultiAxisParallelModel, and TranslationModel.
 
-    Each geometry names its per-view parameters differently, and the copy uses whichever name the model's own
-    constructor takes: ``new_angles`` for the three angle-based geometries (a 1D vector for parallel and cone, a
-    (num_views, 2) array of (azimuth, elevation) pairs for multiaxis) and ``new_translation_vectors`` for
-    TranslationModel.  Passing ``new_translation_vectors`` for an angle-based model raises ValueError, and passing
-    ``new_angles`` or ``new_helical_z_shifts`` for a TranslationModel raises ValueError.  Passing
-    ``new_helical_z_shifts`` for a ParallelBeamModel or MultiAxisParallelModel is silently ignored.
-
-    If the user explicitly set the devices on ct_model with configure_devices, the copy
-    gets the same devices.  Otherwise the copy chooses its own devices when it is used.
-
-    The copy keeps the parent's reconstruction geometry: the voxel pitch (``delta_voxel``) and aspect ratios
-    always, and ``recon_shape`` and ``recon_slice_offset`` along every axis whose inputs did not change.  Only the
-    axes fed by a changed input are re-derived by ``auto_set_recon_geometry``: the slice count and slice offset
-    when the detector row count or the helical travel changes, the in-plane shape when the channel count changes,
-    and, for a TranslationModel, the whole shape when either changes.  A re-derived count is sized at the parent's
-    voxel pitch.  Changing only the per-view parameters keeps the parent's geometry, which is right for a subset of
-    the views; a copy over views the parent never had may need a larger volume, which the caller sets.  When a
-    re-derived value replaces one the parent had set by hand, a warning names it unless ``no_warning`` is True.
+    The copy keeps the voxel pitch and the aspect ratios of ct_model.  Along each axis whose
+    inputs did not change, the copy also keeps ``recon_shape`` and ``recon_slice_offset``.
+    Along each axis whose detector size or helical travel changed, ``auto_set_recon_geometry``
+    sets these values again.  If ct_model has devices set with configure_devices, the copy
+    uses the same devices.
 
     Args:
         ct_model (TomographyModel): The model to copy.
-        new_angles (ndarray of float, optional): Projection angles in radians -- a 1D vector for ParallelBeamModel and
-            ConeBeamModel, or a (num_views, 2) array of (azimuth, elevation) pairs for MultiAxisParallelModel.
-            If None, then use the angles in ct_model. Defaults to None.
-        new_helical_z_shifts (ndarray of float, optional): 1D vector of per-view axial shifts in ALU for ConeBeamModel.
-            Ignored for ParallelBeamModel and MultiAxisParallelModel.  Defaults to None.
-        new_num_det_rows (int, optional): Number of detector rows in the new model.
-            If None, then use the num_det_rows in ct_model. Defaults to None.
-        new_num_det_cols (int, optional): Number of detector columns in the new model.
-            If None, then use the num_det_cols in ct_model. Defaults to None.
-        new_translation_vectors (ndarray of float, optional): (num_views, 3) array of object translations (x, y, z) in
-            ALU for TranslationModel.  If None, then use the translation_vectors in ct_model. Defaults to None.
-        no_warning (bool, optional): Suppress the warning about hand-set reconstruction geometry that the copy
-            re-derived.  Defaults to False.
+        new_angles (ndarray of float, optional): The projection angles in radians.  For
+            ParallelBeamModel and ConeBeamModel, this is a 1D vector.  For
+            MultiAxisParallelModel, this is a (num_views, 2) array of (azimuth, elevation)
+            pairs.  It is not allowed for TranslationModel.  If None, the copy uses the angles
+            of ct_model.  Defaults to None.
+        new_helical_z_shifts (ndarray of float, optional): A 1D vector of the axial shift of
+            each view in ALU, for ConeBeamModel.  The function ignores it for
+            ParallelBeamModel and MultiAxisParallelModel.  It is not allowed for
+            TranslationModel.  Defaults to None.
+        new_num_det_rows (int, optional): The number of detector rows in the new model.  If
+            None, the copy uses the num_det_rows of ct_model.  Defaults to None.
+        new_num_det_cols (int, optional): The number of detector columns in the new model.
+            If None, the copy uses the num_det_cols of ct_model.  Defaults to None.
+        new_translation_vectors (ndarray of float, optional): A (num_views, 3) array of object
+            translations (x, y, z) in ALU.  It applies only to TranslationModel.  If None, the
+            copy uses the translation_vectors of ct_model.  Defaults to None.
+        no_warning (bool, optional): If True, the function gives no warning when the copy
+            replaces reconstruction geometry that was set by hand.  Defaults to False.
 
     Returns:
-        An instance of the same model class as ct_model
+        An instance of the same model class as ct_model.
+
+    Raises:
+        ValueError: If a view parameter is given that the geometry of the model does not use.
     """
     model_name = str(type(ct_model))
     is_cone = model_name.find('ConeBeamModel') > 0
     is_parallel = model_name.find('ParallelBeamModel') > 0
     is_translation = model_name.find('TranslationModel') > 0
-    # MultiAxisParallelModel is matched on its own name, because
-    # 'ParallelBeamModel' is not a substring of it.
+    # 'ParallelBeamModel' is not a substring of 'MultiAxisParallelModel'.
     if not (is_cone or is_translation or model_name.find('ParallelBeamModel') > 0
             or model_name.find('MultiAxisParallelModel') > 0):
         raise TypeError('copy_ct_model() supports ConeBeamModel, ParallelBeamModel, MultiAxisParallelModel and '
                         f'TranslationModel; got {type(ct_model).__name__}.  Construct the new model directly.')
 
     required, optional, regularization = ct_model.get_all_params()
-    parent_required = dict(required)   # The parent's own constructor arguments.
+    parent_required = dict(required)   # The constructor arguments of ct_model.
 
-    # The per-view parameters arrive under the key that the constructor declares.  A translation
-    # model carries translation_vectors and no angles, and the other three carry angles.
     if is_translation:
         view_key, new_view_params = 'translation_vectors', new_translation_vectors
         if new_angles is not None or new_helical_z_shifts is not None:
@@ -1262,8 +1126,7 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
                 raise ValueError('copy_ct_model: new_helical_z_shifts must have the same length as the existing angles.')
         required['helical_z_shifts'] = new_helical_z_shifts
 
-    # The automatic pass reads the helical shifts only through their range, so
-    # only a change in that range counts as a change.
+    # auto_set_recon_geometry uses only the range of the helical shifts.
     travel_changed = False
     if is_cone:
         old_z, new_z = np.asarray(old_helical_z_shifts, dtype=float), np.asarray(new_helical_z_shifts, dtype=float)
@@ -1271,7 +1134,6 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
 
     if new_view_params is None:
         new_view_params = old_view_params
-    # Every form has one entry per view, so len gives the view count.
     new_shape[0] = len(new_view_params)
     if new_num_det_rows is not None:
         new_shape[1] = new_num_det_rows
@@ -1280,14 +1142,13 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     required[view_key] = new_view_params
     required['sinogram_shape'] = tuple(new_shape)
 
-    # The parent's reconstruction geometry is held back, so that the automatic pass sizes the
-    # copy for the new sinogram.  The parent's values are then applied below, one axis at a time.
+    # The geometry of ct_model is applied after auto_set_recon_geometry, one axis at a time.
     parent_geometry = {name: optional.pop(name) for name in _RECON_GEOMETRY_NAMES if name in optional}
     new_model = build_model(required, optional, regularization)
 
-    # The copy keeps the parent's geometry along every axis whose inputs did not change.  The
-    # voxel pitch always stays the parent's pitch, so a derived count is rescaled to cover the
-    # same extent.  Parallel beam is the exception, because it uses one slice per detector row.
+    # Axes whose inputs did not change keep the geometry of ct_model.  A new count is
+    # rescaled to the pitch of ct_model, except the slice count in parallel beam, which has
+    # one slice per detector row.
     rows_changed = new_shape[1] != old_num_det_rows
     cols_changed = new_shape[2] != old_num_det_cols
     if is_translation:
@@ -1321,8 +1182,7 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     new_model.set_params(no_warning=True, **geometry)
 
     if not no_warning and (redo_in_plane or redo_slices):
-        # A derived value replaces the parent's value silently only when the parent's value was
-        # also automatic.  Anything the parent set by hand is named in the warning.
+        # The warning names each value of ct_model that was set by hand and is replaced.
         automatic_parent_shape, automatic_parent_offset = _automatic_recon_geometry(
             parent_required, optional, regularization)
         lost = []
@@ -1342,7 +1202,6 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
             warnings.warn(f"copy_ct_model: the {' and '.join(changed)} changed, so the automatic pass re-derived "
                           f"{' and '.join(lost)}, which the parent had set by hand.  Set them on the copy to keep "
                           "the parent's values, or pass no_warning=True.")
-    # The copy inherits devices that the user set explicitly.
     if not ct_model.device_layout_is_automatic:
         new_model.configure_devices(devices=list(ct_model.sino_placement.devices))
     return new_model
@@ -1350,41 +1209,33 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
 
 def construct_time_frame_models(model, frames_per_rotation=6, frame_overlap_factor=2.0):
     """
-    Split a scan into overlapping time frames and build one model per frame.
+    This function splits a scan into overlapping time frames and builds one model for each
+    frame.
 
-    The views are taken to be recorded in time order at a uniform angular rate, and each
-    frame is a window of consecutive views.  ``frames_per_rotation`` sets the angular step
-    between the starts of consecutive frames, one full rotation divided by that count.
-    ``frame_overlap_factor`` sets the span of a frame in units of that step, and it is also
-    the number of frames that share a view.  With the defaults a frame spans 120 degrees and a
-    new frame starts every 60 degrees, so every view belongs to two frames.
-
-    The angular step per view is the median of the absolute differences between consecutive
-    angles.  A median is used so that the frame arithmetic is unchanged by view subsampling
-    and by angles stored modulo one rotation, where each wrap adds one large difference.  The
-    views per frame and the stride between frames are the frame span and the frame step
-    divided by that angular step, rounded to the nearest integer.  Trailing views that cannot
-    fill a whole frame are discarded.  Each frame model is a copy of ``model`` over the
-    frame's angles, made with :func:`copy_ct_model`, so it keeps the parent's reconstruction
-    geometry.  No sinogram is needed, so the frames can be built before any data is loaded.
+    The function assumes that the views are in time order and that the angle changes at a
+    constant rate.  Each frame is a range of consecutive views.  A new frame starts every
+    360 / ``frames_per_rotation`` degrees.  Each frame spans ``frame_overlap_factor`` of these
+    steps.  The function discards the last views if they cannot fill a whole frame.  Each
+    frame model is a :func:`copy_ct_model` of ``model`` with the angles of the frame.
 
     Args:
-        model (TomographyModel): the model of the full scan, with one angle per view (a
-            ConeBeamModel or a ParallelBeamModel).
-        frames_per_rotation (int, optional): number of frames per full rotation.  Defaults to 6.
-        frame_overlap_factor (float, optional): span of a frame in units of the step between
-            frames.  Defaults to 2.0.
+        model (TomographyModel): The model of the full scan, with one angle per view.  The
+            model is a ConeBeamModel or a ParallelBeamModel.
+        frames_per_rotation (int, optional): The number of frames in a full rotation.
+            Defaults to 6.
+        frame_overlap_factor (float, optional): The span of a frame in units of the step
+            between frames.  Defaults to 2.0.
 
     Returns:
-        (model_list, view_slices): one model and one slice per frame.
-            - model_list (list of TomographyModel): the per-frame models.
-            - view_slices (list of slice): the views of the full sinogram that belong to each
-              frame, so that ``sinogram[view_slices[k]]`` is the sinogram of frame ``k``.
+        (model_list, view_slices): One model and one slice for each frame.
+            - model_list (list of TomographyModel): The model of each frame.
+            - view_slices (list of slice): The views of the full sinogram in each frame.
+              ``sinogram[view_slices[k]]`` is the sinogram of frame ``k``.
 
     Raises:
-        ValueError: if the model has no one-dimensional angle vector, if the angles have zero
-            spacing, if the frame span or the stride is smaller than one view, or if a frame
-            would be longer than the scan.
+        ValueError: If the model has no 1D angle vector, if the angles have zero spacing, if
+            the frame span or the stride is smaller than one view, or if a frame would be
+            longer than the scan.
 
     Example:
         >>> frames, view_slices = mbirtorch.utilities.construct_time_frame_models(ct_model)
@@ -1425,36 +1276,39 @@ def construct_time_frame_models(model, frames_per_rotation=6, frame_overlap_fact
 
 def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta_det_channel, sinogram_shape, translation_vectors, voxel_row_aspect=1.0, voxel_slice_aspect=1.0):
     """
-    Calculate the translation geometry parameters: recon_shape, delta_voxel, voxel_row_aspect
+    This function computes the reconstruction parameters recon_shape, delta_voxel, and
+    voxel_row_aspect for the translation geometry.
 
     Args:
-        source_det_dist (float): distance from the X-ray source to the detector (in ALU)
-        source_iso_dist (float): distance from the X-ray source to the isocenter (in ALU)
-        delta_det_row (float): the spacing between detector rows (in ALU)
-        delta_det_channel (float): the spacing between detector channels (in ALU)
-        sinogram_shape (tuple): Shape of the sinogram as (num_views, num_det_rows, num_det_channels)
-        translation_vectors (numpy array): A (num_views, 3) array of translations (x, y, z) in ALU
-        voxel_row_aspect (float): the aspect ratio between delta_voxel_row and delta_voxel. Defaults to 1.0
-        voxel_slice_aspect (float): the aspect ratio between delta_voxel_slice and delta_voxel. Defaults to 1.0
+        source_det_dist (float): The distance from the X-ray source to the detector, in ALU.
+        source_iso_dist (float): The distance from the X-ray source to the isocenter, in ALU.
+        delta_det_row (float): The spacing between detector rows, in ALU.
+        delta_det_channel (float): The spacing between detector channels, in ALU.
+        sinogram_shape (tuple): The sinogram shape (num_views, num_det_rows,
+            num_det_channels).
+        translation_vectors (numpy array): A (num_views, 3) array of translations (x, y, z)
+            in ALU.
+        voxel_row_aspect (float): The ratio of delta_voxel_row to delta_voxel.  Defaults
+            to 1.0.
+        voxel_slice_aspect (float): The ratio of delta_voxel_slice to delta_voxel.
+            Defaults to 1.0.
 
     Returns:
-        recon_shape (tuple): Shape of the reconstruction shape as (num_recon_rows, num_recon_cols, num_recon_slices)
-        delta_voxel (float): the voxel pitch at isocenter (in ALU)
-        voxel_row_aspect (float): the aspect ratio between delta_voxel_row and delta_voxel
+        recon_shape (tuple): (num_recon_rows, num_recon_cols, num_recon_slices).
+        delta_voxel (float): The voxel pitch at the isocenter, in ALU.
+        voxel_row_aspect (float): The ratio of delta_voxel_row to delta_voxel.
     """
     num_views, num_det_rows, num_det_channels = sinogram_shape
 
     magnification = source_det_dist / source_iso_dist
 
-    # The detector width and height are in ALU.
+    # The detector width and height in ALU.
     detect_box = np.array([delta_det_channel * num_det_channels, delta_det_row * num_det_rows])
 
-    # This is the average slope of a view seen by a voxel at isocenter, along
-    # the x and z directions.  It equals the tangent of half the cone angle.
+    # The average slope of a ray at the isocenter.  It is the tangent of half the cone angle.
     avg_view_slope = (detect_box / 4) / source_det_dist
 
-    # This is the detector pixel pitch at isocenter, which may differ from
-    # delta_voxel.  It sets both the number of rows and their pitch.
+    # The detector pixel pitch at the isocenter.
     det_pixel_pitch_iso_vec = np.array([delta_det_row, delta_det_channel]) / magnification
     det_pixel_pitch_iso = np.max(det_pixel_pitch_iso_vec)
 
@@ -1462,32 +1316,28 @@ def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta
 
     delta_voxel_slice = voxel_slice_aspect * delta_voxel
 
-    # The row pitch heuristic gives isotropic voxels when the average view slope corresponds to
-    # an angle above 76 degrees.  The row resolution is kept no higher than the detector's.
+    # This heuristic gives isotropic voxels when the average view slope is above 76 degrees.
+    # The row resolution is never finer than the detector resolution.
     nominal_row_pitch = 4.0 * det_pixel_pitch_iso_vec / avg_view_slope
     nominal_row_pitch = np.max(nominal_row_pitch)
     delta_recon_row = np.maximum(nominal_row_pitch, det_pixel_pitch_iso)
     delta_recon_row = float(delta_recon_row)
 
-    # Translation geometry usually needs anisotropic row spacing.  A voxel_row_aspect of 1.0
-    # means the user chose no aspect ratio, so the heuristic above sets delta_recon_row.
+    # A voxel_row_aspect of 1.0 means that the caller chose no aspect ratio.  Then the
+    # heuristic sets delta_recon_row.
     if voxel_row_aspect == 1.0:
         voxel_row_aspect = delta_recon_row / delta_voxel
     else:
         delta_recon_row = voxel_row_aspect * delta_voxel
 
-    # The variable cube holds the width, depth, and height of the scanned region
-    # in ALU.  A positive translation moves the object right or up.
+    # cube holds the width, depth, and height of the scanned region in ALU.
     max_translation = np.amax(translation_vectors, axis=0)
     min_translation = np.amin(translation_vectors, axis=0)
     cube = max_translation - min_translation
 
-    # The reconstruction box gives the number of columns and slices.  It uses
-    # delta_voxel for the columns and delta_voxel_slice for the slices.
     recon_box = np.ceil(np.array([cube[0], cube[2]]) / np.array([delta_voxel, delta_voxel_slice]))
 
-    # The number of rows comes from a heuristic.  The rows are chosen so that
-    # the number of unknowns is twice the number of measurements.
+    # The number of rows makes the number of unknowns twice the number of measurements.
     num_pixels_per_view = ((recon_box[0] + num_det_rows) * (recon_box[1] + num_det_channels)) / num_views
     num_measurements_per_view = num_det_channels * num_det_rows
     num_recon_rows = 2 * np.ceil(num_measurements_per_view / num_pixels_per_view)
@@ -1509,16 +1359,13 @@ def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta
 
 def import_recon_hdf5(file_path):
     """
-    Read a reconstruction and its recon_dict from a file written by :func:`export_recon_hdf5`.
-
-    The volume comes back in (row, col, slice) order, or (time, row, col, slice) for a 4D volume,
-    and the recon_dict with the entries and types it was written with.  A file written before the
-    layout was recorded in the file is read by its dataset name, with a warning: ``recon`` is taken
-    to be in (slice, col, row) order, and ``volume`` or ``array`` in (row, col, slice) order; its
-    attributes come back as the strings they were stored as.
+    This function reads a reconstruction and its recon_dict from a file written by
+    :func:`export_recon_hdf5`.  The returned volume has axes (row, col, slice), or
+    (time, row, col, slice) for a 4D volume.  If an older file records no axis order, the
+    function reads it and gives a warning.
 
     Args:
-        file_path (str): Path of the file.
+        file_path (str): The path of the file.
 
     Returns:
         (recon, recon_dict)
@@ -1553,7 +1400,7 @@ def import_recon_hdf5(file_path):
             recon_dict[key] = value
         return recon, recon_dict
 
-    # A file from before the layout was recorded.  Its writer fixed the dataset name.
+    # This is an older file that records no axis order.
     if name == 'recon':
         warnings.warn(f'{file_path} is in the old layout; it is read as (slice, col, row), so a file '
                       f'written by save_recon_hdf5 comes back transposed.')
@@ -1565,15 +1412,14 @@ def import_recon_hdf5(file_path):
 
 
 def merge_log_files(merged_path, labeled_paths):
-    """Merge temp log files into one file, each under a section header, and remove the temps.
-
-    Missing temps are skipped; if none exist, no file is written.  A closing line names
-    the merged file, since the per-part 'Logs written to' lines name temps that no
-    longer exist.
+    """This function merges temporary log files into one file and deletes them.  Each file
+    appears under a section header.  The function skips missing files.  If no file exists,
+    the function writes nothing.
 
     Args:
-        merged_path (str): Path of the merged output file.
-        labeled_paths (iterable): (label, path) pairs in the order they should appear.
+        merged_path (str): The path of the merged output file.
+        labeled_paths (iterable): The (label, path) pairs, in the order they appear in the
+            merged file.
     """
     labeled_paths = [(label, path) for label, path in labeled_paths
                      if path is not None and os.path.exists(path)]
@@ -1592,24 +1438,30 @@ def merge_log_files(merged_path, labeled_paths):
 def get_ct_model(geometry_type, sinogram_shape, angles=None, source_detector_dist=None, source_iso_dist=None,
                  helical_z_shifts=None, translation_vectors=None):
     """
-    Create an instance of TomographyModel with the given parameters
+    This function creates an instance of TomographyModel with the given parameters.
 
     Args:
-        geometry_type (str): 'parallel', 'cone', 'multiaxis' or 'translation'
-        sinogram_shape (tuple of int): (num_views, num_rows, num_channels)
-        angles (ndarray of float, optional): Projection angles in radians -- a 1D vector for 'parallel' and 'cone', or a
-            (num_views, 2) array of (azimuth, elevation) pairs for 'multiaxis'.  Not used by 'translation', which takes
-            translation_vectors instead.  Defaults to None.
-        source_detector_dist (float or None, optional): Distance in ALU from source to detector.  Defaults to None for geometries that don't need this.
-        source_iso_dist (float or None, optional): Distance in ALU from source to iso.  Defaults to None for geometries that don't need this.
-        helical_z_shifts (ndarray, optional): Per-view axial shifts in ALU, same length as angles.
-            Used only by geometry_type 'cone', where it gives a helical scan.  For 'parallel' and
-            'multiaxis' it is ignored with a warning.  Defaults to None.
-        translation_vectors (ndarray of float, optional): (num_views, 3) array of object translations (x, y, z) in ALU.
-            Required for geometry_type 'translation' and unused by the others.  Defaults to None.
+        geometry_type (str): 'parallel', 'cone', 'multiaxis', or 'translation'.
+        sinogram_shape (tuple of int): (num_views, num_rows, num_channels).
+        angles (ndarray of float, optional): The projection angles in radians.  For
+            'parallel' and 'cone', this is a 1D vector.  For 'multiaxis', this is a
+            (num_views, 2) array of (azimuth, elevation) pairs.  'translation' does not use
+            it.  Defaults to None.
+        source_detector_dist (float or None, optional): The distance from the source to the
+            detector, in ALU.  Defaults to None for geometries that do not use it.
+        source_iso_dist (float or None, optional): The distance from the source to the
+            isocenter, in ALU.  Defaults to None for geometries that do not use it.
+        helical_z_shifts (ndarray, optional): The axial shift of each view in ALU, with the
+            same length as angles.  Only 'cone' uses it, and then the scan is helical.  For
+            'parallel' and 'multiaxis', the function ignores it and gives a warning.  Defaults
+            to None.
+        translation_vectors (ndarray of float, optional): A (num_views, 3) array of object
+            translations (x, y, z) in ALU.  'translation' requires it, and the other
+            geometries do not use it.  Defaults to None.
 
     Returns:
-        An instance of ConeBeamModel, ParallelBeamModel, MultiAxisParallelModel or TranslationModel
+        An instance of ConeBeamModel, ParallelBeamModel, MultiAxisParallelModel, or
+        TranslationModel.
     """
     import mbirtorch
 
@@ -1641,25 +1493,28 @@ def get_ct_model(geometry_type, sinogram_shape, angles=None, source_detector_dis
 
 def _gen_ellipsoid(x_grid, y_grid, z_grid, x0, y0, z0, a, b, c, gray_level, alpha=0, beta=0, gamma=0):
     """
-    Return an image with a 3D ellipsoid in a 3D plane with a center of [x0,y0,z0] and ...
+    This function returns an image of a 3D ellipsoid with center [x0, y0, z0].
 
     Args:
-        x_grid(ndarray): 3D grid of X coordinate values.
-        y_grid(ndarray): 3D grid of Y coordinate values.
-        z_grid(ndarray): 3D grid of Z coordinate values.
-        x0(float): horizontal center of ellipsoid.
-        y0(float): vertical center of ellipsoid.
-        z0(float): normal center of ellipsoid.
-        a(float): X-axis radius.
-        b(float): Y-axis radius.
-        c(float): Z-axis radius.
-        gray_level(float): Gray level for the ellipse.
-        alpha(float): [Default=0.0] counter-clockwise angle of rotation by X-axis in radians.
-        beta(float): [Default=0.0] counter-clockwise angle of rotation by Y-axis in radians.
-        gamma(float): [Default=0.0] counter-clockwise angle of rotation by Z-axis in radians.
+        x_grid(ndarray): The 3D grid of x coordinates.
+        y_grid(ndarray): The 3D grid of y coordinates.
+        z_grid(ndarray): The 3D grid of z coordinates.
+        x0(float): The x coordinate of the center.
+        y0(float): The y coordinate of the center.
+        z0(float): The z coordinate of the center.
+        a(float): The radius along the x axis.
+        b(float): The radius along the y axis.
+        c(float): The radius along the z axis.
+        gray_level(float): The value inside the ellipsoid.
+        alpha(float): The counter-clockwise rotation about the x axis, in radians.  Defaults
+            to 0.
+        beta(float): The counter-clockwise rotation about the y axis, in radians.  Defaults
+            to 0.
+        gamma(float): The counter-clockwise rotation about the z axis, in radians.  Defaults
+            to 0.
 
     Return:
-        ndarray: 3D array with the same shape as x_grid, y_grid, and z_grid
+        ndarray: A 3D array with the same shape as x_grid, y_grid, and z_grid.
 
     """
     rx = np.array([[1, 0, 0], [0, np.cos(-alpha), -np.sin(-alpha)], [0, np.sin(-alpha), np.cos(-alpha)]])
@@ -1677,19 +1532,19 @@ def _gen_ellipsoid(x_grid, y_grid, z_grid, x0, y0, z0, a, b, c, gray_level, alph
 
 def gen_shepp_logan_3d_reference(phantom_shape):
     """
-    Generate a 3D Shepp Logan phantom based on below reference.
-
-    Kak AC, Slaney M. Principles of computerized tomographic imaging. Page.102. IEEE Press, New York, 1988. https://engineering.purdue.edu/~malcolm/pct/CTI_Ch03.pdf
+    This function generates the 3D Shepp-Logan phantom defined in Kak AC, Slaney M,
+    Principles of computerized tomographic imaging, page 102, IEEE Press, New York, 1988.
+    https://engineering.purdue.edu/~malcolm/pct/CTI_Ch03.pdf
 
     Args:
-        phantom_shape (tuple or list of ints): (num_rows, num_cols, num_slices)
+        phantom_shape (tuple or list of ints): (num_rows, num_cols, num_slices).
 
     Return:
-        out_image: 3D numpy array with shape (num_rows, num_cols, num_slices)
+        out_image: A 3D numpy array with shape (num_rows, num_cols, num_slices).
 
     Note:
-        This function produces 6 intermediate arrays that each have shape phantom_shape, so if phantom_shape is
-        large, then this will use a lot of peak memory.
+        This function holds 6 temporary arrays of shape phantom_shape, so a large shape
+        needs a lot of memory.
     """
 
     # The phantom is the sum of ten ellipsoids inside a 2 by 2 by 2 cube.
@@ -1721,35 +1576,35 @@ def gen_shepp_logan_3d_reference(phantom_shape):
                                gamma=el_paras['gamma'] / 180.0 * np.pi,
                                gray_level=el_paras['gray_level'])
 
-    # The meshgrid puts y on axis 0 and x on axis 1, so the image is already in
-    # (rows, cols, slices) order and needs no transpose.
+    # meshgrid puts y on axis 0, so the image already has axes (rows, cols, slices).
     return image
 
 
 def _gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size=20, text_row_indices=None,
                             horizontal_offset=0, vertical_offset=0, voxel_slice_aspect=1.0):
     """
-    Generate a synthetic ground truth phantom based on the selected option.
+    This function generates a synthetic phantom of dots or text.
 
     Args:
-        recon_shape (tuple[int, int, int]): Shape of the reconstruction volume.
-        option (str): Phantom type to generate. Options are 'dots' or 'text'.
-        text (list[str]): List of ASCII text strings to render. Used by 'text' only.
-        fill_rate (float, optional): Fill rate of the reconstruction volume. Used by 'dots' only. Default is 0.05.
-        font_size (int, optional): Font size of the ASCII text. Used by 'text' only. Default is 20.
-        text_row_indices (list[int], optional): List of row indices where each string in 'text' should be placed.
-                                           Used by 'text' only. Default is None.
-                                           If None, the strings are automatically distributed evenly across the first dimension.
-                                           Must have the same length as 'text' if provided.
-        horizontal_offset (int, optional): Horizontal offset of the text to be rendered. Positive value shifts the phantom right.
-                                           Used by 'text' only. Default is 0.
-        vertical_offset (int, optional): Vertical offset of the text to be rendered. Positive value shifts the phantom up.
-                                           Used by 'text' only. Default is 0.
-        voxel_slice_aspect (float, optional): Ratio between slice voxel spacing and column voxel spacing.
-                                           Used by 'text' only. Default is 1.0.
+        recon_shape (tuple[int, int, int]): The shape of the reconstruction volume.
+        option (str): The phantom type, either 'dots' or 'text'.
+        text (list[str]): The ASCII strings to draw.  Only 'text' uses this argument.
+        fill_rate (float, optional): The fraction of voxels set to 1.  Only 'dots' uses this
+            argument.  Defaults to 0.05.
+        font_size (int, optional): The font size of the text.  Only 'text' uses this
+            argument.  Defaults to 20.
+        text_row_indices (list[int], optional): The row index of each string in 'text'.
+            Only 'text' uses this argument.  Defaults to None, which spaces the strings evenly
+            along the first axis.
+        horizontal_offset (int, optional): The horizontal offset of the text.  A positive
+            value shifts the text right.  Only 'text' uses this argument.  Defaults to 0.
+        vertical_offset (int, optional): The vertical offset of the text.  A positive value
+            shifts the text up.  Only 'text' uses this argument.  Defaults to 0.
+        voxel_slice_aspect (float, optional): The ratio of the slice spacing to the column
+            spacing.  Only 'text' uses this argument.  Defaults to 1.0.
 
     Returns:
-        np.ndarray: Generated phantom volume.
+        np.ndarray: The phantom volume.
     """
     if option == 'dots':
         return gen_dot_phantom(recon_shape, fill_rate)
@@ -1762,14 +1617,15 @@ def _gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_siz
 
 def gen_dot_phantom(recon_shape, fill_rate):
     """
-    Generate a synthetic ground truth reconstruction volume.
+    This function generates a phantom of randomly placed dots.  In each row of the central
+    two thirds of the rows, the function sets a fraction ``fill_rate`` of the voxels to 1.
 
     Args:
-        recon_shape (tuple[int, int, int]): Shape of the reconstruction volume.
-        fill_rate (float): Fill rate of the reconstruction volume.
+        recon_shape (tuple[int, int, int]): The shape of the reconstruction volume.
+        fill_rate (float): The fraction of voxels set to 1 in each filled row.
 
     Returns:
-        np.ndarray: Ground truth reconstruction volume with sparse binary features.
+        np.ndarray: The phantom, with values 0 and 1.
     """
     np.random.seed(42)
     gt_recon = np.zeros(recon_shape, dtype=np.float32)
@@ -1793,25 +1649,29 @@ def gen_dot_phantom(recon_shape, fill_rate):
 def gen_text_phantom(recon_shape, words, font_size, row_indices=None, horizontal_offset=0,
                      vertical_offset=0, voxel_slice_aspect=1.0, font_path="DejaVuSans.ttf"):
     """
-    Generate a 3D text phantom with binary word patterns embedded in specific slices.
+    This function generates a 3D text phantom.  Each word is drawn with value 1 in one row
+    of the volume.
 
     Args:
-        recon_shape (tuple[int, int, int]): Shape of the phantom volume (num_rows, num_cols, num_slices).
-        words (list[str]): List of ASCII words to render.
-        font_size (int): Font size of ASCII words.
-        row_indices (list[int], optional): List of row indices where each word should be placed. Default is None.
-                                           If None, words are automatically distributed evenly across the first dimension.
-                                           Must have the same length as 'words' if provided.
-        horizontal_offset (int, optional): Horizontal offset of the text to be rendered. Positive value shifts the phantom right. Default is 0.
-        vertical_offset (int, optional): Vertical offset of the text to be rendered. Positive value shifts the phantom up. Default is 0.
-        voxel_slice_aspect (float, optional): Ratio between slice voxel spacing and column voxel spacing. The rendered
-            text is corrected so it has the same physical aspect ratio when slices are anisotropic. Default is 1.0.
-        font_path (str, optional): Path to the TrueType font file. Default is "DejaVuSans.ttf".
+        recon_shape (tuple[int, int, int]): The shape of the phantom (num_rows, num_cols,
+            num_slices).
+        words (list[str]): The ASCII words to draw.
+        font_size (int): The font size of the words.
+        row_indices (list[int], optional): The row index of each word.  Defaults to None,
+            which spaces the words evenly along the first axis.
+        horizontal_offset (int, optional): The horizontal offset of the text.  A positive
+            value shifts the text right.  Defaults to 0.
+        vertical_offset (int, optional): The vertical offset of the text.  A positive value
+            shifts the text up.  Defaults to 0.
+        voxel_slice_aspect (float, optional): The ratio of the slice spacing to the column
+            spacing.  The text keeps its physical aspect ratio.  Defaults to 1.0.
+        font_path (str, optional): The path to the TrueType font file.  Defaults to
+            "DejaVuSans.ttf".
 
     Returns:
-        np.ndarray: A 3D numpy array of shape `recon_shape` containing the text phantom.
+        np.ndarray: A 3D numpy array of shape `recon_shape` that holds the text phantom.
     """
-    # PIL is imported here so that importing mbirtorch does not require Pillow.
+    # Imported here so that importing mbirtorch does not require Pillow.
     from PIL import Image, ImageDraw, ImageFont
 
     if voxel_slice_aspect <= 0:
@@ -1885,7 +1745,6 @@ def gen_text_phantom(recon_shape, words, font_size, row_indices=None, horizontal
             word_array = np.array(word_img)
         word_array = (word_array > 0).astype(np.float32)
 
-        # The word array is cropped to fit in the reconstruction volume.
         r_start, r_end = r, r + 1
         c_start = c - array_num_cols // 2
         c_end = c_start + array_num_cols
@@ -1910,16 +1769,17 @@ def gen_text_phantom(recon_shape, words, font_size, row_indices=None, horizontal
 
 def gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z_spacing):
     """
-    Generate translation vectors for lateral (x) and axial (z) displacements.
+    This function generates a grid of translation vectors in the lateral (x) and axial (z)
+    directions.  The grid is centered at zero.
 
     Args:
-        num_x_translations (int): Number of x-direction translations
-        num_z_translations (int): Number of z-direction translations
-        x_spacing (float): Spacing between x translations in ALU
-        z_spacing (float): Spacing between z translations in ALU
+        num_x_translations (int): The number of translations in x.
+        num_z_translations (int): The number of translations in z.
+        x_spacing (float): The spacing between x translations, in ALU.
+        z_spacing (float): The spacing between z translations, in ALU.
 
     Returns:
-        np.ndarray: Array of shape (num_views, 3) with translation vectors [dx, dy, dz]
+        np.ndarray: An array of shape (num_views, 3) of translation vectors [dx, dy, dz].
     """
     num_views = num_x_translations * num_z_translations
     translation_vectors = np.zeros((num_views, 3))
@@ -1941,21 +1801,20 @@ def gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z
 
 def _gen_polygon_phantom(recon_shape):
     """
-    A phantom of one asymmetric convex polygon, the same in every slice, for view selection.
-
-    The polygon has five sides and no symmetry, so its edges face a few directions and the
-    best view angles are not evenly spaced.  Its vertices are scaled to the volume.
+    This function returns a phantom of one asymmetric polygon with five sides.  Every slice
+    is the same.  The phantom is used to test view selection.
 
     Args:
         recon_shape (tuple of int): (num_rows, num_cols, num_slices).
 
     Returns:
-        numpy.ndarray: The phantom, float32, 1.0 inside the polygon and 0 elsewhere.
+        numpy.ndarray: The float32 phantom.  It is 1.0 inside the polygon and 0 elsewhere.
     """
     from matplotlib.path import Path
 
     num_rows, num_cols, num_slices = recon_shape
-    # Vertices as (row, col) on a 512 by 512 grid, scaled to this one.
+    # The vertices are (row, col) points on a 512 by 512 grid.  The code scales them to
+    # this grid.
     vertices = np.array([[100, 440], [80, 260], [280, 60], [420, 280], [360, 460]], dtype=np.float64)
     vertices *= np.array([num_rows, num_cols]) / 512.0
     rows, cols = np.meshgrid(np.arange(num_rows), np.arange(num_cols), indexing='ij')
@@ -1965,15 +1824,15 @@ def _gen_polygon_phantom(recon_shape):
 
 
 def gen_cube_phantom(recon_shape, device=None):
-    """Code to generate a simple phantom """
+    """This function generates a phantom of a rectangular bar that shifts across the columns
+    from slice to slice.  The function returns it as a torch tensor on ``device``."""
     import torch
 
     num_recon_rows, num_recon_cols, num_recon_slices = recon_shape[:3]
-    phantom_rows = num_recon_rows // 4  # Phantom height.
-    phantom_cols = num_recon_cols // 4  # Phantom width.
+    phantom_rows = num_recon_rows // 4  # The phantom height.
+    phantom_cols = num_recon_cols // 4  # The phantom width.
 
-    # The dtype is float32 because torch.as_tensor keeps whatever numpy gives
-    # it, and the mps backend does not support float64.
+    # The phantom is float32, because the mps backend does not support float64.
     phantom = np.zeros((num_recon_rows, num_recon_cols, num_recon_slices),
                        dtype=np.float32)
 
@@ -1995,14 +1854,12 @@ def get_helical_half_rotation_slice_range(
     helical_z_shifts,
 ):
     """
-    Return the contiguous slice range whose z positions are visible for at least
-    half a rotation.
-
-    Assumes helical_z_shifts are monotone and uniformly sampled.
+    This function returns the contiguous range of slices that the helical scan sees for at
+    least half a rotation.  The function assumes that helical_z_shifts are monotone and
+    evenly spaced.
 
     Returns:
-        start_slice, stop_slice
-        where stop_slice is exclusive.
+        start_slice, stop_slice.  The range excludes stop_slice.
     """
     recon_shape = ct_model.get_params('recon_shape')
     delta_voxel, voxel_slice_aspect, recon_slice_offset = ct_model.get_params(
@@ -2017,20 +1874,16 @@ def get_helical_half_rotation_slice_range(
 
     delta_voxel_slice = voxel_slice_aspect * delta_voxel
 
-    # These are the z locations of the slice centers, in reconstruction
-    # coordinates.
+    # These are the z locations of the slice centers, in reconstruction coordinates.
     k = np.arange(num_slices)
     z_k = delta_voxel_slice * (k - (num_slices - 1) / 2.0) + recon_slice_offset
 
-    # Detector height mapped to isocenter.
     det_height_iso = num_det_rows * delta_det_row / magnification
 
-    # Table travel range.
     z_shift_min = np.min(helical_z_shifts)
     z_shift_max = np.max(helical_z_shifts)
 
-    # A pitch above 1 needs an interior trim.  At a pitch of 1 or less the
-    # endpoints of the table travel are already visible for half a rotation.
+    # The range is trimmed only when the pitch is above 1.
     trim = 0.5 * det_height_iso * np.maximum(float(helical_pitch) - 1.0, 0.0)
 
     z_min = z_shift_min + trim
@@ -2087,66 +1940,66 @@ def gen_demo_data(
     devices=None,
 ):
     """
-    Create a simple object and a sinogram for demonstration purposes.
+    This function creates a simple object and a simulated sinogram for demonstrations.
 
-    This function will create a 3D volume (aka object or phantom) of the specified type, then use the model type and
-    parameters to create a simulated sinogram.  The object type 'shepp-logan' gives a simplified version of the
-    classic Shepp-Logan test phantom, type 'cube' gives a simple cube object, and type 'polygon' gives one
-    asymmetric five-sided polygon, the same in every slice, whose edges face a few directions so that some view
-    angles matter more than others.  The polygon is the object for sparse view selection.
-
-    The 'translation' model type is the exception: it reconstructs a volume only a few voxels thick, on which
-    those objects come out empty, so it always uses a sparse pattern of dots and ignores object_type.
-
-    The output sinogram has shape (num_views, num_det_rows, num_det_channels); each 2D array
-    sinogram[view_index] is a simulated image from the detector, with num_det_rows indicating the
-    vertical size and num_det_channels the horizontal size.
+    The object is a simplified Shepp-Logan phantom, a cube, or an asymmetric polygon.  The
+    polygon is used to test view selection.  The 'translation' model type always uses a
+    sparse pattern of dots instead.  Each 2D array sinogram[view_index] is a simulated
+    detector image.
 
     Args:
-        object_type (str, optional): One of 'shepp-logan', 'cube', or 'polygon'.  Defaults to 'shepp-logan'.
-            Ignored when model_type is 'translation', which uses its own phantom (see above).
-        model_type (str, optional): One of 'parallel', 'cone', 'translation' or 'multiaxis'.  Defaults to 'cone'.
-        num_views (int, optional):  Number of views in the output sinogram.  Defaults to 64. Ignored when model_type is 'translation'
-        num_det_rows (int, optional): Number of rows (vertical) in the output sinogram.  Defaults to 96.
-        delta_det_row (float, optional): Detector row pitch in ALU.  Used only to compute the helical
-            trajectory, so it has no effect unless model_type is 'cone' and use_helical is True.  Defaults to 1.
-        num_det_channels (int, optional): Number of channels (horizontal) in the output sinogram.  Defaults to 128.
-        num_x_translations (int, optional): Number of horizontal translations for translation mode.  Defaults to 7.
-        num_z_translations (int, optional): Number of vertical translations for translation mode.  Defaults to 7.
-        x_spacing (float, optional): Horizontal spacing between translations in ALU.  Defaults to 22.
-        z_spacing (float, optional): Vertical spacing between translations in ALU.  Defaults to 22.
-        use_helical (bool, optional):
-            If True and model_type == 'cone', generate a helical cone-beam trajectory by
-            supplying per-view z_shifts to ConeBeamModel. Defaults to False.
-        helical_pitch (float, optional):
-            Helical pitch (dimensionless) for helical mode.
-            pitch = (table travel per rotation) / (det height at iso).  This is the fraction of the detector height at iso traveled per rotation.
-        helical_z_range (float, optional): Total axial travel over the scan in ALU for helical mode.
-        helical_z_center (float, optional): Midpoint of axial travel over the scan in ALU for helical mode.
-        use_curved_detector (bool, optional): (cone beam geometry parameter)
-        elevation_degrees (float, optional): (multiaxis geometry parameter) The
-            constant tilt of every view out of the horizontal plane, in degrees.
-            Defaults to 0.0.
-        voxel_row_aspect (float, optional): Aspect ratio for recon rows relative to columns.  Defaults to 1.0.
-        voxel_slice_aspect (float, optional): Ratio of the slice voxel spacing to the in-plane voxel spacing
-            delta_voxel, so that delta_voxel_slice = voxel_slice_aspect * delta_voxel.  Defaults to 1.0.
-        target_max_attenuation (float, optional): Target max sinogram attenuation for Shepp-Logan phantom.  Defaults to None, for which each voxel is in the range [0, 1].  May not be accurate if any detector or voxel dimensions are not 1.
-        devices (sequence of devices, optional): Devices to run the generation on.  Defaults to None,
-            which uses the model's automatic selection.  This only affects where the work runs, not
-            the result.
+        object_type (str, optional): One of 'shepp-logan', 'cube', or 'polygon'.  Defaults to
+            'shepp-logan'.  The function ignores it when model_type is 'translation'.
+        model_type (str, optional): One of 'parallel', 'cone', 'translation', or 'multiaxis'.
+            Defaults to 'cone'.
+        num_views (int, optional): The number of views in the output sinogram.  Defaults to
+            64.  The function ignores it when model_type is 'translation'.
+        num_det_rows (int, optional): The number of detector rows (vertical) in the output
+            sinogram.  Defaults to 96.
+        delta_det_row (float, optional): The detector row pitch in ALU.  It has an effect only
+            for a helical cone beam scan.  Defaults to 1.
+        num_det_channels (int, optional): The number of detector channels (horizontal) in the
+            output sinogram.  Defaults to 128.
+        num_x_translations (int, optional): The number of horizontal translations for the
+            translation model.  Defaults to 7.
+        num_z_translations (int, optional): The number of vertical translations for the
+            translation model.  Defaults to 7.
+        x_spacing (float, optional): The horizontal spacing between translations, in ALU.
+            Defaults to 22.
+        z_spacing (float, optional): The vertical spacing between translations, in ALU.
+            Defaults to 22.
+        use_helical (bool, optional): If True and model_type is 'cone', the scan is helical.
+            Defaults to False.
+        helical_pitch (float, optional): The helical pitch.  It equals the table travel per
+            rotation divided by the detector height at the isocenter.
+        helical_z_range (float, optional): The total axial travel of a helical scan, in ALU.
+        helical_z_center (float, optional): The midpoint of the axial travel of a helical
+            scan, in ALU.
+        use_curved_detector (bool, optional): If True, the cone beam detector is curved.
+        elevation_degrees (float, optional): The constant tilt of every view out of the
+            horizontal plane, in degrees.  Only 'multiaxis' uses it.  Defaults to 0.0.
+        voxel_row_aspect (float, optional): The ratio of the row spacing to the column
+            spacing of the reconstruction.  Defaults to 1.0.
+        voxel_slice_aspect (float, optional): The ratio of the slice spacing to the in-plane
+            voxel spacing delta_voxel.  Defaults to 1.0.
+        target_max_attenuation (float, optional): The target maximum sinogram attenuation for
+            the Shepp-Logan phantom.  Defaults to None, which keeps each voxel in [0, 1].  The
+            scaling may not be accurate if any detector or voxel spacing is not 1.
+        devices (sequence of devices, optional): The devices that generate the data.  Defaults
+            to None, which uses the automatic choice of the model.  The result does not depend
+            on the devices.
 
     Returns:
         tuple: (object, sinogram, params)
-            - object: the phantom volume, shape recon_shape = (num_rows, num_cols, num_slices).
-              A host numpy float32 array, for either object type.
-            - sinogram: shape (num_views, num_det_rows, num_det_channels).
-            - params (dict): the geometry parameters used for the simulation.  For model_type
-              'parallel', 'cone' and 'multiaxis' it contains 'angles' plus the voxel aspect ratios;
-              'cone' adds 'source_detector_dist', 'source_iso_dist' and 'use_curved_detector', and a
-              helical cone scan also adds 'helical_z_shifts'; 'multiaxis' adds 'elevation_degrees'.
-              For model_type 'translation' it contains 'translation_vectors' only.
-
-        sinogram is always a host NumPy array (what ``recon`` prefers).
+            - object: The phantom, a host numpy float32 array of shape recon_shape.
+            - sinogram: A host numpy array of shape (num_views, num_det_rows,
+              num_det_channels).
+            - params (dict): The geometry parameters of the simulation.  For all model types
+              except 'translation', it holds 'angles' and the voxel aspect ratios.  For 'cone',
+              it also holds 'source_detector_dist', 'source_iso_dist', and
+              'use_curved_detector'.  For a helical scan, it also holds 'helical_z_shifts'.
+              For 'multiaxis', it also holds 'elevation_degrees'.  For 'translation', it holds
+              only 'translation_vectors'.
     """
     import mbirtorch
 
@@ -2157,8 +2010,6 @@ def gen_demo_data(
     end_angle = np.pi
 
     if model_type == ModelType.MULTIAXIS:
-        # The azimuths cover a half rotation, and every view is at the same
-        # elevation.
         azimuths = np.linspace(0, np.pi, num_views, endpoint=False)
         elevations = np.deg2rad(elevation_degrees) * np.ones(num_views)
         angles = np.column_stack([azimuths, elevations]).astype(np.float32)
@@ -2179,8 +2030,7 @@ def gen_demo_data(
         ct_model_for_generation.auto_set_recon_geometry()
         params = {'angles': angles, 'voxel_row_aspect': voxel_row_aspect, 'voxel_slice_aspect': voxel_slice_aspect}
     elif model_type == ModelType.CONE:
-        # Cone beam geometry needs the source to detector distance and the source to rotation
-        # axis distance.  An infinite distance is allowed, and it is equivalent to parallel beam.
+        # An infinite source distance is allowed and gives parallel beam.
         source_detector_dist = 4 * num_det_channels
         source_iso_dist = source_detector_dist/2
         sinogram_shape = (num_views, num_det_rows, num_det_channels)
@@ -2202,17 +2052,17 @@ def gen_demo_data(
             else:
                 magnification = source_detector_dist / source_iso_dist
 
-            # This is the detector height mapped to isocenter, in ALU.
+            # The detector height at the isocenter, in ALU.
             det_height_iso = float(num_det_rows) * (delta_det_row / magnification)
 
-            # This is the table travel per rotation, in ALU.
+            # The table travel per rotation, in ALU.
             z_per_rot = float(helical_pitch) * det_height_iso
             if z_per_rot <= 0:
                 raise ValueError(f"helical_pitch must be > 0 (got {helical_pitch}).")
             if float(helical_z_range) < 0:
                 raise ValueError(f"helical_z_range must be >= 0 (got {helical_z_range}).")
 
-            if float(helical_z_range) == 0.0:  # Circular reconstruction.
+            if float(helical_z_range) == 0.0:  # The scan is circular.
                 num_rotations = 1.0
                 views_per_rotation = float(num_views)
             else:
@@ -2221,13 +2071,9 @@ def gen_demo_data(
                     raise ValueError("Derived num_rotations <= 0; check pitch/z_range.")
                 views_per_rotation = float(num_views) / num_rotations
 
-            # The angle advances by one rotation divided by views_per_rotation
-            # at each view.
             angle_step = (2.0 * np.pi) / views_per_rotation
             angles = start_angle + angle_step * np.arange(num_views)
 
-            # The z shifts span helical_z_range and are centered on
-            # helical_z_center.
             z0 = float(helical_z_center) - 0.5 * float(helical_z_range)
             z1 = float(helical_z_center) + 0.5 * float(helical_z_range)
             helical_z_shifts = np.linspace(z0, z1, num_views, endpoint=True)
@@ -2265,16 +2111,11 @@ def gen_demo_data(
     else:
         raise ValueError(f'Invalid model type. Expected one of {[m.value for m in ModelType]}, got {model_type}')
 
-    # The generation model is pinned to the requested devices, so that the projection and the
-    # returned sinogram share one layout.  A value of None leaves the automatic selection.
     if devices is not None:
         ct_model_for_generation.configure_devices(devices=list(devices))
-    # The device layout is settled before projecting, so that the generation spreads over the
-    # devices.  The memory preflight is skipped, because this model does one forward projection.
+    # This model skips the memory check, because it does only one forward projection.
     ct_model_for_generation.skip_memory_preflight = True
     ct_model_for_generation._apply_device_policy()
-    # The log names where the layout came from, because the devices used here
-    # can differ from the devices used by the reconstruction.
     device_provenance = 'requested' if devices is not None else 'default'
 
     print('Creating phantom')
@@ -2294,30 +2135,25 @@ def gen_demo_data(
             embed_slice_stop - embed_slice_start,
         )
     if model_type == ModelType.TRANSLATION:
-        # The translation geometry reconstructs a thin slab, often a single row of voxels.  Both
-        # generic phantoms come out empty that thin, so this geometry uses a phantom of dots.
+        # The other phantoms are empty in the thin translation volume, so the code uses dots.
         phantom_core = _gen_translation_phantom(phantom_shape, option='dots', text=None)
     elif object_type == ObjectType.SHEPP_LOGAN:
         phantom_core = gen_shepp_logan_3d(
             phantom_shape, target_max_attenuation=target_max_attenuation)
     elif object_type == ObjectType.CUBE:
-        # gen_cube_phantom returns a tensor, and this function returns a host
-        # numpy array for both object types.
         phantom_core = gen_cube_phantom(phantom_shape).cpu().numpy()
     elif object_type == ObjectType.POLYGON:
         phantom_core = _gen_polygon_phantom(phantom_shape)
     else:
         raise ValueError(f'Invalid object type. Expected one of {[o.value for o in ObjectType]}, got {object_type}')
     if model_type == ModelType.CONE and use_helical:
-        # In a helical scan only the slices seen for at least half a rotation
-        # get phantom content.  The remaining slices stay zero.
+        # In a helical scan, only the slices seen for at least half a rotation hold the
+        # phantom.
         phantom = np.zeros(recon_shape, dtype=np.float32)
         phantom[:, :, embed_slice_start:embed_slice_stop] = phantom_core
     else:
         phantom = phantom_core
 
-    # The sinogram is kept in its device form and then gathered to the host, so
-    # that the whole sinogram never passes through a single device.
     print('Creating sinogram on the {} devices'.format(device_provenance))
     sinogram_sharded = ct_model_for_generation.forward_project(phantom, output_sharded=True)
     sinogram = ct_model_for_generation._gather_sinogram(sinogram_sharded)
@@ -2336,39 +2172,38 @@ def gen_demo_data_4d(
     **object_options,
 ):
     """
-    Create a moving object and the sinogram of one continuous scan of it, for 4D demonstrations.
+    This function creates a moving object and the sinogram of one continuous scan of the
+    object.  The 4D demos use this data.
 
-    The object is a moving phantom sampled at ``num_steps`` evenly spaced times over the scan.
-    The only object so far is 'rack-and-pinion': a toothed bar along the rotation axis and a
-    toothed wheel beside it, the wheel turning by ``rotation_degrees`` over the scan.  A new
-    object is added in the private module ``_phantoms_4d``, as a function of the volume shape and
-    the time in [0, 1], listed by name in its table of moving phantoms.  The views are in time order and are divided evenly among
-    the steps: the views of step k are projected from the object at step k.  With 240 views and
-    24 steps, views 0 to 9 see the object in its first state, views 10 to 19 in its second, and
-    so on.  A 4D reconstruction such as :class:`~mbirtorch.MACE4DModel` divides the views into
-    frames on its own; nothing here depends on that.
+    The function samples the object at ``num_steps`` evenly spaced times.  The views are in
+    time order, and the function divides them evenly among the time steps.  The views of
+    step k see the object at step k.  The only object is 'rack-and-pinion'.  It is a toothed
+    bar along the rotation axis with a toothed wheel beside it.
 
     Args:
         object_type (str, optional): The moving object.  Defaults to 'rack-and-pinion'.
         model_type (str, optional): 'parallel' or 'cone'.  Defaults to 'parallel'.
-        num_views (int, optional): Views in the scan.  Defaults to 240.
-        num_rotations (float, optional): Rotations the scan covers.  Defaults to 2.
-        num_det_rows (int, optional): Detector rows.  Defaults to 64.
-        num_det_channels (int, optional): Detector channels.  Defaults to 64.
-        num_steps (int, optional): Times at which the object is sampled.  Defaults to 24.
-        devices (sequence of devices, optional): Devices to project on.  Defaults to None, the
-            model's automatic choice.
-        **object_options: Passed to the phantom function, such as ``rotation_degrees`` for the
-            rack and pinion.
+        num_views (int, optional): The number of views in the scan.  Defaults to 240.
+        num_rotations (float, optional): The number of rotations in the scan.  Defaults to 2.
+        num_det_rows (int, optional): The number of detector rows.  Defaults to 64.
+        num_det_channels (int, optional): The number of detector channels.  Defaults to 64.
+        num_steps (int, optional): The number of times at which the function samples the
+            object.  Defaults to 24.
+        devices (sequence of devices, optional): The devices that compute the projections.
+            Defaults to None, which uses the automatic choice of the model.
+        **object_options: Options passed to the phantom function, such as
+            ``rotation_degrees`` for the rack and pinion.
 
     Returns:
         tuple: (phantom_4d, sinogram, params)
-            - phantom_4d: the object at each step, float32, shape (num_steps, num_rows,
-              num_cols, num_slices).  The volume shape is the model's reconstruction shape.
-            - sinogram: shape (num_views, num_det_rows, num_det_channels), a host numpy array.
-            - params (dict): 'angles', the angle of each view; 'step_of_view', the step each view
-              was projected from; 'num_rotations' and 'num_steps'; and for 'cone' the two
-              source distances.
+            - phantom_4d: The float32 object at each step, with shape (num_steps, num_rows,
+              num_cols, num_slices).  The volume shape is the reconstruction shape of the
+              model.
+            - sinogram: A host numpy array with shape (num_views, num_det_rows,
+              num_det_channels).
+            - params (dict): 'angles' holds the angle of each view.  'step_of_view' holds the
+              time step of each view.  The dict also holds 'num_rotations' and 'num_steps'.
+              For 'cone', it also holds the two source distances.
     """
     import mbirtorch
     from ._phantoms_4d import _gen_moving_phantom
@@ -2394,7 +2229,6 @@ def gen_demo_data_4d(
     phantom_shape = tuple(int(n) for n in ct_model.get_params('recon_shape'))
     phantom_4d = _gen_moving_phantom(object_type, phantom_shape, num_steps, **object_options)
 
-    # Each step's views are projected from that step's object.
     step_of_view = (np.arange(num_views) * num_steps) // num_views
     params['step_of_view'] = step_of_view
     sinogram = np.zeros(sinogram_shape, dtype=np.float32)

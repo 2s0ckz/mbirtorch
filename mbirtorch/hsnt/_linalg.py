@@ -4,19 +4,14 @@ import torch
 
 
 def _randomized_svd(X, n_components, n_oversamples=10, n_iter=4, seed=0):
-    """Truncated SVD via a randomized range finder.
-
-    A full SVD of an (n_samples, n_features) matrix is wasted work when only a
-    handful of components are wanted, and here n_components is the material count
-    -- rarely above 20 against a thousand or more wavelength bins. Seeded so the
-    result is reproducible.
-    """
+    """This function computes a truncated SVD of ``X`` by a randomized method.  The random
+    numbers come from a generator seeded with ``seed``, so the result is repeatable."""
     n_rows, n_cols = X.shape
     rank = min(n_components + n_oversamples, n_rows, n_cols)
     generator = torch.Generator(device=X.device).manual_seed(seed)
     Q, _ = torch.linalg.qr(X @ torch.randn(n_cols, rank, generator=generator,
                                            dtype=X.dtype, device=X.device))
-    for _ in range(n_iter):                      # power iterations sharpen the range
+    for _ in range(n_iter):                      # power iterations improve the estimate of the range
         Q, _ = torch.linalg.qr(X.T @ Q)
         Q, _ = torch.linalg.qr(X @ Q)
     U, singular_values, Vh = torch.linalg.svd(Q.T @ X, full_matrices=False)
@@ -24,20 +19,19 @@ def _randomized_svd(X, n_components, n_oversamples=10, n_iter=4, seed=0):
 
 
 def nndsvda(X, n_components):
-    """NNDSVD initialization for X ~= W @ H, with zeros filled.
+    """This function computes the NNDSVD initial values of ``W`` and ``H`` for the
+    factorization X ~= W @ H.
 
-    Every component after the first is one sign-half of a singular vector pair, so roughly half its entries are zero.
-    They are filled with sqrt(mean X): each factor carries sqrt(s_k), so that is the scale of a factor entry, and the
-    fill adds a fixed fraction of a typical entry to the product whatever the scale of X. A fill far below factor
-    scale would be frozen at zero by the two-metric projection of block_newton_step.
+    The NNDSVD factors contain zero entries.  This function replaces each zero entry with
+    sqrt(mean X), which is the typical size of a factor entry.
 
     Args:
-        X: Nonnegative array of shape (n_samples, n_features).
-        n_components: Factorization rank.
+        X: A nonnegative array of shape (n_samples, n_features).
+        n_components: The rank of the factorization.
 
     Returns:
-        W: Shape (n_samples, n_components).
-        H: Shape (n_components, n_features).
+        W: An array of shape (n_samples, n_components).
+        H: An array of shape (n_components, n_features).
     """
     if X.ndim != 2:
         raise ValueError("X must be two-dimensional.")
@@ -98,14 +92,8 @@ def nndsvda(X, n_components):
 
 
 def _batched_spd_solve(M, g, jitter_rel=1e-9):
-    """Solve M[b] d[b] = g[b] for a batch of small SPD matrices.
-
-    The system is solved in Jacobi scaling, D^-1/2 M D^-1/2 with D = diag(M), so the Tikhonov damping is relative to
-    each diagonal entry: a component whose curvature is orders of magnitude below another's (a skewed gauge, or a
-    component next to a huge one) keeps its Newton step, and rescaling a component leaves the solve equivariant. The
-    damping keeps the factorization well posed when Z is near zero (heavily attenuated pixels), and the fallback is
-    branch-free so no host synchronization is introduced inside the iteration.
-    """
+    """This function solves M[b] d[b] = g[b] for a batch of small symmetric positive definite
+    matrices.  It adds a small multiple of each diagonal entry to that entry before it solves."""
     rank = M.shape[-1]
     eye = torch.eye(rank, dtype=M.dtype, device=M.device)
     s = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(M.dtype).tiny).sqrt()
@@ -116,8 +104,7 @@ def _batched_spd_solve(M, g, jitter_rel=1e-9):
     gs = g / s
     d = torch.cholesky_solve(gs.unsqueeze(-1), L).squeeze(-1)
     d = torch.where(failed[:, :, 0], gs / torch.diagonal(A, dim1=-2, dim2=-1), d) / s
-    # A row with no curvature (Z underflows in float32 above an attenuation of about 88) makes the scaling divide by
-    # `tiny` and overflow; take no step there and let later gradient-driven steps bring the iterate back into range.
+    # A row with a zero diagonal entry makes the scaling overflow, so its step is set to zero.
     return torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -126,33 +113,23 @@ def _joint_dot(a, b, c, d):
 
 
 def _joint_blocks(flat, rows, cols, rank, free, jitter):
-    """(B,Q) upper triangle -> damped SPD (B,R,R) with frozen vars set to identity."""
+    """This function builds a batch of symmetric positive definite matrices of shape (B, R, R)
+    from their upper triangles of shape (B, Q), and returns their Cholesky factors."""
     M = flat.new_zeros(flat.shape[0], rank, rank)
     M[:, rows, cols] = flat
     M[:, cols, rows] = flat
     eye = torch.eye(rank, dtype=M.dtype, device=M.device)
     M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
-    # Damping relative to each diagonal entry (Jacobi), so that one component's curvature does not set another's.
+    # Each diagonal entry is increased by ``jitter`` times itself, so the components are scaled separately.
     M = M + torch.diag_embed(jitter * torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(M.dtype).tiny))
     L, info = torch.linalg.cholesky_ex(M)
     return torch.where((info > 0)[:, None, None], eye.expand_as(L), L)
 
 
 def _reseed_dead(W, H, T=None, seed=0):
-    """Re-seed any component whose map or spectrum is zero, both factors, with small random values. Returns (W, H,
-    number re-seeded).
-
-    With its spectrum at zero the map gets no gradient, and a spectrum whose every bin has an outward gradient stays
-    at zero, so the component contributes nothing from then on: a degenerate stationary point, which the first
-    projected step can reach from an ordinary start. The projected steps set a dying factor exactly to zero, and the
-    test is for exact zeros rather than for a norm small next to the other components': how a component's scale
-    splits between its map and its spectrum is arbitrary, and at low dose the fit can send one component to a huge
-    scale on the zero counts, next to which a live component looks dead. For the same reasons the seed's scale comes
-    from the data, sqrt(-log(mean T) / R) in both factors (given T whose mean is below 1; otherwise the median over
-    the live components of the geometric mean of their mean map and spectrum entries). The generator is seeded with
-    `seed`, so repeated re-seeds of a component can differ, and a random rather than constant seed keeps the revived
-    spectrum from being flat.
-    """
+    """This function replaces each component whose map or spectrum is exactly zero with small
+    random values in both ``W`` and ``H``.  It returns ``(W, H, n)``, where ``n`` is the number
+    of components replaced."""
     dead = (W.amax(0) <= 0) | (H.amax(1) <= 0)
     n_dead = int(dead.sum())
     if n_dead == 0:
@@ -171,10 +148,8 @@ def _reseed_dead(W, H, T=None, seed=0):
 
 
 def _attenuation_scale(T, rank, chunk=2 ** 23):
-    """sqrt(-log(mean T) / rank), the mean over every entry (zero counts included) taken in float64 by blocks of rows:
-    the scale of one factor entry of a component carrying 1/rank of a typical attenuation; 0 when the mean
-    transmission is not below 1. (The mean attenuation of the entries with counts will not do: at one count per bin
-    those are T >= 1, attenuation <= 0.)"""
+    """This function returns sqrt(-log(mean T) / rank), which is the typical size of one factor
+    entry.  It returns 0 when the mean transmission is not between 0 and 1."""
     rows = max(1, chunk // max(T.shape[1], 1))
     total = torch.zeros((), dtype=torch.float64, device=T.device)
     for i in range(0, T.shape[0], rows):
@@ -186,8 +161,8 @@ def _attenuation_scale(T, rank, chunk=2 ** 23):
 
 
 def _attenuation_for_start(T):
-    """-log T with zero counts floored at half the smallest positive transmission (the model is X = W H, X = -log T);
-    transmissions below 1e-12 count as zero counts."""
+    """This function returns -log T.  Before it takes the log, it sets each transmission below
+    1e-12 to half of the smallest transmission above 1e-12."""
     real = T > 1e-12
     if bool(real.any()) and not bool(real.all()):
         T = torch.where(real, T, 0.5 * T[real].min())
@@ -197,13 +172,13 @@ def _attenuation_for_start(T):
 
 
 def _nonneg_least_squares_start(A, H, ridge=1e-6):
-    """W >= 0 approximately minimizing ||A - W H||, from the R x R normal equations with a ridge relative to each
-    diagonal entry (so rescaling a row of H rescales its coefficient and nothing else), solved by Cholesky in float64
-    so that a rank-deficient H gives finite values on every device."""
+    """This function returns a nonnegative ``W`` that approximately minimizes ||A - W H||.  It
+    solves the ridge regularized normal equations by Cholesky factorization, and then it clips
+    negative entries to zero."""
     Hd = H.double()
     G = Hd @ Hd.T
     diag = torch.diagonal(G)
-    floor = 1e-12 * diag.mean().clamp_min(torch.finfo(torch.float64).tiny)     # a zero row of H: keep G definite
+    floor = 1e-12 * diag.mean().clamp_min(torch.finfo(torch.float64).tiny)     # keeps G definite if a row of H is zero
     G = G + ridge * torch.diag_embed(torch.maximum(diag, floor))
     W = torch.cholesky_solve((A.double() @ Hd.T).T, torch.linalg.cholesky(G)).T
     return W.clamp_(min=0).to(A.dtype)

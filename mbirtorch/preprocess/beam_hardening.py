@@ -11,11 +11,12 @@ from .recon_utils import segment_plastic_metal, compute_scaling_factor
 __all__ = ['BH_correction']
 
 
-# These helpers apply an operation to a sinogram held either as one tensor or as a Shards
-# container with one piece per device.  Reductions combine the per piece results on the host.
+# The helpers below accept a sinogram as one tensor or as a Shards container with one
+# tensor per device.
 
 def _ps_map(fn, *xs):
-    """Elementwise: fn over aligned inputs, returned in the same form."""
+    """This function applies fn to the inputs, one device tensor at a time, and returns the
+    result in the same form as the inputs."""
     if isinstance(xs[0], _sharding.Shards):
         parts = [fn(*[x.tensors[i] for x in xs])
                  for i in range(xs[0].placement.n_devices)]
@@ -24,7 +25,8 @@ def _ps_map(fn, *xs):
 
 
 def _ps_sum(fn, *xs):
-    """float: fn (a scalar reduction) summed across the pieces."""
+    """This function applies the scalar reduction fn to each device tensor and returns the sum
+    as a float."""
     if isinstance(xs[0], _sharding.Shards):
         return sum(float(fn(*[x.tensors[i] for x in xs]))
                    for i in range(xs[0].placement.n_devices))
@@ -32,22 +34,23 @@ def _ps_sum(fn, *xs):
 
 
 def _ps_max(fn, x):
-    """float: fn (a scalar reduction) maximized across the pieces.  A piece with no elements is
-    skipped, since a device may own no views."""
+    """This function applies the scalar reduction fn to each nonempty device tensor and
+    returns the maximum as a float."""
     if isinstance(x, _sharding.Shards):
         return max(float(fn(t)) for t in x.tensors if t.numel() > 0)
     return float(fn(x))
 
 
 def _ps_numel(x):
-    """int: total element count across the pieces."""
+    """This function returns the total number of elements in all device tensors, as an int."""
     if isinstance(x, _sharding.Shards):
         return sum(t.numel() for t in x.tensors)
     return x.numel()
 
 
 def _ps_item(x, idx):
-    """float: the value at a global (view, row, col) index."""
+    """This function returns the value at a (view, row, col) index of the whole sinogram, as
+    a float."""
     if isinstance(x, _sharding.Shards):
         pl = x.placement
         for t, (_d, (v0, v1)) in zip(x.tensors, pl.shard_ranges()):
@@ -58,8 +61,8 @@ def _ps_item(x, idx):
 
 
 def _ps_argmin3d(x):
-    """Global (view, row, col) of the minimum, plus the value.  A tie resolves to the first view,
-    which matches the single tensor argmin."""
+    """This function returns the (view, row, col) index of the minimum in the whole sinogram,
+    and the minimum value.  If several views share the minimum, it returns the first view."""
     if not isinstance(x, _sharding.Shards):
         return _argmin_3d(x)
     pl = x.placement
@@ -75,21 +78,21 @@ def _ps_argmin3d(x):
 
 def BH_correction(sino, alpha, batch_size=64, devices=None):
     """
-    Apply a polynomial beam hardening correction to a sinogram.
-
-    Each value ``p`` of the sinogram is replaced by ``alpha[0] p + alpha[1] p**2 + alpha[2] p**3 + ...``.
-    Takes a numpy array or a tensor and returns a numpy array.
+    This function applies a polynomial beam hardening correction to a sinogram.  It replaces
+    each value ``p`` by ``alpha[0] p + alpha[1] p**2 + alpha[2] p**3 + ...``.
 
     Args:
-        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
-        alpha (sequence of float): The polynomial coefficients; ``alpha[k]`` multiplies ``p**(k+1)``.
-        batch_size (int, optional): Views processed at a time.  Defaults to 64.
-        devices (sequence or None, optional): Devices to spread the views over.  None uses all visible
-            CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when it is set, or the default device
-            when there are none.  Defaults to None.
+        sino (numpy array or tensor): The sinogram, with shape (num_views, num_det_rows,
+            num_det_channels).
+        alpha (sequence of float): The polynomial coefficients.  The coefficient ``alpha[k]``
+            multiplies ``p**(k+1)``.
+        batch_size (int, optional): The number of views processed at a time.  Defaults to 64.
+        devices (sequence or None, optional): The devices to divide the views among.  None
+            means all visible CUDA devices, up to the number set by ``MBIRTORCH_NUM_DEVICES``.
+            If there is no CUDA device, None means the default device.  Defaults to None.
 
     Returns:
-        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+        numpy.ndarray: The corrected sinogram, with the shape of ``sino``.
 
     Example:
         >>> sino = BH_correction(sino, alpha=[1.0, 0.2, 0.1])
@@ -110,16 +113,15 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
 
 def _generate_metal_exponent_list(num_metal, max_order):
     """
-    Generate all combinations of polynomial powers such that the total degree
-    (sum of exponents) is <= max_order, excluding the all-zero combination.
-    The combinations are sorted in increasing order of total degree.
+    This function returns every exponent tuple with total degree from 1 to max_order.  It
+    sorts the tuples by total degree.
 
     Args:
-        num_metal (int): Number of metals.
-        max_order (int): Maximum total degree of the polynomial.
+        num_metal (int): The number of metals, which is the length of each tuple.
+        max_order (int): The maximum total degree of the polynomial.
 
     Returns:
-        list[tuple[int]]: List of exponent tuples representing valid terms.
+        list[tuple[int]]: The exponent tuples.  Each tuple gives the exponents of one term.
     """
     combinations = []
 
@@ -142,19 +144,21 @@ def _generate_metal_exponent_list(num_metal, max_order):
 def _est_plastic_metal_sinos_from_recon(recon, num_metal, ct_model,
                                         radial_margin=None, top_margin=None, bottom_margin=None):
     """
-    Segment plastic and metal regions from a reconstruction, project them,
-    and return the unnormalized sinogram p, m0, m1, ... for beam hardening modeling.
+    This function segments the plastic and metal regions of a reconstruction and forward
+    projects them.  It returns the unnormalized sinograms p, m0, m1, ... that the beam
+    hardening model uses.
 
     Args:
-        recon (ndarray or tensor): Reconstructed image.
-        num_metal (int): Number of metal types to segment.
-        ct_model: Forward projection model with a `.forward_project()` method.
-        radial_margin, top_margin, bottom_margin (int or None, optional): Segmentation mask
-            margins; None (default) = size-relative (see segment_plastic_metal).
+        recon (ndarray or tensor): The reconstruction.
+        num_metal (int): The number of metal types to segment.
+        ct_model: The model used for the forward projection.
+        radial_margin, top_margin, bottom_margin (int or None, optional): The margins of the
+            segmentation mask.  None means a margin proportional to the volume size, as in
+            ``segment_plastic_metal``.  Defaults to None.
 
     Returns:
-        plastic_sino_est (tensor): Unnormalized plastic sino estimation.
-        metal_sino_est (list of tensor): List of unnormalized metal sino estimation.
+        plastic_sino_est (tensor): The unnormalized estimate of the plastic sinogram.
+        metal_sino_est (list of tensor): The unnormalized estimates of the metal sinograms.
     """
     recon = ct_model._shard_recon(recon)
 
@@ -178,26 +182,23 @@ def _est_plastic_metal_sinos_from_recon(recon, num_metal, ct_model,
 
 def _get_column_H(col_index, plastic_sino_est, metal_sino_est, H_exponent_list):
     """
-    Compute the col_index-th column of the matrix H.
-
-    The column is constructed as a monomial of the form:
-        H[:, col_index] = p^e0 * m_0^e1 * m_1^e2 * ... * m_{n-1}^en
-
-    where (e0, e1, ..., en) = H_exponent_list[col_index].
+    This function computes column ``col_index`` of the matrix H.  The column is the monomial
+    ``p^e0 * m_0^e1 * ... * m_{n-1}^en``, where the exponents are
+    ``H_exponent_list[col_index]``.
 
     Args:
-        col_index (int): Index of the column to compute.
-        plastic_sino_est (tensor): Normalized plastic sinogram estimation.
-        metal_sino_est (list of tensor): Normalized metal sinogram estimation [m_0, m_1, ..., m_{n-1}].
-        H_exponent_list (list of tuple): List of exponent tuples defining each column of H.
+        col_index (int): The index of the column to compute.
+        plastic_sino_est (tensor): The normalized estimate of the plastic sinogram.
+        metal_sino_est (list of tensor): The normalized estimates of the metal sinograms
+            [m_0, m_1, ..., m_{n-1}].
+        H_exponent_list (list of tuple): The exponent tuple of each column of H.
 
     Returns:
-        tensor: The computed column of H (same shape as p and m_i).
+        tensor: The column of H, with the same shape as p and m_i.
     """
     exponents = H_exponent_list[col_index]
     assert len(exponents) == 1 + len(metal_sino_est), "Mismatch between exponent tuple and number of sinograms."
 
-    # An exponent of 0 contributes nothing, and an exponent of 1 needs no power operation.  Both are skipped.
     col = None
     for arr, exp in zip([plastic_sino_est] + list(metal_sino_est), exponents):
         if exp == 0:
@@ -205,25 +206,22 @@ def _get_column_H(col_index, plastic_sino_est, metal_sino_est, H_exponent_list):
         term = arr if exp == 1 else arr ** exp
         col = term if col is None else col * term
     if col is None:
-        # An all zero exponent tuple gives the constant column.
         col = torch.ones_like(plastic_sino_est)
     return col
 
 def _get_row_H(pixel_index, plastic_sino_est, metal_sino_est, H_exponent_list):
     """
-    Compute the row of the matrix H for one sinogram pixel.
-
-    H has one row per sinogram pixel, so ``pixel_index`` selects a row of H.  The middle entry of
-    ``pixel_index`` is the detector row, which is a different axis from the row of H.
+    This function computes the row of the matrix H for one sinogram pixel.
 
     Args:
-        pixel_index (tuple of int): (view, row, col) of the pixel, identifying the row of H to compute.
-        plastic_sino_est (tensor): Normalized plastic sinogram estimation.
-        metal_sino_est (list of tensor): Normalized metal sinogram estimation [m_0, m_1, ..., m_{n-1}].
-        H_exponent_list (list of tuple): List of exponent tuples defining each column of H.
+        pixel_index (tuple of int): The (view, row, col) index of the pixel.
+        plastic_sino_est (tensor): The normalized estimate of the plastic sinogram.
+        metal_sino_est (list of tensor): The normalized estimates of the metal sinograms
+            [m_0, m_1, ..., m_{n-1}].
+        H_exponent_list (list of tuple): The exponent tuple of each column of H.
 
     Returns:
-        ndarray: The computed row of H.
+        ndarray: The row of H.
     """
     pi = _ps_item(plastic_sino_est, pixel_index)
     mi = [_ps_item(m, pixel_index) for m in metal_sino_est]
@@ -237,9 +235,9 @@ def _get_row_H(pixel_index, plastic_sino_est, metal_sino_est, H_exponent_list):
 
 
 def _argmin_3d(x):
-    """Index of the minimum of a 3D sinogram shaped array as Python ints (view, row, col), plus the
-    minimum value.  A tie resolves to the first view and the first position within it.
-    """
+    """This function returns the (view, row, col) index of the minimum of a 3D array, as
+    Python ints, and the minimum value.  If several entries share the minimum, it returns the
+    first one."""
     num_views, num_rows, num_channels = x.shape
     per_view = x.reshape(num_views, -1)              # (V, R*C)
     per_view_min, plane_argmin = torch.min(per_view, dim=1)
@@ -248,35 +246,27 @@ def _argmin_3d(x):
     return (view, row, col), per_view_min[view]
 
 
-# A pixel is eligible for a residual positivity constraint when some metal estimate exceeds this
-# value.  The metal estimates are normalized to a maximum of 1 before the fit.
+# The constraint y - H_m θ_m >= 0 is applied only at pixels where some metal estimate exceeds
+# this value.  The metal estimates are normalized to a maximum of 1.
 _METAL_SUPPORT_FLOOR = 1e-3
 
 
 def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms):
     """
-    Compute the most violated constraints for the beam hardening model.
-
-    The BH model enforces two types of inequality constraints:
-        1. Plastic positivity:        H_p[i,:] θ_p ≥ 0
-        2. Residual positivity:       y[i] − H_m[i,:] θ_m ≥ 0
-
-    This function evaluates the indices and values of the entries that most violate
-    the constraints.
-
-    The residual search is restricted to pixels where some metal estimate exceeds
-    ``_METAL_SUPPORT_FLOOR``.  Where every metal estimate is near zero the row H_m[i,:] is near
-    zero, so no θ can move that residual.  Such a pixel makes OSQP declare the whole problem
-    infeasible when y[i] is negative, which noisy sinograms contain on air rays.
+    This function finds the most violated constraint of each of the two types in the beam
+    hardening model.  The constraints are ``H_p[i,:] θ_p ≥ 0`` and ``y[i] − H_m[i,:] θ_m ≥ 0``.
+    The function checks the second constraint only where some metal estimate exceeds
+    ``_METAL_SUPPORT_FLOOR``.
 
     Returns:
-        idx_min_Sp (tuple of int): (view, row, col) of the smallest Sp entry.
-        v_min_Sp (scalar): Value of Sp at that entry.
-        idx_min_residual (tuple of int): (view, row, col) of the smallest (y − Sm) entry.
-        v_min_residual (scalar): Value of (y − Sm) at that entry.
+        idx_min_Sp (tuple of int): The (view, row, col) index of the smallest entry of Sp.
+        v_min_Sp (scalar): The value of Sp at that index.
+        idx_min_residual (tuple of int): The (view, row, col) index of the smallest entry of
+            (y − Sm).
+        v_min_residual (scalar): The value of (y − Sm) at that index.
     """
     num_cols = len(H_exponent_list)
-    # Zeroing the p exponent gives the coefficient of p in each column.
+    # Setting the p exponent to zero gives the coefficient of p in each column.
     p_coeff_exponents = [(0,) + exps[1:] for exps in H_exponent_list]
 
     def build_sp(p, *ms):
@@ -294,7 +284,7 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
     Sp = _ps_map(build_sp, plastic_sino_est, *metal_sino_est)
     y_minus_Sm = _ps_map(build_y_minus_sm, measured_sino, plastic_sino_est, *metal_sino_est)
 
-    # A pixel with no metal support cannot be moved by theta, so it must never become a constraint.
+    # theta cannot change y - Sm at a pixel with no metal, so such a pixel is never a constraint.
     def mask_residual(ym, *ms):
         support = torch.zeros_like(ym, dtype=torch.bool)
         for metal in ms:
@@ -312,33 +302,26 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
 
 def _estimate_BH_model_params_using_OSQP(P, q, A, u):
     """
-    Solve the constrained quadratic optimization problem:
-
-        minimize_θ   0.5 * θᵀ P θ + qᵀ θ
-        subject to   A θ ≤ u
-
-    The problem is solved using the OSQP solver when constraints are provided.
-    If `A` or `u` is `None`, an unconstrained least-squares solution is computed directly.
+    This function solves ``minimize 0.5 θᵀ P θ + qᵀ θ subject to A θ ≤ u`` with OSQP.  If
+    ``A`` or ``u`` is None, it solves the unconstrained problem with a linear solve.
 
     Args:
-        P (ndarray): Quadratic term matrix.
-        q (ndarray): Linear term vector.
-        A (ndarray): Inequality constraint matrix.
-        u (ndarray): Right-hand side vector for the inequality constraints.
+        P (ndarray): The matrix of the quadratic term.
+        q (ndarray): The vector of the linear term.
+        A (ndarray): The inequality constraint matrix.
+        u (ndarray): The right side of the inequality constraints.
 
     Returns:
-        ndarray or None: Solution vector θ, or ``None`` when the constrained solve fails
-        (a non-solved OSQP status, or a non-finite solution vector).
+        ndarray or None: The solution θ, or None if the constrained solve fails.
     """
     P_numpy = np.asarray(P, dtype=np.float64)
     q_numpy = np.asarray(q, dtype=np.float64)
 
     if A is None or u is None:
-        # There are no constraints, so solve the small unconstrained system directly.
         theta = np.linalg.solve(P_numpy, -q_numpy)
         return np.asarray(theta, dtype=np.float32)
 
-    # osqp and scipy.sparse are imported here because most callers never fit a beam hardening model.
+    # The import is local because most callers never fit a beam hardening model.
     from scipy.sparse import csc_matrix
     import osqp
     A_numpy = np.asarray(A, dtype=np.float64)
@@ -351,8 +334,8 @@ def _estimate_BH_model_params_using_OSQP(P, q, A, u):
     solver.setup(P=P_sparse, q=q_numpy, A=A_sparse, l=None, u=u_numpy, alpha=1.0, verbose=0)
     result = solver.solve()
 
-    # OSQP reports failure in result.info.status rather than by raising.  On failure it fills
-    # result.x with the finite sentinel 2143289344.0, so accept only a solved status with finite values.
+    # On failure, OSQP sets result.info.status and fills result.x with 2143289344.0.  So the
+    # code accepts only a solved status with finite values.
     status = str(result.info.status).strip().lower()
     theta = np.asarray(result.x, dtype=np.float64)
     if not status.startswith('solved') or not np.all(np.isfinite(theta)):
@@ -361,13 +344,14 @@ def _estimate_BH_model_params_using_OSQP(P, q, A, u):
     return np.asarray(theta, dtype=np.float32)
 
 def _compute_entry_for_OSQP(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta):
-    """Compute entries for OSQP quadratic programming solver."""
+    """This function computes the matrix P and the vector q of the quadratic program that
+    OSQP solves."""
     num_cols = len(H_exponent_list)
 
     HtH = np.zeros((num_cols, num_cols), dtype=np.float64)
     Hty = np.zeros(num_cols, dtype=np.float64)
 
-    # Compute the upper triangle of HtH and mirror it.
+    # The code computes the upper triangle of HtH and copies it to the lower triangle.
     def column(i):
         return _ps_map(lambda p, *ms: _get_column_H(i, p, list(ms), H_exponent_list),
                        plastic_sino_est, *metal_sino_est)
@@ -385,7 +369,7 @@ def _compute_entry_for_OSQP(plastic_sino_est, metal_sino_est, measured_sino, H_e
     cross_degree = [sum(exponent) for exponent in H_exponent_list[0:1+num_cross_terms]]
     metal_degree = [sum(exponent) for exponent in H_exponent_list[1+num_cross_terms:]]
 
-    # Diagonal regularization weights.  A higher degree term is penalized more when alpha > 0.
+    # When alpha > 0, a term of higher degree has a larger penalty.
     weights = np.asarray(cross_degree + metal_degree, dtype=np.float64)
     weight_matrix = np.diag(1 + weights ** alpha)
 
@@ -399,39 +383,30 @@ def _compute_entry_for_OSQP(plastic_sino_est, metal_sino_est, measured_sino, H_e
 
 def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta, num_constraint_update_iter=10, tolerance=-1e-5):
     """
-    Estimate polynomial beam hardening model parameters with iterative constraints search.
-
-    This function solves a regularized least squares problem with inequality constraints to
-    enforce nonnegativity on the plastic and residual sinograms. The optimization problem is:
+    This function estimates the parameters of the polynomial beam hardening model.  It solves
 
         minimize_θ   0.5‖Hθ − y‖² + 0.5λ‖θ‖²_Λ
-        subject to   H_p[i,:] θ_p ≥ 0 and y[i] − H_m[i,:] θ_m ≥ 0
+        subject to   H_p[i,:] θ_p ≥ 0 and y[i] − H_m[i,:] θ_m ≥ 0.
 
-    where:
-        - H_p contains the plastic and plastic–metal cross-term columns.
-        - H_m contains the metal-only columns.
-
-    The function uses an iterative active constraint selection method:
-        1. Start from the unconstrained least squares estimate.
-        2. Identify indices where the constraints are violated.
-        3. Add the most violated constraints to the set.
-        4. Re-solve the quadratic program (QP) using OSQP.
-        5. Repeat until all constraints are satisfied or `num_constraint_update_iter` is reached.
+    In each iteration, the function adds the most violated constraint of each type and
+    solves again.  H_p holds the plastic column and the cross term columns.  H_m holds the
+    metal-only columns.
 
     Args:
-        plastic_sino_est (tensor): Normalized plastic sinogram estimation.
-        metal_sino_est (list of tensor): List of normalized metal sino estimation.
-        measured_sino (tensor): Measured sinogram.
-        H_exponent_list (list of tuple[int]): List of exponent tuples defining each column of the matrix H.
-        num_cross_terms (int): Number of cross terms (plastic × metal); remaining terms are metal-only.
-        alpha (float): Regularization exponent; higher alpha penalizes higher-degree terms more.
-        beta (float): Regularization strength scaling factor.
-        num_constraint_update_iter (int): Number of iterations for updating constraints.
-        tolerance (float): Tolerance for stopping criteria.
+        plastic_sino_est (tensor): The normalized estimate of the plastic sinogram.
+        metal_sino_est (list of tensor): The normalized estimates of the metal sinograms.
+        measured_sino (tensor): The measured sinogram.
+        H_exponent_list (list of tuple[int]): The exponent tuple of each column of H.
+        num_cross_terms (int): The number of cross terms (plastic × metal).  The remaining
+            terms after the plastic and cross terms are metal-only.
+        alpha (float): The regularization exponent.  A higher alpha penalizes terms of higher
+            degree more.
+        beta (float): The scale factor of the regularization strength.
+        num_constraint_update_iter (int): The maximum number of constraint update iterations.
+        tolerance (float): The iterations stop when no constraint is below this value.
 
     Returns:
-        theta (ndarray): Estimated model parameters corresponding to each column in H.
-
+        theta (ndarray): The model parameters, one for each column of H.
     """
     num_cols = len(H_exponent_list)
     dp = 1 + num_cross_terms
@@ -440,7 +415,7 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
     C_m = []
 
     P, q = _compute_entry_for_OSQP(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta)
-    A = np.zeros((0, num_cols))  # no active constraints yet
+    A = np.zeros((0, num_cols))  # No constraints are active yet.
     u = np.zeros((0,))
 
     theta = _estimate_BH_model_params_using_OSQP(P, q, A=None, u=None)
@@ -450,10 +425,9 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
 
         # (1) Hp θp ≥ 0  ->  (-Hp) θ ≤ 0
         if v_min_Sp < tolerance and (idx_min_Sp not in C_p):
-            # Zeroing the p exponent gives the coefficient of p in the row.
             p_coeff_exponents = [(0,) + exps[1:] for exps in H_exponent_list]
             row_p = _get_row_H(idx_min_Sp, plastic_sino_est, metal_sino_est, p_coeff_exponents)
-            # The sign of row_p[:dp] is negated so that Hp θp >= 0.
+            # row_p[:dp] is negated so that the constraint reads (-Hp) θ <= 0.
             A_p = np.concatenate([-row_p[:dp], np.zeros((num_cols - dp,))])
             u_p = np.array([0.0])
             A = np.vstack([A, A_p[None, :]])
@@ -463,10 +437,10 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
         # (2) y − Hm θm ≥ 0  ->  (Hm) θ ≤ y
         if v_min_residual < tolerance and (idx_min_residual not in C_m):
             row_m = _get_row_H(idx_min_residual, plastic_sino_est, metal_sino_est, H_exponent_list)
-            # row_m[dp:] is kept positive so that y - Hm θm >= 0.
+            # row_m[dp:] keeps its sign so that the constraint reads Hm θ <= y.
             A_m = np.concatenate([np.zeros(dp), row_m[dp:]])
-            # The right side is clamped at 0.  The metal contribution is a nonnegative attenuation,
-            # and a negative measurement would force large negative metal coefficients.
+            # The bound is clamped at 0, because a negative measurement would force large
+            # negative metal coefficients.
             u_m = np.array([max(_ps_item(measured_sino, idx_min_residual), 0.0)])
             A = np.vstack([A, A_m[None, :]])
             u = np.concatenate([u, u_m])
@@ -476,7 +450,7 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
             break
         theta_new = _estimate_BH_model_params_using_OSQP(P, q, A, u)
         if theta_new is None:
-            # Keep the last good theta rather than passing the OSQP failure sentinel downstream.
+            # The function keeps the last theta that OSQP solved.
             warnings.warn("OSQP failed to solve the constrained beam-hardening fit; keeping the "
                           "parameters from the previous constraint iteration.", RuntimeWarning)
             break
@@ -486,40 +460,28 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
 
 def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms, num_metal_terms, p_normalization, gamma):
     """
-    Perform beam hardening correction on the plastic sinogram.
-
-    This function subtracts the metal-only contributions from the measured sinogram
-    and normalizes the result using the linear plastic component, yielding a corrected
-    sinogram that approximates the plastic-only contribution.
-
-    The correction is based on a polynomial matrix H whose columns correspond to:
-        - Plastic term: p
-        - Cross terms: p*m, p*m^2, ...
-        - Metal-only terms: m, m^2, m^3, ...
-
-    The H matrix looks like: [p, p*m, p*m^2, m, m^2, m^3]
-    The correction is applied as:
-        corrected_plastic = p_normalization * max(y - H_metal·θ_m, 0) / (max(H_plastic·θ_p, γ * mean(H_plastic·θ_p))
-    The stabilization term involving γ prevents division by near-zero or negative values, reducing streaks
-    and numerical instability.
+    This function returns the part of the measured sinogram that comes from the plastic.
+    The result is
+    ``p_normalization * max(y - H_metal θ_m, 0) / max(H_plastic θ_p, γ mean(H_plastic θ_p))``.
+    The columns of H are p, the cross terms p*m, p*m^2, ..., and the metal terms m, m^2, ....
 
     Args:
-        measured_sino (tensor): Measured sinogram.
-        plastic_sino_est (tensor): Normalized plastic sino estimation.
-        metal_sino_est (list of tensor): List of normalized metal sino estimation.
-        theta (ndarray): Estimated coefficients for the polynomial terms in H.
-        H_exponent_list (list of tuple): Exponent tuples defining each column of H.
-        num_cross_terms (int): Number of cross terms involving both p and metal.
-        num_metal_terms (int): Number of metal-only terms in H.
-        p_normalization (float): Normalization factor applied to p.
-        gamma (float, optional): Stabilization factor.
+        measured_sino (tensor): The measured sinogram.
+        plastic_sino_est (tensor): The normalized estimate of the plastic sinogram.
+        metal_sino_est (list of tensor): The normalized estimates of the metal sinograms.
+        theta (ndarray): The coefficients of the polynomial terms in H.
+        H_exponent_list (list of tuple): The exponent tuple of each column of H.
+        num_cross_terms (int): The number of cross terms that contain both p and a metal.
+        num_metal_terms (int): The number of metal-only terms in H.
+        p_normalization (float): The normalization factor of p.
+        gamma (float): The stabilization factor γ.  It sets the smallest denominator as a
+            fraction of the mean of H_plastic θ_p.
 
     Returns:
-        corrected_plastic_sino (tensor): Beam-hardening-corrected plastic sinogram.
+        corrected_plastic_sino (tensor): The plastic sinogram with beam hardening corrected.
     """
 
-    # The denominator uses the first 1 + num_cross_terms columns of H.  Zeroing the p exponent
-    # gives the coefficient of p in each column.
+    # The denominator uses the first 1 + num_cross_terms columns of H.
     p_coeff_exponents = [(0,) + exps[1:] for exps in H_exponent_list]
 
     def build_sp(p, *ms):
@@ -537,19 +499,15 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
     Sp = _ps_map(build_sp, plastic_sino_est, *metal_sino_est)
     y_minus_Sm = _ps_map(build_y_minus_sm, measured_sino, plastic_sino_est, *metal_sino_est)
 
-    # The central plastic coefficient sets a stabilization floor.  A sharded input is summed per
-    # piece and divided on the host.
     if not isinstance(Sp, _sharding.Shards):
         mean_plastic_coef = torch.mean(Sp)
     else:
         mean_plastic_coef = _ps_sum(torch.sum, Sp) / _ps_numel(Sp)
     Sp_floor = gamma * mean_plastic_coef
 
-    # A negative mean is not physical and may indicate instability.
     if float(mean_plastic_coef) <= 0:
         warnings.warn("Mean of Sp is negative", RuntimeWarning)
 
-    # Clamp Sp at Sp_floor to prevent division by very small or negative values.
     def clamp_and_divide(sp, ym):
         floor = (Sp_floor if torch.is_tensor(Sp_floor)
                  else torch.as_tensor(Sp_floor, dtype=sp.dtype, device=sp.device))
@@ -560,8 +518,7 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
     return corrected_plastic_sino
 
 def _estimate_plastic_scaling(plastic_sino_est, metal_sino_est, measured_sino, plastic_sino_corrected):
-    # The scaling is a least squares fit between the corrected plastic sinogram and the measured
-    # sinogram.  Only the locations where plastic is present and every metal is absent are used.
+    # This function returns a least squares scale fit over the pixels with plastic and no metal.
     def keep_plastic_only(x, p, *ms):
         condition = (p != 0)
         for metal in ms:
@@ -577,33 +534,41 @@ def _estimate_plastic_scaling(plastic_sino_est, metal_sino_est, measured_sino, p
 def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, order=3, alpha=1, beta=0.002, gamma=0.1, num_constraint_update_iter=10,
                                radial_margin=None, top_margin=None, bottom_margin=None):
     """
-    This function corrects the measured sinogram of an object with plastic and multiple metal components by fitting a
-    beam hardening model to the sinogram and removing the metal contributions.
+    This function corrects beam hardening in the sinogram of an object with plastic and metal
+    parts.  It fits a beam hardening model to the sinogram.  The result is the corrected plastic
+    sinogram plus the forward projections of the metal regions.
 
     Args:
-        ct_model: CT model object with a `forward_project` method and recon_placement / sino_placement.
-        measured_sino (ndarray): Raw measured sinogram.
-        recon (ndarray or tensor): Reconstructed 3D volume used for segmentation of plastic and metal regions.
-        num_metal (int, optional): Number of metal materials to segment and correct for. Defaults to 1.
-        order (int, optional): Maximum total degree of the beam hardening correction polynomial. Defaults to 3.
-        alpha (float, optional): Degree-dependent scaling factor for regularization weights. Higher values penalize
-            higher-order terms more strongly. Defaults to 1.
-        beta (float, optional): Regularization strength for ridge regression. Defaults to 0.002.
-        gamma (float, optional): Stabilization factor. Defaults to 0.1.
-        num_constraint_update_iter (int, optional): Number of iterations for updating constraints. Defaults to 10.
-        radial_margin, top_margin, bottom_margin (int or None, optional): Segmentation mask margins;
-            None (default) = size-relative (see segment_plastic_metal).
+        ct_model: The CT model of the scan.
+        measured_sino (ndarray): The measured sinogram.
+        recon (ndarray or tensor): A reconstruction of the 3D volume.  The function segments it
+            into plastic and metal regions.
+        num_metal (int, optional): The number of metal materials to segment and correct.
+            Defaults to 1.
+        order (int, optional): The maximum total degree of the correction polynomial.
+            Defaults to 3.
+        alpha (float, optional): The exponent of the degree in the regularization weights.
+            Higher values penalize terms of higher degree more.  Defaults to 1.
+        beta (float, optional): The strength of the ridge regularization.  Defaults to 0.002.
+        gamma (float, optional): The stabilization factor.  It sets the smallest denominator
+            in the plastic correction as a fraction of the mean of the denominator.  Defaults
+            to 0.1.
+        num_constraint_update_iter (int, optional): The maximum number of constraint update
+            iterations.  Defaults to 10.
+        radial_margin, top_margin, bottom_margin (int or None, optional): The margins of the
+            segmentation mask.  None means a margin proportional to the volume size, as in
+            ``segment_plastic_metal``.  Defaults to None.
 
     Returns:
-        ndarray: Beam-hardening corrected sinogram of the same shape as `measured_sino`.
+        ndarray: The corrected sinogram, with the shape of ``measured_sino``.
     """
     metal_exponent_list = _generate_metal_exponent_list(num_metal, order)
     cross_exponent_list = _generate_metal_exponent_list(num_metal, order - 1)
     num_metal_terms = len(metal_exponent_list)
     num_cross_terms = len(cross_exponent_list)
 
-    # Each entry of H_exponent_list holds the exponents of (p, m_0, ..., m_{num_metal-1}).  The
-    # first entry is the linear plastic term, then come the cross terms, then the metal only terms.
+    # Each tuple holds the exponents of (p, m_0, ..., m_{num_metal-1}).  The order is the
+    # linear plastic term, then the cross terms, then the metal-only terms.
     H_exponent_list = (
             [(1,) + (0,) * num_metal] +
             [(1, *t) for t in cross_exponent_list] +
@@ -616,8 +581,7 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
         bottom_margin=bottom_margin)
     plastic_sino_scale = _ps_max(lambda t: torch.max(torch.abs(t)), plastic_sino_est)
     metal_sino_scale = [_ps_max(lambda t: torch.max(torch.abs(t)), arr) for arr in metal_sino_est]
-    # An empty plastic or metal estimate would fill the normalized sinogram with NaNs, so check the
-    # scales here.  ``not > 0`` also catches a NaN scale.
+    # An empty estimate would give NaNs.  The test ``not > 0`` also catches a NaN scale.
     if not float(plastic_sino_scale) > 0:
         raise ValueError(
             "The estimated plastic sinogram is empty (the plastic segmentation class contains no "
@@ -638,7 +602,6 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
 
     plastic_sino_corrected_scale = _estimate_plastic_scaling(plastic_sino_est, metal_sino_est, measured_sino, plastic_sino_corrected)
 
-    # Combine the corrected plastic sinogram with the metal sinograms and gather to the host.
     def combine(corrected, *ms):
         out = plastic_sino_corrected_scale * corrected
         for arr, norm in zip(ms, metal_sino_scale):
@@ -651,41 +614,29 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
 
 def fit_beam_hardening_curve(linear_projection, target_projection, num_parameters=5, zero_offset_normalized=True):
     """
-    Fit a parametric beam-hardening function from paired samples.
-
-    The fitted model is
-
-        f(p) = -log( sum_{i=1..N} exp(theta_i - i * theta_0 * p) )
-
-    with ``N = num_parameters - 1``.  The returned parameters are
-    ``[theta_0, theta_1, ..., theta_N]``.  With
-    ``zero_offset_normalized`` the model is shifted so that ``f(0) = 0``.
-    Evaluate the fitted curve with :func:`apply_beam_hardening_curve`, and
-    build the correction curve that inverts it with
-    :func:`fit_inverse_beam_hardening_curve`.
+    This function fits a beam hardening curve to paired samples.  The curve is
+    ``f(p) = -log( sum_{i=1..N} exp(theta_i - i * theta_0 * p) )``, with
+    ``N = num_parameters - 1``.  If ``zero_offset_normalized`` is True, the function shifts
+    the curve so that ``f(0) = 0``.
 
     Args:
-        linear_projection (np.ndarray): Ideal linear projection or path-length
-            samples.
-        target_projection (np.ndarray): Target beam-hardened projection
-            samples paired with ``linear_projection``.
-        num_parameters (int, optional): Total number of fitted parameters.
+        linear_projection (np.ndarray): The samples of the ideal linear projection or the path
+            length.
+        target_projection (np.ndarray): The samples of the beam hardened projection, paired
+            with ``linear_projection``.
+        num_parameters (int, optional): The total number of fitted parameters.
             Defaults to 5.
-        zero_offset_normalized (bool, optional): If True, use the normalized
-            forward model with ``h(0) = 0``. If False, use the
-            unnormalized log-sum-exp form. Defaults to True.
+        zero_offset_normalized (bool, optional): If True, the function uses the shifted
+            curve with ``f(0) = 0``.  Defaults to True.
 
     Returns:
-        ndarray: Optimized parameter vector
+        ndarray: The fitted parameters
             ``[theta_0, theta_1, ..., theta_{num_parameters-1}]``.
 
     Example:
-        >>> linear_projection = sinogram.ravel()
-        >>> target_projection = sinogram_nonlinear.ravel()
         >>> fitted_params = fit_beam_hardening_curve(
-        ...     linear_projection, target_projection, num_parameters=5)
-        >>> y_pred = apply_beam_hardening_curve(
-        ...     sinogram_test, fitted_params)
+        ...     sinogram.ravel(), sinogram_nonlinear.ravel(), num_parameters=5)
+        >>> y_pred = apply_beam_hardening_curve(sinogram_test, fitted_params)
     """
     num_parameters = int(num_parameters)
     if num_parameters < 2:
@@ -744,26 +695,25 @@ def fit_beam_hardening_curve(linear_projection, target_projection, num_parameter
 
 def apply_beam_hardening_curve(linear_projection, params, zero_offset_normalized=True):
     """
-    Apply a fitted parametric beam-hardening function.
+    This function applies a fitted beam hardening curve to linear projection values.
 
-    If ``zero_offset_normalized`` is True, this uses
+    If ``zero_offset_normalized`` is True, the function uses
 
         f(p) = log(sum_i exp(theta_i))
                - log(sum_i exp(theta_i - i * theta_0 * p)),
 
-    which forces ``f(0) = 0``. If False, this uses the form
+    which gives ``f(0) = 0``.  If False, the function uses
 
         f(p) = -log(sum_i exp(theta_i - i * theta_0 * p)).
 
     Args:
-        linear_projection (np.ndarray): Linear projection values.
-        params (np.ndarray): Parameter vector
-            ``[theta_0, theta_1, ..., theta_N]``.
-        zero_offset_normalized (bool, optional): Select the zero-normalized
-            forward model. Defaults to True.
+        linear_projection (np.ndarray): The linear projection values.
+        params (np.ndarray): The parameters ``[theta_0, theta_1, ..., theta_N]``.
+        zero_offset_normalized (bool, optional): If True, the function uses the curve with
+            ``f(0) = 0``.  Defaults to True.
 
     Returns:
-        ndarray: Beam-hardened projection values with the same shape as
+        ndarray: The beam hardened projection values, with the shape of
             ``linear_projection``.
     """
     linear_projection = np.asarray(linear_projection, dtype=np.float64)
@@ -793,18 +743,8 @@ def apply_beam_hardening_curve(linear_projection, params, zero_offset_normalized
 
 def _beam_hardening_curve_residuals(params, linear_projection, target_projection, zero_offset_normalized):
     """
-    Return fitted-minus-target residuals for nonlinear least-squares fitting.
-
-    Args:
-        params (np.ndarray): Current beam-hardening
-            model parameters.
-        linear_projection (np.ndarray): Filtered linear projection samples.
-        target_projection (np.ndarray): Filtered target beam-hardened samples.
-        zero_offset_normalized (bool, optional): Select the zero-normalized forward model.
-
-    Returns:
-        ndarray: One-dimensional residual vector used by
-            :func:`scipy.optimize.least_squares`.
+    This function returns the fitted values minus the target values, for
+    :func:`scipy.optimize.least_squares`.
     """
     fitted_projection = apply_beam_hardening_curve(
         linear_projection, params,
@@ -815,25 +755,24 @@ def _beam_hardening_curve_residuals(params, linear_projection, target_projection
 
 def fit_inverse_beam_hardening_curve(forward_params, vmin=0.0, vmax=5.0, degree=10, num_samples=2000, zero_offset_normalized=True):
     """
-    Fit a Chebyshev inverse that linearizes beam-hardened projections.
+    This function fits a Chebyshev polynomial that inverts a beam hardening curve.  The
+    polynomial maps beam hardened projections to linear projections.
 
     Args:
-        forward_params (np.ndarray): Forward beam-hardening parameters from
+        forward_params (np.ndarray): The beam hardening curve parameters from
             :func:`fit_beam_hardening_curve`.
-        vmin (float, optional): Minimum input projection value to correct.
-            Defaults to 0.0.
-        vmax (float, optional): Maximum input projection value to correct.
-            Defaults to 5.0.
-        degree (int, optional): Chebyshev polynomial degree. Defaults to 10.
-        num_samples (int, optional): Number of fitting samples. Defaults to
+        vmin (float, optional): The smallest projection value to correct.  Defaults to 0.0.
+        vmax (float, optional): The largest projection value to correct.  Defaults to 5.0.
+        degree (int, optional): The degree of the Chebyshev polynomial.  Defaults to 10.
+        num_samples (int, optional): The number of samples used in the fit.  Defaults to
             2000.
-        zero_offset_normalized (bool, optional): Match the forward model
-            normalization used to fit ``forward_params``. Defaults to True.
+        zero_offset_normalized (bool, optional): The value of this argument used to fit
+            ``forward_params``.  Defaults to True.
 
     Returns:
-        tuple: ``(cheb_coeffs, y_domain)`` where ``cheb_coeffs`` is an
-            ndarray of length ``degree + 1`` and ``y_domain`` is ``(vmin,
-            vmax)`` for later inverse evaluation.
+        tuple: ``(cheb_coeffs, y_domain)``.  ``cheb_coeffs`` is an ndarray of length
+            ``degree + 1``.  ``y_domain`` is ``(vmin, vmax)``, which
+            :func:`apply_inverse_beam_hardening_curve` needs.
 
     Example:
         >>> forward_params = fit_beam_hardening_curve(
@@ -864,7 +803,7 @@ def fit_inverse_beam_hardening_curve(forward_params, vmin=0.0, vmax=5.0, degree=
             'fit_inverse_beam_hardening_curve: num_samples must be at least '
             'degree + 1.')
 
-    # Estimate the effective attenuation h'(0).
+    # The effective attenuation is the slope h'(0) of the forward curve.
     epsilon = 1e-6
     forward_at_zero = apply_beam_hardening_curve(
         0.0, forward_params,
@@ -879,7 +818,7 @@ def fit_inverse_beam_hardening_curve(forward_params, vmin=0.0, vmax=5.0, degree=
 
     path_min = 0.0
     path_max = max(path_min + 1.0, abs(vmax) + 1.0)
-    # Each pass doubles path_max.  This guard prevents an infinite expansion loop.
+    # The loop doubles path_max at most this many times.
     max_expand_iterations = 64
     for _ in range(max_expand_iterations):
         y_at_path_max = apply_beam_hardening_curve(
@@ -943,21 +882,20 @@ def fit_inverse_beam_hardening_curve(forward_params, vmin=0.0, vmax=5.0, degree=
 
 def apply_inverse_beam_hardening_curve(beam_hardened_projection, cheb_coeffs, y_domain, clip=False):
     """
-    Apply a fitted Chebyshev inverse to linearize projection values.
+    This function applies a fitted Chebyshev inverse to beam hardened projections.  The
+    result is the linearized projections.
 
     Args:
-        beam_hardened_projection (np.ndarray): Beam-hardened projection
-            values. Arrays of any shape are accepted and the output preserves
-            that shape.
-        cheb_coeffs (np.ndarray): Coefficients returned by
+        beam_hardened_projection (np.ndarray): The beam hardened projection values.  The
+            array may have any shape.
+        cheb_coeffs (np.ndarray): The coefficients returned by
             :func:`fit_inverse_beam_hardening_curve`.
-        y_domain (tuple): ``(vmin, vmax)`` projection range used for fitting.
-        clip (bool, optional): If True, clip input values into ``y_domain``
-            before evaluation. If False, warn when extrapolating. Defaults to
-            False.
+        y_domain (tuple): The projection range ``(vmin, vmax)`` used in the fit.
+        clip (bool, optional): If True, the function clips the input values to ``y_domain``.
+            If False, the function warns when it extrapolates.  Defaults to False.
 
     Returns:
-        ndarray: Linearized projection values with the same shape as
+        ndarray: The linearized projection values, with the shape of
             ``beam_hardened_projection``.
     """
     beam_hardened_projection = np.asarray(

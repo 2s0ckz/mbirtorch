@@ -1,17 +1,17 @@
 """This script writes mbirtorch/data/gpu_speeds.json from the newest nightly performance records.
 
-It is run before each release:
+A developer runs this script before each release:
 
     python dev_scripts/update_gpu_speeds.py
 
-It downloads the newest nightly records for the prerelease branch from the
-cabouman/mbirtorch_metrics repository, fits the time lines that mbirtorch.estimate_resources
-uses, prints the old and new values, and writes the speed file.  It is the only code that
-knows the format of the nightly records.  If the records are missing or have changed
-format, it stops and writes nothing.
+The script downloads the newest nightly records for the prerelease branch from the
+cabouman/mbirtorch_metrics repository.  It fits straight lines of run time against projection
+work, and ``mbirtorch.estimate_resources`` uses these lines.  The script prints the old and new
+times and then writes the speed file.  If the records are missing or have changed format, the
+script stops and writes nothing.
 
-The "gpus" section of the speed file (card memory, driver reserve, and time factor of each
-GPU model) is entered by hand and kept as it is.
+The "gpus" section of the speed file lists the card memory, driver reserve, and time factor of
+each GPU model.  A developer enters this section by hand, and the script keeps it unchanged.
 """
 import json
 import pathlib
@@ -36,18 +36,17 @@ SPEED_FILE = pathlib.Path(__file__).resolve().parents[1] / 'mbirtorch' / 'data' 
 #: The GPU models the speed file starts with when it does not exist yet.
 INITIAL_GPUS = {
     'H100': {'card_memory_gb': 80, 'driver_reserve_gib': 2.0, 'time_factor': 1.0},
-    # Memory speed of an H100 is 1.7 times that of an 80 GB A100 and 2.2 times that of a 40 GB A100.
     'A100': {'card_memory_gb': None, 'driver_reserve_gib': 2.0, 'time_factor': 2.0},
 }
 
 
 def fail(message):
-    """Stops without writing anything."""
+    """This function stops the script without writing anything."""
     sys.exit(f'update_gpu_speeds: {message}  The speed file was not changed.')
 
 
 def fetch(url):
-    """Returns the text at ``url``."""
+    """This function returns the text at ``url``."""
     try:
         with urllib.request.urlopen(url, timeout=60) as response:
             return response.read().decode()
@@ -56,7 +55,7 @@ def fetch(url):
 
 
 def nightly_model(geometry, size):
-    """Returns the model the nightly runs build for ``geometry`` and sinogram ``size``."""
+    """This function returns the model that the nightly runs build for ``geometry`` and sinogram ``size``."""
     num_views, num_rows, num_channels = size
     angles = np.linspace(0, np.pi, num_views, endpoint=False)
     if geometry == 'parallel':
@@ -70,13 +69,16 @@ def nightly_model(geometry, size):
 
 
 def iso_date(date):
-    """Returns a nightly run date such as 20261010 as 2026-10-10."""
+    """This function converts a nightly run date such as 20261010 to the form 2026-10-10."""
     text = str(date)
     return f'{text[:4]}-{text[4:6]}-{text[6:8]}' if re.fullmatch(r'\d{8}', text) else text
 
 
 def fit_line(work, seconds):
-    """Returns a and b of seconds = a + b * work, by least squares with a >= 0."""
+    """This function fits the line seconds = a + b * work by least squares and returns (a, b).
+
+    The fit constrains the intercept a to be nonnegative.
+    """
     work, seconds = np.asarray(work, float), np.asarray(seconds, float)
     b, a = np.polyfit(work, seconds, 1) if len(work) > 1 else (seconds[0] / work[0], 0.0)
     if a < 0:

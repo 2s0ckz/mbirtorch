@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 
 
-# The allowed metadata keys and what each one holds.
+# This dict lists the allowed metadata keys and describes the value of each one.
 KEY_DESCRIPTIONS = {
     "dataset_name": "Character string with the name of the dataset.",
     "dataset_type": "'attenuation' or 'transmission'.",
@@ -23,7 +23,7 @@ KEY_DESCRIPTIONS = {
     "source_iso_dist": "Distance from source to iso in ALU."
 }
 
-# The values each of these keys accepts.
+# This dict lists the values that each of these keys accepts.
 VALIDATION_RULES = {
     "dataset_type": (None, "attenuation", "transmission"),
     "dataset_modality": (None, "hyperspectral neutron"),
@@ -34,16 +34,15 @@ ALLOWED_KEYS = list(KEY_DESCRIPTIONS.keys())
 
 
 def _validate_key(key, value):
-    """Warn when a key listed in VALIDATION_RULES has a value that is not
-    allowed."""
+    """This function warns when a key in ``VALIDATION_RULES`` has a value that is not allowed."""
     if key in VALIDATION_RULES and value not in VALIDATION_RULES[key]:
         valid_options = [v for v in VALIDATION_RULES[key] if v is not None]
         warnings.warn(f"Invalid '{key}': should be one of {valid_options}.")
 
 
 def _with_key_docstring(style):
-    """Return a decorator that replaces ``{_KEY_DOCS}`` in a docstring with
-    the key descriptions."""
+    """This function returns a decorator that replaces ``{_KEY_DOCS}`` in a docstring with the
+    descriptions of the metadata keys."""
     indent = "\t- " if style == "dict" else "\t"
     text = "\n".join(f"{indent}{k}: {v}" for k, v in KEY_DESCRIPTIONS.items())
 
@@ -56,15 +55,18 @@ def _with_key_docstring(style):
 
 
 def import_hsnt_data_hdf5(filename):
-    """Import a hyperspectral dataset and its metadata from an HDF5 file.
+    """This function imports a hyperspectral dataset and its metadata from an HDF5 file.
+
+    The file can hold the data in hyperspectral form or in dehydrated form.  If the function
+    cannot read the data, it warns and returns None for the data.
 
     Args:
-        filename: Path to the HDF5 file.
+        filename (str): The path to the HDF5 file.
 
     Returns:
-        [data, metadata]: data is an ndarray with the spectral axis last (hyperspectral form), a list
-        [subspace_data, subspace_basis, dataset_type] (dehydrated form), or None; metadata is a dict with the keys
-        of create_hsnt_metadata.
+        [data, metadata]: For hyperspectral data, data is an ndarray with the spectral axis last.
+            For dehydrated data, data is the list [subspace_data, subspace_basis, dataset_type].
+            metadata is a dict with the keys of ``create_hsnt_metadata``.
     """
     data = None
     metadata = {key: None for key in ALLOWED_KEYS}
@@ -107,7 +109,9 @@ def import_hsnt_data_hdf5(filename):
 
 @_with_key_docstring("arg")
 def create_hsnt_metadata(**kwargs):
-    """Create the metadata dict of a hyperspectral neutron dataset. Keys not given are None.
+    """This function creates the metadata dict of a dataset.
+
+    Each key that is not given has the value None.
 
     Args:
     {_KEY_DOCS}
@@ -117,7 +121,7 @@ def create_hsnt_metadata(**kwargs):
 
     Example:
         >>> metadata = create_hsnt_metadata(dataset_name="sample1", dataset_type="transmission",
-        ...                                 wavelengths=np.linspace(1.0, 5.0, 50), angles=np.linspace(0, 180, 10))
+        ...     wavelengths=np.linspace(1.0, 5.0, 50), angles=np.linspace(0, 180, 10))
     """
     for key in kwargs.keys():
         if key not in ALLOWED_KEYS:
@@ -132,13 +136,13 @@ def create_hsnt_metadata(**kwargs):
 
 
 def export_hsnt_data_hdf5(filename, data, metadata=None):
-    """Export a hyperspectral dataset and its metadata to an HDF5 file.
+    """This function exports a hyperspectral dataset and its metadata to an HDF5 file.
 
     Args:
-        filename: Path to the HDF5 file.
-        data: ndarray with the spectral axis last (hyperspectral form), or [subspace_data, subspace_basis,
-            dataset_type] (dehydrated form).
-        metadata: The dict from create_hsnt_metadata. Defaults to None.
+        filename (str): The path to the HDF5 file.
+        data (ndarray or list): For hyperspectral data, an ndarray with the spectral axis last.
+            For dehydrated data, the list [subspace_data, subspace_basis, dataset_type].
+        metadata (dict, optional): The dict from ``create_hsnt_metadata``.  Defaults to None.
     """
     if metadata is None:
         metadata = {}
@@ -175,8 +179,11 @@ def export_hsnt_data_hdf5(filename, data, metadata=None):
 
 @contextlib.contextmanager
 def _written_atomically(path):
-    """Yield a temporary path beside `path`, moved into place only when the block completes, so that a failed or
-    interrupted write leaves no file that reads back as complete. The extension is kept for writers that go by it."""
+    """This function yields a temporary path in the directory of ``path``.
+
+    When the ``with`` block completes, the function renames the temporary file to ``path``.  If
+    the block fails, the function deletes the temporary file, so no partial file remains.
+    """
     root, ext = os.path.splitext(path)
     tmp = f"{root}.partial{ext}"
     try:
@@ -188,21 +195,26 @@ def _written_atomically(path):
 
 
 def _write_metadata(group, metadata):
-    """Write hsnt metadata entries the group does not hold yet (strings as bytes, None skipped)."""
+    """This function writes each hsnt metadata entry that the group does not already hold."""
     for key, value in metadata.items():
         if value is not None and key not in group:
             group.create_dataset(key, data=np.bytes_(value) if isinstance(value, str) else value)
 
 
 def _decode(value):
-    """A string from an HDF5 scalar that may be stored as bytes."""
+    """This function converts an HDF5 scalar stored as bytes to a string.
+
+    The function returns any other value unchanged.
+    """
     return value.decode() if isinstance(value, (bytes, np.bytes_)) else value
 
 
 def _find_data_group(f, dataset=None):
-    """The group holding the hyperspectral 'data' dataset: the named group, else the root, else the only root group
-    that has one. Returns (group, name); raises KeyError when there is none and ValueError when the file holds
-    dehydrated data or the choice is ambiguous."""
+    """This function finds the group that holds the 'data' dataset and returns (group, name).
+
+    The function raises KeyError when no group holds 'data'.  It raises ValueError when several
+    groups hold 'data' or when the file holds dehydrated data.
+    """
     if dataset:
         if dataset not in f:
             groups = [k for k, v in f.items() if isinstance(v, h5py.Group)]
@@ -221,8 +233,11 @@ def _find_data_group(f, dataset=None):
 
 
 def _data_selection(shape, views=None, downsample=1):
-    """The index over the spatial axes of a 2-, 3- or 4-D 'data' dataset (spectral axis last) that selects the views
-    and every downsample-th row and column, and the (views, rows, cols) it gives. A 2-D dataset is (pixels, bins)."""
+    """This function returns an index into a 2D, 3D, or 4D 'data' dataset and the shape it selects.
+
+    The index selects the requested views and every ``downsample``-th row and column.  The shape
+    is (views, rows, cols).
+    """
     ndim = len(shape)
     step = slice(None, None, downsample)
     if ndim == 2:
@@ -237,8 +252,10 @@ def _data_selection(shape, views=None, downsample=1):
 
 
 def _create_hyperspectral(f, shape, dataset_type, chunks):
-    """Create the 'data' dataset of the hsnt layout, float32 of shape (views, rows, cols, bins), with its
-    dataset_type and dataset_modality entries. Returns the dataset, to be filled in blocks."""
+    """This function creates and returns an empty float32 'data' dataset in the hsnt file format.
+
+    The dataset has shape (views, rows, cols, bins).  The caller fills it in blocks.
+    """
     d = f.create_dataset("data", shape=shape, dtype=np.float32, chunks=chunks)
     f.create_dataset("dataset_type", data=np.bytes_(dataset_type))
     f.create_dataset("dataset_modality", data=np.bytes_("hyperspectral neutron"))

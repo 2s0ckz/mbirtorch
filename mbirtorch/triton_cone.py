@@ -1,78 +1,12 @@
-"""The hand-written Triton cone-beam kernels -- the cone BACK and FORWARD
-projections as alternative
-view-batch bodies.
+"""This module holds hand-written Triton kernels for the cone beam back and
+forward projections.
 
-A kernel here is an ALTERNATIVE BODY, never a new driver.  Each wrapper below
-has the same signature as the torch body it replaces
-(:func:`mbirtorch.cone_beam._cone_back_view_batch`,
-:func:`mbirtorch.cone_beam._cone_forward_view_batch`), so the driver's
-view-range loop, its lazy assembly, the banded seams (``slice_start``,
-``band_slices``, ``dev_index``) and the ``plan`` slot all pass through
-unchanged, and the torch bodies stay compiled in everywhere as the value
-reference and the fallback.
-
-Both kernels stand on the same two eager precomputes, which is why one module
-covers both directions: the hfan contract of horizontal_fan.py (n_p, centers,
-W_p_c, weight_scale) and the (m0, W_p_r) pair from
-:func:`_cone_vertical_affine`, the sanctioned geometry bridge.  Every tap
-weight is derived from them IN-KERNEL, so the tap axis is never materialized.
-Curved detectors and helical z shifts therefore need no kernel code at all:
-they enter through those two builders alone (curved through
-_cone_horizontal_data's arc parameterisation, helical through the z_shifts
-that set z_offset, which the cone-angle chain reads).
-
-What the BACK kernel fuses (the mechanism behind the pallas campaign's 9.07x
-on this same math): each program accumulates its (BLOCK_P, BLOCK_L) tile of
-the output IN REGISTERS across the view reduction and both tap loops, so the
-per-view (Vb, P, R) gather transient the torch body materializes is never
-written at all.
-
-What the FORWARD kernel fuses: the torch forward body materializes a
-(Vb, P, S) scaled-value copy and a (Vb, P, R) detector-column transient, then
-scatters that second one channel by channel.  The kernel keeps its
-(BLOCK_P, BLOCK_R) detector column IN REGISTERS through the vertical tap loop
-and scatters it straight into the sinogram with per-tap atomics, so neither
-transient is written.  This is the PLAIN-ATOMIC form the design mandates
-first: the pallas evidence says atomics are the forward's limiter, but
-Triton's atomics and scheduling differ enough that the plain form is measured
-before the sorted-stream specialization (measure, then specialize).
-
-Three arithmetic deviations from the torch bodies, all inherited from the
-pallas cone kernels and all covered by the design's value gate (rel 1e-5 on
-the gradient path, 1e-4 at coeff_power=2, with the rounding carve-out):
-
-  - The cone-angle divisor is formed as ``inv_cos_phi = sqrt(1 + (v/SDD)^2)``
-    and MULTIPLIED, where the torch bodies divide by ``cos(atan2(v, SDD))``.
-    The forms are algebraically identical and differ by a ULP or two of
-    rounding; the sqrt form needs no atan2 (whose Triton lowering is
-    backend-specific) and is Inf-safe at SDD = inf, where inv_sdd = 0 gives
-    exactly 1.
-  - Row centers (back) use ``floor(m + 0.5)`` where the torch body uses
-    ``torch.round`` (half to even).  The two differ only at an exact .5 tie,
-    and there the tap that enters or leaves the window carries weight exactly
-    zero: its trapezoid weight is clip((W_p_r + 1)/2 - (psf_radius + 0.5), 0)
-    and W_p_r <= 2 * psf_radius holds by construction of psf_radius.
-  - Slice centers (forward) use ``floor(k + 0.5)`` for the same reason, and
-    the same tie argument holds one level down: the entering/leaving tap sits
-    at |k - k_center| = bp_psf_radius + 0.5 slices, so its trapezoid weight is
-    clip(1/2 - W_p_r * bp_psf_radius, 0), zero whenever
-    2 * bp_psf_radius >= 1 / W_p_r -- which is what bp_psf_radius is built to
-    guarantee (it is ceil(ceil(voxels per detector row) / 2)).  Where an
-    anisotropic detector breaks that guarantee the torch body is ALREADY
-    truncating a nonzero tap, so the two forms differ there by exactly that
-    pre-existing truncation, at a measure-zero tie.
-
-Atomics and determinism (forward only): float atomic_add is commutative but
-not associative, so the summation order over pixels and taps varies between
-launches and the forward kernel is not bit-reproducible.  It is reproducible
-to float rounding -- the value gates use rel 1e-5, and the repeat-consistency
-test in tests/test_triton_cone.py measures the run-to-run spread directly.
-Nothing downstream depends on bit reproducibility (the torch body's own view
-batching already reorders the same sums).
-
-The module imports WITHOUT triton (a CPU/MPS install has none), so the test
-suite and the availability self-check can import it anywhere; only calling a
-wrapper needs a working triton.
+Each wrapper function in this module projects one batch of views.  It replaces a torch
+function with the same signature: :func:`mbirtorch.cone_beam._cone_back_view_batch` or
+:func:`mbirtorch.cone_beam._cone_forward_view_batch`.  The results match the torch
+functions to a relative error of 1e-5, or 1e-4 when coeff_power is 2.  The forward kernel
+adds with atomic operations, so its results can differ from run to run by float rounding.
+The module imports without triton.  Only a call to a wrapper needs triton.
 """
 
 import contextlib
@@ -90,29 +24,27 @@ _F32 = torch.float32
 try:
     import triton
     import triton.language as tl
-except ImportError:                        # no triton (e.g. a macOS/CPU build)
+except ImportError:                        # Triton is missing, as on macOS or a CPU build.
     triton = None
 
     class _NoTritonLanguage:
-        """Stand-in for ``triton.language`` so this module imports with no
-        triton installed.  Only ``constexpr`` is read at import time.  Every
-        other name is reached at kernel compile time, which never runs here."""
+        """This class is used in place of ``triton.language`` when triton is not
+        installed.  The module reads only ``constexpr`` from it at import time."""
         constexpr = None
 
     tl = _NoTritonLanguage()
 
 
 def _jit(fn):
-    """Apply ``triton.jit`` where triton is importable.  Without triton the
-    function is returned undecorated and is not callable as a kernel."""
+    """This function applies ``triton.jit`` when triton is installed, and
+    otherwise returns the function unchanged."""
     return fn if triton is None else triton.jit(fn)
 
 
 def _tl_builtin(name):
-    """Return the ``triton.language`` builtin ``name``, or None without triton.
-
-    Several math builtins have moved between ``tl`` and ``tl.math`` across
-    Triton versions, so the name is looked up in both and bound once here.
+    """This function returns the ``triton.language`` builtin function ``name``.  The
+    function looks for the name in both ``tl`` and ``tl.math``.  It returns None when triton
+    is not installed.
     """
     fn = getattr(tl, name, None)
     if fn is None:
@@ -123,20 +55,20 @@ def _tl_builtin(name):
 _tl_abs = _tl_builtin('abs')
 _tl_floor = _tl_builtin('floor')
 _tl_sqrt = _tl_builtin('sqrt')
-# The tap loops want compile time trip counts, which tl.static_range gives.
-# Plain range is the fallback for a toolchain without it.
+# tl.static_range gives the tap loops a loop count fixed at compile time.  The code uses
+# plain range when the installed triton has no static_range.
 _tap_range = _tl_builtin('static_range') or range
 
-# The tile constants below were chosen on an H100.  Register pressure binds, since
-# the inner loop holds the (BLOCK_P, BLOCK_L) accumulator and about six live tiles.
+# The number of GPU registers limits the tile sizes below.  The inner loop holds the
+# (BLOCK_P, BLOCK_L) accumulator and about six other tiles.
 CONE_BACK_BLOCK_P = 16
 CONE_BACK_BLOCK_L = 64
 CONE_BACK_NUM_WARPS = 4
 CONE_BACK_NUM_STAGES = 1
-# A band or pixel subset smaller than this tile is padded, not shrunk.
+# The wrapper pads a slice range or a pixel set that is smaller than this tile size.
 CONE_BACK_MIN_TILE = 8
-# The view batch this body asks for when the model's view_batch_size is None.
-# The driver's transient budget may cap the realized batch below it.
+# The number of views in a batch when the model's view_batch_size is None.  The calling
+# code may use a smaller batch to fit in memory.
 CONE_BACK_VIEW_CHUNK = 128
 
 CONE_FWD_BLOCK_P = 8
@@ -146,9 +78,8 @@ CONE_FWD_NUM_STAGES = 1
 CONE_FWD_MIN_TILE = 8
 CONE_FWD_VIEW_CHUNK = 128
 
-# Launch keys whose triton compilation has already finished in this process.  A key
-# includes the runtime integers as well as the constexprs, because a false hit would
-# race a compile.  All kernels share this set, so every key leads with its own name.
+# This set holds the launch keys whose triton compilation has finished in this process.
+# A key starts with the kernel name and holds the integer arguments and the constexprs.
 _COMPILED_LAUNCH_KEYS = set()
 
 
@@ -161,21 +92,16 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                       delta_voxel_slice, slice_center, inv_sdd, num_rows_f,
                       PSF_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
                       BLOCK_P: tl.constexpr, BLOCK_L: tl.constexpr):
-    """One program per (pixel block, slice chunk) of the output partial.
+    """This function is the Triton back projection kernel.  Each Triton program computes
+    one block of pixels and one block of slices of the output.
 
         out[p, l] = sum over views v, row taps tr, channel taps tc of
                     Wrow[v, p, l, tr] * Wchan[v, p, tc]
                     * sino[v, c(v, p) + tc, m(v, p, l) + tr]
 
-    Both weight sets are formed in the kernel from the per (view, pixel)
-    contract.  The pixel block is the fast grid axis, so programs that run
-    together gather the same detector rows of the same view.
-
-    Pixel lanes beyond ``num_pixels`` load zeroed contract values, which zeroes
-    both weights, and their stores are masked.  ``band_len`` is the padded band
-    the wrapper launches at.  Every sinogram address is clamped into the
-    buffer, so a slice lane past the real band still reads inside the sinogram,
-    and the wrapper returns only the real band columns.
+    The kernel computes both sets of weights from arrays indexed by (view, pixel).  The
+    output covers a contiguous range of slices.  ``band_len`` is the number of slices in this
+    range, padded by the wrapper.  The kernel masks pixel indices at or beyond ``num_pixels``.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)     # (BLOCK_P,)
     l_offs = tl.program_id(1) * BLOCK_L + tl.arange(0, BLOCK_L)     # (BLOCK_L,)
@@ -183,8 +109,8 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
     l_mask = l_offs < band_len
     tile_mask = p_mask[:, None] & l_mask[None, :]
 
-    # k is the global slice index of each output column.  The affine row map and the
-    # z chain are anchored at global slice 0, so a band only restricts the range of k.
+    # k is the slice index of each output column in the full volume.  The row map and z
+    # are computed from slice 0 of the full volume, so a slice range only limits k.
     k = (slice_start + l_offs).to(tl.float32)                       # (BLOCK_L,)
     z_at_k = delta_voxel_slice * (k - slice_center)                 # (BLOCK_L,)
 
@@ -201,12 +127,12 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
         pixel_mag = tl.load(pixel_mag_ptr + pix_base, mask=p_mask, other=0.0)
         z_offset = tl.load(z_offset_ptr + v)
 
-        # This is the direct form of the affine map, plus the cone angle
-        # divisor from the z chain v = pixel_mag * z.
+        # m is the detector row of slice k.  inv_cos_phi is the cone angle factor, computed
+        # from the detector height v = pixel_mag * z.
         m = m0[:, None] + w_p_r[:, None] * k[None, :]        # (BLOCK_P, BLOCK_L)
         m_center = _tl_floor(m + 0.5)                        # Ties carry zero weight.
-        # The center is bounded before the integer conversions in the tap loop,
-        # because float to int is undefined past the int32 range.
+        # The center is clamped before the integer conversions in the tap loop, because
+        # conversion from float to int is undefined outside the int32 range.
         m_center = tl.minimum(tl.maximum(m_center, -1.0 - PSF_RADIUS),
                               num_rows_f + PSF_RADIUS)
         v_det = pixel_mag[:, None] * (z_at_k[None, :] + z_offset)
@@ -219,7 +145,7 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
             m_tap_i = m_tap.to(tl.int32)
             w_row = tl.maximum((w_p_r[:, None] + 1.0) / 2.0
                                - _tl_abs(m - m_tap), 0.0)
-            # coeff_power is applied after the divisor.  Do not rearrange.
+            # coeff_power must be applied after the cone angle factor.
             w_row = tl.minimum(w_row, l_max_r) * inv_cos_phi
             w_row = tl.where((m_tap_i >= 0) & (m_tap_i < num_rows), w_row, 0.0)
             if COEFF_POWER == 2:
@@ -228,8 +154,8 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
 
             row_vals = tl.zeros((BLOCK_P, BLOCK_L), dtype=tl.float32)
             for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
-                # The trapezoid rule zeroes the weight where the unclipped tap
-                # left the detector, then clamps the index.
+                # The weight is zero where the tap is outside the detector.  Then the
+                # index is clamped into range.
                 n_tap = centers + (tc - PSF_RADIUS)
                 w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                                     - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
@@ -239,8 +165,8 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                 if COEFF_POWER == 2:
                     w_chan = w_chan * w_chan
                 n_chan = tl.minimum(tl.maximum(n_tap, 0), num_channels - 1)
-                # The views are channel major, so the row axis is contiguous
-                # and a tile's gather is a near unit stride read.
+                # The views have the channel axis before the row axis.  The row axis is
+                # contiguous, so each tile reads nearly consecutive addresses.
                 chan_ptr = sino_view_ptr + n_chan.to(tl.int64) * num_rows
                 vals = tl.load(chan_ptr[:, None] + m_row, mask=tile_mask,
                                other=0.0)
@@ -256,10 +182,9 @@ def _next_pow2(n):
 
 
 def _tile_size(cap, extent, min_tile):
-    """Return the power of two tile size for an axis of length ``extent``.
-
-    The result is the cap, shrunk when the axis is smaller but never below
-    ``min_tile``, so a small axis does not launch a mostly padded tile.
+    """This function returns the tile size for an axis of length ``extent``.  The tile size
+    is a power of two.  It equals ``cap``, reduced for a shorter axis, but it is never less
+    than ``min_tile``.
     """
     return max(int(min_tile), min(int(cap), _next_pow2(extent)))
 
@@ -275,23 +200,20 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
                                  source_detector_dist, use_curved_detector,
                                  psf_radius, bp_psf_radius, coeff_power=1,
                                  slice_start=0, band_slices=None, plan=None):
-    """Triton cone back body, replacing
-    :func:`mbirtorch.cone_beam._cone_back_view_batch`.
+    """This function computes the cone beam back projection of one batch of views with
+    Triton.  It replaces :func:`mbirtorch.cone_beam._cone_back_view_batch`.
 
-    It has the same signature and the same (P, band) return, written fresh
-    each call so the driver may accumulate into it in place.  The band is
-    rounded up to a multiple of 16 for the launch, and the return is the real
-    band slice, which is a strided view when the band is not such a multiple.
-    This body must stay eager, which the ``torch.compiler.disable`` decorator
-    and the ``_mbirtorch_no_compile`` marker below enforce for the two kinds of
-    caller.  ``bp_psf_radius`` and ``plan`` are ignored.
+    The function has the same signature and returns the same (P, band_slices) tensor.  Each
+    call allocates a new output tensor, so the caller may add into it in place.  When the
+    number of slices is not a multiple of 16, the output is a strided view.  torch.compile
+    does not compile this function.  The function ignores ``bp_psf_radius`` and ``plan``.
     """
     if triton is None:
         raise RuntimeError('the Triton cone back body was called without '
                            'triton installed; the selection in '
                            'ConeBeamModel._view_batch_bodies should have kept '
                            'the torch body (see kernel_availability).')
-    # The kernel has static branches for powers 1 and 2 only.
+    # The kernel supports only coeff_power 1 and 2.
     if coeff_power not in (1, 2):
         return _cone_back_view_batch(
             sino_batch, pixel_indices, view_params_batch, num_rows_r,
@@ -315,11 +237,11 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
 
     num_views, num_pixels = n_p.shape
     band_len = int(num_slices if band_slices is None else band_slices)
-    # The kernel is launched at a band rounded up to a multiple of 16.  Every
-    # use of the band argument takes this value.
+    # The kernel runs on a slice count rounded up to a multiple of 16.  Every
+    # slice count passed to the kernel uses this value.
     launch_band = padded_kernel_width(band_len)
-    # The views are made channel major, so the per tile gather is contiguous.  This
-    # copy is not padded, because the kernel clamps every sinogram address it forms.
+    # This copy puts the channel axis before the row axis, so each tile reads contiguous
+    # memory.  The copy is not padded, because the kernel clamps every sinogram index.
     sino_t = sino_batch.permute(0, 2, 1).contiguous()
     contract = [t.contiguous() for t in (n_p, centers, w_p_c, weight_scale,
                                          m0, w_p_r, pixel_mag, z_offset)]
@@ -337,10 +259,8 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
                   int(num_rows_r), launch_band, int(slice_start))
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
     guard = compile_serialized() if first_launch else contextlib.nullcontext()
-    # The device context is required for correctness.  A Triton launch targets the
-    # launching thread's current CUDA device and stream, while every torch op targets
-    # the tensor's device.  The drivers call this wrapper from worker threads whose
-    # current device is 0, so without this bracket the launch lands on device 0.
+    # A Triton launch runs on the current CUDA device of the thread, which is device 0 in a
+    # worker thread.  The device context makes the launch run on the device of the tensors.
     with torch.cuda.device(sino_batch.device), guard:
         _cone_back_kernel[grid](
             *contract, sino_t, out,
@@ -355,23 +275,22 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
     _COMPILED_LAUNCH_KEYS.add(launch_key)
     if launch_band == band_len:
         return out
-    # The padded columns are sliced off.  The result is a strided view whose
-    # rows are each still contiguous.
+    # This slice removes the padded columns.  The result is a strided view, and each
+    # row of the view is contiguous.
     return out[:, :band_len]
 
 
-# The driver reads this marker in maybe_compile.
+# maybe_compile reads this attribute and does not compile the function.
 _cone_back_view_batch_triton._mbirtorch_no_compile = True
 
 
 def _cone_back_view_batch_cost(num_pixels, num_band_rows, args):
-    """Return the bytes resident per view in one back kernel batch, and this
-    kernel's nominal view chunk.
+    """This function returns the GPU memory, in bytes, that each view uses in one batch of
+    the back kernel.  It also returns the default number of views in a batch.
 
-    The driver reads this through the ``_view_batch_cost`` attribute.  One view
-    holds the two precomputed geometry tables at 48 bytes per (view, pixel),
-    plus the channel major copy of its sinogram plane.  Tensors whose size does
-    not depend on the batch are not charged.
+    The calling code reads this function through the ``_view_batch_cost`` attribute.  Each
+    view uses 48 bytes per pixel for geometry arrays.  Each view also uses a copy of its
+    sinogram plane with the channel axis first.
     """
     plane_bytes = 4 * int(args['num_channels']) * int(num_band_rows)
     return 48 * int(num_pixels) + plane_bytes, CONE_BACK_VIEW_CHUNK
@@ -390,29 +309,17 @@ def _cone_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                          k_center_lo, k_center_hi,
                          PSF_RADIUS: tl.constexpr, BP_PSF_RADIUS: tl.constexpr,
                          BLOCK_P: tl.constexpr, BLOCK_R: tl.constexpr):
-    """One program per (pixel block, row chunk, view) of the sinogram.
+    """This function is the Triton forward projection kernel.  Each Triton program computes
+    one block of pixels, one block of detector rows, and one view.
 
         out[v, c, m] += sum over pixels p, channel taps tc, slice taps tk of
                         Wchan[v, p, tc] * Wslice[v, p, m, tk] / cos_phi
                         * values[p, k(v, p, m) + tk]
 
-    The detector side vertical fan runs first, then the horizontal fan
-    scatter.  The vertical map is the inverse of the affine map,
-    ``k = (m - m0) / W_p_r``.
-
-    The view is a grid axis because each view writes its own output plane.
-    The pixel block is the fast axis, so programs that run together read the
-    same rows of ``values`` and hit neighboring channels.  The view axis is
-    last, and it stays well under the CUDA limit of 65535 on grid dims 1 and 2.
-
-    The output is channel major (Vb, C, R), which puts the row axis on the
-    contiguous stride.  The wrapper transposes the view on return.
-
-    Pixel lanes beyond ``num_pixels`` have their atomics masked off, so their
-    contract values may be any finite number.  ``num_rows`` is the padded row
-    count the wrapper launches at.  Row lanes past the real rows gather with a
-    clamped and masked index, and their atomics land in extra output rows that
-    the wrapper slices off.
+    The kernel maps detector row m to slice ``k = (m - m0) / W_p_r``.  The output has
+    shape (Vb, C, R), with the channel axis before the row axis.  The wrapper transposes it.
+    ``num_rows`` is the row count padded by the wrapper.  The kernel masks pixel indices at or
+    beyond ``num_pixels``, and the wrapper removes the padded rows.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)     # (BLOCK_P,)
     r_offs = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)     # (BLOCK_R,)
@@ -427,20 +334,20 @@ def _cone_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
     w_p_c = tl.load(w_p_c_ptr + pix_base, mask=p_mask, other=0.0)
     weight_scale = tl.load(weight_scale_ptr + pix_base, mask=p_mask, other=0.0)
     m0 = tl.load(m0_ptr + pix_base, mask=p_mask, other=0.0)
-    # The filler is 1.0 rather than 0.0, because a padded lane divides by its slope
-    # and 0/0 would give a NaN in the float to int conversion below.
+    # The fill value is 1.0, not 0.0.  A masked pixel divides by w_p_r, and 0/0 would give
+    # a NaN in the float to int conversion below.
     w_p_r = tl.load(w_p_r_ptr + pix_base, mask=p_mask, other=1.0)
     pixel_mag = tl.load(pixel_mag_ptr + pix_base, mask=p_mask, other=0.0)
     z_offset = tl.load(z_offset_ptr + v)
 
-    # Vertical fan, detector side, from rows to fractional slice indices.
+    # This code maps each detector row to a fractional slice index.
     slope = w_p_r[:, None]                                          # (BLOCK_P, 1)
     k_m = (r_offs.to(tl.float32)[None, :] - m0[:, None]) / slope
     k_center = _tl_floor(k_m + 0.5)                          # Ties carry zero weight.
-    # The center is bounded before the integer conversions in the tap loop, because
-    # float to int is undefined past the int32 range.
+    # The center is clamped before the integer conversions in the tap loop, because
+    # conversion from float to int is undefined outside the int32 range.
     k_center = tl.minimum(tl.maximum(k_center, k_center_lo), k_center_hi)
-    # m_p is the offset of the center slice from the row, in row units.
+    # m_p is the offset of the center slice from the row, in units of detector rows.
     m_p = slope * (k_center - k_m)
     l_max_r = tl.minimum(w_p_r, 1.0)[:, None]
 
@@ -452,27 +359,27 @@ def _cone_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
         w_slice = tl.maximum((slope + 1.0) / 2.0 - _tl_abs(m_p + slope * k_off),
                              0.0)
         w_slice = tl.minimum(w_slice, l_max_r)
-        # The weight is zeroed where the tap left the band, and the index is then
-        # clamped.  The z anchor stays on the full slice count.
+        # The weight is zero where the tap is outside the slice range, and then the index
+        # is clamped.  z is still computed from the slice count of the full volume.
         in_band = (k_ind_i >= slice_start) & (k_ind_i < slice_start + band_len)
         w_slice = tl.where(in_band, w_slice, 0.0)
-        # The cone angle divisor belongs to the tapped slice, not to the row.
-        # The z chain is v = pixel_mag * z, as in the back kernel.
+        # The cone angle factor uses the slice of the tap, not the detector row.  The
+        # detector height is v = pixel_mag * z, as in the back kernel.
         v_det = pixel_mag[:, None] * (delta_voxel_slice * (k_ind - slice_center)
                                       + z_offset)
         inv_cos_phi = _tl_sqrt(1.0 + (v_det * inv_sdd) * (v_det * inv_sdd))
-        # The clamp keeps the index legal.  Carrying in_band into the load mask
-        # saves the read of a tap that already carries zero weight.
+        # The clamp keeps the index in range.  The load mask includes in_band, so the
+        # kernel does not read taps that have zero weight.
         k_local = tl.minimum(tl.maximum(k_ind_i - slice_start, 0), band_len - 1)
         vals = tl.load(values_ptr + p_offs.to(tl.int64)[:, None] * band_len
                        + k_local, mask=tile_mask & in_band, other=0.0)
         det_col = det_col + w_slice * (vals * inv_cos_phi)
 
-    # Horizontal fan scatter, one atomic add per tap.
+    # This loop adds each channel tap into the output with one atomic add.
     out_view_ptr = out_ptr + v.to(tl.int64) * out_view_stride
     for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
-        # The trapezoid rule again.  Taps outside the detector drop out of the
-        # atomic mask instead of being added as zeros.
+        # This is the same trapezoid weight as in the back kernel.  The atomic mask skips
+        # taps outside the detector.
         n_tap = centers + (tc - PSF_RADIUS)
         w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                             - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
@@ -496,17 +403,13 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
                                     source_detector_dist, use_curved_detector,
                                     psf_radius, bp_psf_radius, slice_start=0,
                                     plan=None):
-    """Triton cone forward body, replacing
-    :func:`mbirtorch.cone_beam._cone_forward_view_batch`.
+    """This function computes the cone beam forward projection of one batch of views with
+    Triton.  It replaces :func:`mbirtorch.cone_beam._cone_forward_view_batch`.
 
-    It has the same signature and the same (Vb, R, C) return, zeroed each call
-    because the kernel accumulates into it with atomics.  The detector row
-    count is rounded up to a multiple of 16 for the launch, and the return is
-    the real row slice.  ``values`` is (P, L).  When L is less than num_slices
-    it is the slice band starting at ``slice_start``, and the z geometry stays
-    anchored on the full num_slices center, so summing the outputs over a
-    tiling of the slice axis reproduces the unbanded projection.  ``plan`` is
-    ignored.
+    The function has the same signature and returns the same (Vb, R, C) tensor.  ``values``
+    has shape (P, L).  When L is less than num_slices, ``values`` holds the L slices that
+    start at ``slice_start``.  The sum of the outputs over slice ranges that cover the volume
+    is the full projection.  The function ignores ``plan``.
     """
     if triton is None:
         raise RuntimeError('the Triton cone forward body was called without '
@@ -525,14 +428,14 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
 
     num_views, num_pixels = n_p.shape
     band_len = int(values.shape[1])
-    # The kernel is launched at a detector row count rounded up to a multiple of 16.
-    # The geometry builders above keep the real row count.
+    # The kernel runs on a detector row count rounded up to a multiple of 16.  The
+    # geometry functions above use the true row count.
     launch_rows = padded_kernel_width(int(num_rows_r))
     values = values.contiguous()
     contract = [t.contiguous() for t in (n_p, centers, w_p_c, weight_scale,
                                          m0, w_p_r, pixel_mag, z_offset)]
-    # The output is channel major and zeroed, because the atomics accumulate
-    # into it.  The return transposes each view.
+    # The output has the channel axis before the row axis.  It starts at zero, because
+    # the kernel adds into it with atomic operations.
     out = torch.zeros((num_views, num_channels, launch_rows), dtype=_F32,
                       device=values.device)
 
@@ -541,9 +444,8 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
     grid = (-(-num_pixels // block_p), -(-launch_rows // block_r), num_views)
     inv_sdd = (0.0 if math.isinf(float(source_detector_dist))
                else 1.0 / float(source_detector_dist))
-    # These are the bounds the kernel clamps the slice center to.  They are tight: at
-    # the low bound the highest tap is slice_start - 1, and at the high bound the
-    # lowest tap is slice_start + band_len.
+    # The kernel clamps the center slice to these bounds.  At the low bound, the highest
+    # tap is slice_start - 1.  At the high bound, the lowest tap is slice_start + band_len.
     bp = int(bp_psf_radius)
     k_center_lo = float(int(slice_start) - bp - 1)
     k_center_hi = float(int(slice_start) + band_len + bp)
@@ -553,7 +455,7 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
                   band_len, int(slice_start))
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
     guard = compile_serialized() if first_launch else contextlib.nullcontext()
-    # The launch runs on the tensors' own device, and the device leads the
+    # The launch runs on the device of the tensors.  The device index is part of the
     # launch key.
     with torch.cuda.device(values.device), guard:
         _cone_forward_kernel[grid](
@@ -568,22 +470,20 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
     _COMPILED_LAUNCH_KEYS.add(launch_key)
     if launch_rows == int(num_rows_r):
         return out.permute(0, 2, 1)
-    # The extra detector rows are sliced off before the transpose.
+    # This slice removes the padded detector rows before the transpose.
     return out[:, :, :int(num_rows_r)].permute(0, 2, 1)
 
 
-# The driver reads this marker in maybe_compile.
+# maybe_compile reads this attribute and does not compile the function.
 _cone_forward_view_batch_triton._mbirtorch_no_compile = True
 
 
 def _cone_forward_view_batch_cost(num_pixels, band_len, args):
-    """Return the bytes resident per view in one forward kernel batch, and
-    this kernel's nominal view chunk.
+    """This function returns the GPU memory, in bytes, that each view uses in one batch of
+    the forward kernel.  It also returns the default number of views in a batch.
 
-    One view holds the same 48 bytes per (view, pixel) of precomputed geometry
-    as the back kernel, plus its zeroed channel major output plane.  That plane
-    spans the full detector rows at the padded row count, whatever slice band
-    the values carry.
+    Each view uses 48 bytes per pixel for geometry arrays, as in the back kernel.  Each view
+    also uses its output plane, which includes the padded detector rows.
     """
     plane_rows = padded_kernel_width(int(args['num_rows_r']))
     plane_bytes = 4 * int(args['num_channels']) * plane_rows

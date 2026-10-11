@@ -1,5 +1,8 @@
-"""Helpers shared by the scanner loaders: image readers, geometry vectors, detector crops, unit
-conversion, and the model built from a loader's parameter dictionaries."""
+"""This module contains functions that the scanner data loaders use.
+
+The functions read images, compute geometry vectors, crop the detector, convert units, and
+build the model from the parameter dictionaries of a loader.
+"""
 
 import glob
 import os
@@ -10,16 +13,14 @@ import mbirtorch as mt
 
 def _normalize_to_float32(img: np.ndarray) -> np.ndarray:
     """
-    Convert image to float32 and normalize if it is an integer dtype.
-
-    - If `imgs.dtype` is an integer type, cast to float32 and divide by the max value for that dtype.
-    - Otherwise, cast to float32 without scaling.
+    This function converts an image to float32.  If the image has an integer dtype, the function
+    divides it by the largest value of that dtype.
 
     Args:
-        img (np.ndarray): Input image array.
+        img (np.ndarray): The input image.
 
     Returns:
-        np.ndarray: float32 array, normalized to [0, 1] if input was integer.
+        np.ndarray: The float32 image.  An integer input image is scaled to [0, 1].
     """
     if np.issubdtype(img.dtype, np.integer):
         maxval = np.iinfo(img.dtype).max
@@ -29,16 +30,14 @@ def _normalize_to_float32(img: np.ndarray) -> np.ndarray:
 
 def read_tif_img(img_path):
     """
-    Read a TIFF image and return it as a float32 array with the shape stored in the file.
-
-    An integer-valued image is scaled to the range [0, 1] by dividing by the largest value its
-    integer type can hold. A floating-point image is cast to float32 without scaling.
+    This function reads a TIFF image as a float32 array.  If the image has an integer dtype, the
+    function divides it by the largest value of that dtype.
 
     Args:
-        img_path (str): Path to the image file. The file must be readable by `tifffile`.
+        img_path (str): The path of the image file.  ``tifffile`` must be able to read the file.
 
     Returns:
-        np.ndarray: Image data as a float32 NumPy array. Can be 2D or higher dimensional depending on the input.
+        np.ndarray: The image as a float32 array with 2 or more dimensions.
     """
     import tifffile
     img = tifffile.imread(img_path)
@@ -47,25 +46,30 @@ def read_tif_img(img_path):
 
 
 def read_tif_stack_dir(scan_dir, view_ids=None):
-    """Reads a tif stack of scan images from a directory. This function is a subroutine to `load_scans_and_params`.
+    """This function reads a stack of TIFF scan images from a directory.
+
+    The function reads the files whose names end in a digit followed by ``.tif`` or ``.tiff``.
+    It sorts the file names and assumes that this order is the order of the views.
 
     Args:
-        scan_dir (string): Path to a ConeBeam Scan directory.
-            Example: "<absolute_path_to_dataset>/Radiographs"
-        view_ids (ndarray of ints, optional, default=None): List of view indices to specify which scans to read.
+        scan_dir (string): The path of the scan directory, such as
+            "<absolute_path_to_dataset>/Radiographs".
+        view_ids (ndarray of ints, optional, default=None): The indices of the views to read.
+            If None, the function reads all views.
+
     Returns:
-        ndarray (float): 3D numpy array, (num_views, num_det_rows, num_det_channels). A stack of scan images.
+        ndarray (float): A 3D array with shape (num_views, num_det_rows, num_det_channels).
     """
 
     import tifffile
     img_path_list = sorted(glob.glob(os.path.join(scan_dir, '*[0-9].tif')))
     if len(img_path_list) == 0:
-        img_path_list = sorted(glob.glob(os.path.join(scan_dir, '*[0-9].tiff')))  # Assume files are '.tif' but check '.tiff' if not
+        img_path_list = sorted(glob.glob(os.path.join(scan_dir, '*[0-9].tiff')))
 
     if len(img_path_list) == 0:
         raise FileNotFoundError('No scan images found in directory: {}'.format(scan_dir))
 
-    # This assumes that all the views are labeled sequentially.
+    # The sorted file names must be in view order.
     if view_ids is None:
         view_ids = np.arange(len(img_path_list))
     else:
@@ -81,13 +85,12 @@ def read_tif_stack_dir(scan_dir, view_ids=None):
 
 
 def unit_vector(v):
-    """ Normalize v. Returns v/||v|| """
+    """This function returns the unit vector v/||v||."""
     return v / np.linalg.norm(v)
 
 
 def project_vector_to_vector(u1, u2):
-    """ Projects the vector u1 onto the vector u2. Returns the vector <u1|u2>.
-    """
+    """This function returns the projection of u1 onto u2."""
     u2 = unit_vector(u2)
     u1_proj = np.dot(u1, u2)*u2
     return u1_proj
@@ -95,24 +98,23 @@ def project_vector_to_vector(u1, u2):
 
 def detect_blank_margins(sino, safety_buffer=20, max_views_to_use=20):
     """
-    Detect how many blank detector rows/channels frame the object in a sinogram.
+    This function counts the blank detector rows and channels around the object in a sinogram.
 
-    The detected amounts feed :func:`apply_detector_crop` to assemble the automatic-crop step.
-    Detection uses a support mask computed over a subsample of views, so it stays cheap on large
-    sinograms.
+    The function uses a subset of the views.  The result can be passed to
+    :func:`apply_detector_crop`.
 
     Args:
-        sino (np.ndarray): Sinogram, shape ``(num_views, num_det_rows, num_det_channels)``.
-        safety_buffer (int, optional): Blank margin, in pixels, to keep on each side of the detected
-            object region. Defaults to 20.
-        max_views_to_use (int, optional): Cap on the number of views sampled for detection.
+        sino (np.ndarray): The sinogram, with shape ``(num_views, num_det_rows, num_det_channels)``.
+        safety_buffer (int, optional): The number of blank pixels to keep on each side of the
+            object.  Defaults to 20.
+        max_views_to_use (int, optional): The largest number of views that the function uses.
             Defaults to 20.
 
     Returns:
-        tuple: ``(crop_top, crop_bottom, crop_left, crop_right)`` -- detector rows to crop from the
-        top and bottom, and detector channels to crop from the left and right.
+        tuple: ``(crop_top, crop_bottom, crop_left, crop_right)``.  The first two entries are the
+        numbers of detector rows to crop from the top and bottom.  The last two entries are the
+        numbers of detector channels to crop from the left and right.
     """
-    # Detection is statistical across views, so a subsample of views keeps it fast on a large sinogram.
     sino = mt.TomographyModel.subsample_views(sino, max_views_to_use)
 
     sino_indicator_mask = mt.TomographyModel._get_sino_indicator(sino)
@@ -138,47 +140,44 @@ def detect_blank_margins(sino, safety_buffer=20, max_views_to_use=20):
 
 def apply_detector_crop(required_params, optional_params, crop_top, crop_bottom, crop_left, crop_right):
     """
-    Update the geometry for a detector crop: shrink the sinogram shape and shift the detector
-    offsets by the amount the crop moves the detector center.
+    This function updates the geometry parameters to match a detector crop.
 
-    This function changes only the parameters, not the data.  The caller must slice the array with
-    the same crop amounts.
+    The function reduces the sinogram shape by the cropped rows and channels.  It also shifts the
+    detector offsets by the distance that the crop moves the detector center.  The function does
+    not change the sinogram data.  The caller must crop the sinogram array in the same way.
 
     Args:
-        required_params (dict): Constructor parameters, read for ``sinogram_shape``.
-        optional_params (dict): Parameters applied with ``set_params``.  ``det_row_offset`` and
-            ``det_channel_offset`` are compensated when the geometry has them, using the detector
-            pitches ``delta_det_row`` and ``delta_det_channel`` (each 1.0 if unset).
-        crop_top (int): Detector rows removed from the top.
-        crop_bottom (int): Detector rows removed from the bottom.
-        crop_left (int): Detector channels removed from the left.
-        crop_right (int): Detector channels removed from the right.
+        required_params (dict): The constructor parameters.  The function uses
+            ``sinogram_shape``.
+        optional_params (dict): The parameters applied with ``set_params``.  If
+            ``det_row_offset`` or ``det_channel_offset`` is present, the function adjusts it.
+            The adjustment uses ``delta_det_row`` and ``delta_det_channel``, which default to 1.0.
+        crop_top (int): The number of detector rows removed from the top.
+        crop_bottom (int): The number of detector rows removed from the bottom.
+        crop_left (int): The number of detector channels removed from the left.
+        crop_right (int): The number of detector channels removed from the right.
 
     Returns:
-        tuple: new ``(required_params, optional_params)`` dicts, with the reduced ``sinogram_shape``
-        and the compensated detector offsets.  The input dicts are not modified, so the caller must
-        use the returned dicts.
+        tuple: New ``(required_params, optional_params)`` dicts.  The function does not modify
+        the input dicts.
 
     Raises:
-        AssertionError: If any crop amount is negative, or if ``crop_top + crop_bottom >= num_det_rows``,
-            or if ``crop_left + crop_right >= num_det_channels``.
+        AssertionError: If any crop amount is negative, or if
+            ``crop_top + crop_bottom >= num_det_rows``, or if
+            ``crop_left + crop_right >= num_det_channels``.
     """
     num_views, num_det_rows, num_det_channels = required_params['sinogram_shape']
-    # A crop as large as the detector dimension would give a negative sinogram_shape.
     assert (crop_top >= 0 and crop_bottom >= 0 and crop_left >= 0 and crop_right >= 0 and
             crop_top + crop_bottom < num_det_rows and crop_left + crop_right < num_det_channels), \
         ('apply_detector_crop: crop amounts must be nonnegative with crop_top + crop_bottom < num_det_rows'
          ' and crop_left + crop_right < num_det_channels (got top={}, bottom={}, left={}, right={} for a'
          ' {}x{} detector).'.format(crop_top, crop_bottom, crop_left, crop_right, num_det_rows, num_det_channels))
-    # Work on copies so that the caller's dicts are not modified.
     required_params = dict(required_params)
     optional_params = dict(optional_params)
     required_params['sinogram_shape'] = (int(num_views),
                                          int(num_det_rows - crop_top - crop_bottom),
                                          int(num_det_channels - crop_left - crop_right))
 
-    # Shift each detector offset by the move of the detector center.  Only a geometry that carries
-    # the offset gets it compensated.
     if 'det_row_offset' in optional_params:
         delta_det_row = optional_params.get('delta_det_row', 1.0)
         optional_params['det_row_offset'] += (crop_bottom - crop_top) / 2 * delta_det_row
@@ -191,26 +190,26 @@ def apply_detector_crop(required_params, optional_params, crop_top, crop_bottom,
 
 def _auto_crop_sino(sino, required_params, optional_params, safety_buffer=20):
     """
-    Detect and remove blank sinogram margins, updating the detector-plane geometry to match.
+    This function removes the blank margins of a sinogram and updates the geometry to match.
 
-    This combines :func:`detect_blank_margins`, slicing of the sinogram, and
-    :func:`apply_detector_crop`.  A ``recon_slice_offset`` in the dicts is moved by the change in
-    the automatic center.  Run this before ``build_model``.
+    The function calls :func:`detect_blank_margins` and :func:`apply_detector_crop`.  It runs
+    before ``build_model``.
 
     Args:
-        sino (np.ndarray): Sinogram, shape ``(num_views, num_det_rows, num_det_channels)``.
-        required_params (dict): Constructor parameters, including ``sinogram_shape``.
-        optional_params (dict): Parameters applied with ``set_params`` (detector pitches/offsets).
-        safety_buffer (int, optional): Blank margin, in pixels, to keep around the detected object
-            region. Defaults to 20.
+        sino (np.ndarray): The sinogram, with shape ``(num_views, num_det_rows, num_det_channels)``.
+        required_params (dict): The constructor parameters, including ``sinogram_shape``.
+        optional_params (dict): The parameters applied with ``set_params``, such as the detector
+            pitches and offsets.
+        safety_buffer (int, optional): The number of blank pixels to keep around the object.
+            Defaults to 20.
 
     Returns:
-        tuple: ``(sino, required_params, optional_params)`` with the sinogram cropped and the
-        geometry updated consistently (``required_params['sinogram_shape'] == sino.shape``).
+        tuple: ``(sino, required_params, optional_params)``.  The sinogram is cropped, and the
+        parameters are updated.
     """
     crop_top, crop_bottom, crop_left, crop_right = detect_blank_margins(sino, safety_buffer)
     sino = sino[:, crop_top:sino.shape[1] - crop_bottom, crop_left:sino.shape[2] - crop_right]
-    # A supplied recon_slice_offset keeps its place relative to the automatic center.
+    # If the user set recon_slice_offset, this code keeps its position relative to the automatic center.
     supplied_offset = optional_params.get('recon_slice_offset')
     if supplied_offset is not None:
         _, automatic_before = mt.utilities._automatic_recon_geometry(required_params, optional_params, None)
@@ -227,30 +226,29 @@ def apply_config_crop(num_det_rows, num_det_channels, det_row_offset, det_channe
                       delta_det_row, delta_det_channel, *,
                       crop_pixels_top, crop_pixels_bottom, crop_pixels_sides):
     """
-    Apply a configuration (manual) detector crop to a scanner loader's SCALAR geometry values.
+    This function applies a detector crop from a loader configuration to the scalar geometry
+    values of a scanner loader.
 
-    Scalar-in / scalar-out adapter around :func:`apply_detector_crop` -- the scanner loaders' configuration crop
-    acts on loose scalars (not a param dict) at conversion time, so this packs them, applies the shared
-    detector-plane crop (shape reduction + offset compensation for an asymmetric top/bottom crop), and
-    unpacks the results.  A detector crop does not change the number of views, so it is neither taken nor
-    returned.  ``crop_pixels_sides`` crops each lateral side symmetrically.
+    The function calls :func:`apply_detector_crop`.  It crops ``crop_pixels_sides`` channels from
+    both the left and the right side.
 
     Args:
-        num_det_rows (int): Detector rows before the crop.
-        num_det_channels (int): Detector channels before the crop.
-        det_row_offset (float): Detector row offset (ALU) before the crop.
-        det_channel_offset (float): Detector channel offset (ALU) before the crop.
-        delta_det_row (float): Detector row pitch (scales the row-offset compensation).
-        delta_det_channel (float): Detector channel pitch (scales the channel-offset compensation).
-        crop_pixels_top (int): Detector rows cropped from the top.
-        crop_pixels_bottom (int): Detector rows cropped from the bottom.
-        crop_pixels_sides (int): Detector channels cropped from EACH lateral side.
+        num_det_rows (int): The number of detector rows before the crop.
+        num_det_channels (int): The number of detector channels before the crop.
+        det_row_offset (float): The detector row offset in ALU before the crop.
+        det_channel_offset (float): The detector channel offset in ALU before the crop.
+        delta_det_row (float): The detector row pitch.
+        delta_det_channel (float): The detector channel pitch.
+        crop_pixels_top (int): The number of detector rows cropped from the top.
+        crop_pixels_bottom (int): The number of detector rows cropped from the bottom.
+        crop_pixels_sides (int): The number of detector channels cropped from each side.
 
     Returns:
-        tuple: ``(num_det_rows, num_det_channels, det_row_offset, det_channel_offset)`` after the crop.
+        tuple: ``(num_det_rows, num_det_channels, det_row_offset, det_channel_offset)`` after
+        the crop.
     """
     required, optional = apply_detector_crop(
-        {'sinogram_shape': (0, num_det_rows, num_det_channels)},   # 0 = num_views placeholder (crop preserves it)
+        {'sinogram_shape': (0, num_det_rows, num_det_channels)},  # num_views is not used, so it is 0.
         {'delta_det_row': delta_det_row, 'delta_det_channel': delta_det_channel,
          'det_row_offset': det_row_offset, 'det_channel_offset': det_channel_offset},
         crop_pixels_top, crop_pixels_bottom, crop_pixels_sides, crop_pixels_sides)
@@ -260,21 +258,22 @@ def apply_config_crop(num_det_rows, num_det_channels, det_row_offset, det_channe
 
 def finalize_model(sino, required_params, optional_params, *, auto_crop=False, safety_buffer=20):
     """
-    Build a model from a scanner loader's sinogram and parameter dictionaries.
+    This function builds a model from the sinogram and parameter dictionaries of a scanner loader.
 
-    This is the last step of each scanner loader's ``get_sino_and_model``.  With ``auto_crop`` the blank
-    margins of the sinogram are removed first and the geometry is adjusted to match.
+    Each loader calls this function as the last step of its ``get_sino_and_model``.
 
     Args:
         sino (numpy.ndarray): The sinogram.
-        required_params (dict): The model constructor arguments plus a ``geometry_type`` entry that
-            names the model class.
-        optional_params (dict): Arguments for ``set_params``.
-        auto_crop (bool, optional): If True, remove the blank margins of the sinogram.  Defaults to False.
-        safety_buffer (int, optional): Blank margin in pixels kept when auto-cropping.  Defaults to 20.
+        required_params (dict): The model constructor arguments.  The dict also has a
+            ``geometry_type`` entry that names the model class.
+        optional_params (dict): The arguments for ``set_params``.
+        auto_crop (bool, optional): If True, the function first removes the blank margins of the
+            sinogram.  Defaults to False.
+        safety_buffer (int, optional): The number of blank pixels kept around the object when
+            ``auto_crop`` is True.  Defaults to 20.
 
     Returns:
-        tuple: ``(sino, model)``: the sinogram, cropped if asked, and the model with its parameters set.
+        tuple: ``(sino, model)``.  The sinogram is cropped if ``auto_crop`` is True.
     """
     if auto_crop:
         sino, required_params, optional_params = _auto_crop_sino(sino, required_params, optional_params, safety_buffer)
@@ -287,14 +286,16 @@ _ALU_UNIT_CONVERSION = {'um': 1.0, 'mm': 1000.0, 'cm': 1e4, 'm': 1e6}
 
 def to_alu(value, from_unit, alu_unit):
     """
-    Rescale a physical ``value`` from ``from_unit`` to ALU, where 1 ALU = 1 unit of ``alu_unit``.
+    This function converts a physical ``value`` from ``from_unit`` to ALU.
+
+    ALU is the arbitrary length unit of the model.  One ALU equals one ``alu_unit``.
 
     Args:
-        value (float or array): The value(s) to rescale.
-        from_unit (str): Unit of ``value`` (``'um'``, ``'mm'``, ``'cm'``, ``'m'``).
-        alu_unit (str): The unit defining 1 ALU.
+        value (float or array): The value or values to convert.
+        from_unit (str): The unit of ``value``: ``'um'``, ``'mm'``, ``'cm'``, or ``'m'``.
+        alu_unit (str): The unit that equals 1 ALU.
 
     Returns:
-        ``value * conversion[from_unit] / conversion[alu_unit]``.
+        float or array: The value in ALU.
     """
     return value * _ALU_UNIT_CONVERSION[from_unit] / _ALU_UNIT_CONVERSION[alu_unit]

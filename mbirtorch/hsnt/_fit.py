@@ -1,5 +1,7 @@
-"""The fit behind dehydrate and the command line: a memory plan, then the maximum-likelihood factorization held whole on
-the device or streamed by chunks of pixels, then the requested spectra estimator."""
+"""This module computes the factorization T = exp(-W @ H) for ``dehydrate`` and for the command
+line.  It first estimates the device memory that the fit needs.  If all pixels fit on the device,
+it solves for all pixels at once.  Otherwise, it streams chunks of pixels to the device.  After the
+factorization, it computes the spectra by the method that the caller selects."""
 import logging
 import time
 
@@ -8,36 +10,29 @@ import torch
 
 log = logging.getLogger("mbirtorch.hsnt")
 
-# Device working set of a full solve, in bytes per data entry with T, about 10% above the measured peaks: compiled
-# (H100, 1M pixels x 1200 bins: the joint-Newton MLE 37.2, the unconstrained re-estimate 38.2, support selection no
-# higher) and eager (H100, 262k and 1M pixels: the MLE 53.3, unconstrained 54.3; support selection's refit as
-# unconstrained). A W solve against a fixed basis peaks at 49.4 on the CPU.
+# This is the device memory of a full solve, in bytes per data entry, including T itself.
 _BYTES_PER_ENTRY = dict(compiled=dict(mle=41, unconstrained=42, support=42, basis=54),
                         eager=dict(mle=58, unconstrained=60, support=60, basis=54))
-# Support selection adds its free-set blocks: 29.3 bytes per entry of one block on the CPU (a block holds at most
-# spectra._FREE_SET_ELEMS entries), while the selection's own 37 bytes per data entry stay below the solve's.
+# This is the extra memory of support selection, in bytes per entry of one block of
+# ``spectra._FREE_SET_ELEMS`` entries.
 _BYTES_PER_BLOCK_ENTRY = 32
-# A streamed chunk's working set per chunk entry, about 10% above the measured (52.5 to 58.1 bytes beyond the chunk on
-# the CPU, 63 for a chunk's support selection, and on CUDA the chunk and its prefetched successor, 8 more); the
-# streamed warm-up is a full eager MLE fit of its subsample.
+# This is the device memory of a streamed solve, in bytes per entry of one chunk.
 _BYTES_PER_CHUNK_ENTRY = 72
-# Held at any size: the float64 blocks of the loss and of the fit quality (outputs._CHUNK_ELEMENTS entries each).
+# This is the memory in bytes that the float64 blocks of the loss and the fit quality use at
+# any data size.
 _FIXED_BYTES = 2**29
-# A full solve is planned when its estimate is within the first share of the budget; stream chunks and the streamed
-# warm-up are sized to the second.
+# The automatic plan uses a full solve when it needs at most 0.8 of the available memory.
+# Otherwise, it sizes the streamed chunks and the warm-up fit to use 0.6 of the available memory.
 _FULL_SHARE, _STREAM_SHARE = 0.8, 0.6
 _MIN_WARMUP_PIXELS = 4096
 SPECTRA = ("mle", "unconstrained", "support")
 
 
 def _device_memory(device):
-    """(budget, total, name, remark): the bytes a solve can allocate on the device, the device's total, its name, and
-    a remark on the reading for the plan's note ('' when there is none).
-
-    On CUDA the caching allocator's unused blocks are released first. The budget is then device_budget_bytes (the
-    driver's free memory plus what the allocator reserves but does not use), at most the total less what is allocated.
-    Where that sum exceeds the total, as the WSL2 driver can report, the driver's free memory is taken alone.
-    """
+    """This function returns the tuple (budget, total, name, remark) for a device.  The value
+    ``budget`` is the number of bytes that a solve can allocate, ``total`` is the total memory of
+    the device, and ``name`` is the name of the device.  The string ``remark`` notes how the budget
+    was measured, and it is empty when there is nothing to note."""
     if device.startswith("cuda"):
         from .._memory_ledger import device_budget_bytes
         torch.cuda.empty_cache()
@@ -55,17 +50,13 @@ def _device_memory(device):
 
 
 def _plan(P, K, device, spectra="mle", mode="auto", chunk_pixels=None, compile_mode="auto", warmup_pixels=16384):
-    """A full or streamed solve from the memory the device has available. Returns (mode, chunk_pixels,
-    warmup_pixels, note): the chunk and the streamed warm-up's pixels are None in a full solve.
-
-    The full solve's estimate uses the compiled or the eager constants as compile_mode resolves for the whole data,
-    and is chosen when within _FULL_SHARE of the budget; a streamed solve's chunks and its warm-up subsample are sized
-    to _STREAM_SHARE of it. spectra is 'mle', 'unconstrained', 'support' or 'basis' (a given basis: no warm-up).
-    """
+    """This function chooses a full solve or a streamed solve from the available device memory.
+    It returns the tuple (mode, chunk_pixels, warmup_pixels, note).  For a full solve, the two
+    pixel counts are None."""
     from ._newton import _resolve_compile
     budget, total, name, remark = _device_memory(device)
     compiled = _resolve_compile(compile_mode, torch.empty(P, K, device="meta"), device) == "on"
-    if compiled and torch.device(device).type == "cuda":     # 'on' without a working Triton runs eager
+    if compiled and torch.device(device).type == "cuda":     # Without a working Triton, 'on' runs eager.
         from ..kernel_availability import triton_available
         compiled = triton_available()[0]
     need_full = P * K * _BYTES_PER_ENTRY["compiled" if compiled else "eager"][spectra] + _FIXED_BYTES
@@ -96,7 +87,8 @@ def _plan(P, K, device, spectra="mle", mode="auto", chunk_pixels=None, compile_m
 
 
 def _loss(W, H, T_host, device):
-    """The float64 NNAL loss of W @ H against the host data, in pixel chunks so no P x K float64 array is formed."""
+    """This function computes the float64 NNAL loss of W @ H against the data in host memory.
+    It moves the data to the device in chunks of pixels."""
     from ._loss import stable_nnal
     from .outputs import _CHUNK_ELEMENTS
     Hd = H.to(device).double()
@@ -109,11 +101,10 @@ def _loss(W, H, T_host, device):
 
 
 def _report_zero_counts(rep, W, H, T, device, chunk):
-    """Record, and warn about, zero-count entries whose fitted attenuation sits at the solver's bound
-    (_zero_count_divergence), and the components that model the zero counts rather than a material: those holding at
-    least _CAPTURED_SHARE of their attenuation there (_zero_count_mass), or reaching the attenuation bound on them
-    alone (_components_at_bound). Goes through T (host numpy or a device tensor)
-    by blocks of `chunk` rows."""
+    """This function finds two problems in a fit and records them in ``rep``.  The first problem
+    is zero-count entries whose fitted attenuation reaches the upper bound.  The second problem is
+    components that model the zero counts instead of a material.  The function logs a warning for
+    each problem it finds."""
     from ._newton import _X_MAX
     from .factorization import _CAPTURED_SHARE, _components_at_bound, _zero_count_divergence, _zero_count_mass
     x_max, n_above = 0.0, 0
@@ -146,9 +137,9 @@ def _report_zero_counts(rep, W, H, T, device, chunk):
 
 def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8,
                      compile_mode="auto", report=None):
-    """The maps for a given basis: every pixel's maximum-likelihood W >= 0 with H fixed, independent problems solved
-    by block Newton in chunks of pixels from the memory plan. Returns (W, H, report) as _fit does, and fills `report`
-    as _fit does."""
+    """This function computes the maps W >= 0 for a fixed basis H.  It uses block Newton steps on
+    chunks of pixels.  It returns (W, H, report), and it fills ``report`` in the same way as
+    :func:`_fit`."""
     from ._newton import _resolve_compile, solve_W
     P, K = T.shape
     Hd = torch.as_tensor(np.ascontiguousarray(H, dtype=np.float32), device=device)
@@ -158,7 +149,7 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
     rep.update(mode=mode, memory_plan=note, spectra="given basis", chunks=-(-P // chunk))
     if mode == "stream":
         rep["chunk_pixels"] = chunk
-    if mode != "full":                                  # as a streamed fit: chunks compile only when asked
+    if mode != "full":                                  # Streamed chunks compile only when compile_mode is 'on'.
         compile_mode = "on" if compile_mode == "on" else "off"
     t0 = time.perf_counter()
     parts = []
@@ -184,14 +175,14 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
 def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, device="cpu",
          mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8, max_passes=5, warmup_pixels=16384,
          compile_mode="auto", report=None):
-    """Fit T (host numpy, pixels x bins, float32) at the given rank. Returns (W, H, report): numpy factors and a dict
-    of what was done (mode, steps or passes, seconds, losses, support size).
+    """This function fits the transmission T at the given rank.  T is a float32 numpy array with
+    shape (pixels, bins).  The function returns (W, H, report).  W and H are the numpy factors,
+    and ``report`` is a dict that describes what the fit did.
 
-    spectra: 'mle', 'unconstrained' or 'support' (needs the dose). penalty: support selection's charge per component,
-    'auto' or a multiple of log K. compile_mode applies to the full solve; a streamed solve compiles only with 'on'.
-    rel_tol stops a full solve after five steps in a row below it and a streamed one on the first pass below it, within
-    max_passes. warmup_pixels is the streamed warm-up's subsample, capped by the memory plan. report, a dict, is
-    filled in place of a new one, so that a caller has the memory plan even when the solve fails.
+    The argument ``spectra`` is 'mle', 'unconstrained', or 'support'.  The value 'support' needs
+    the dose.  The argument ``penalty`` is the penalty per component of the support selection.
+    It is either 'auto' or a multiple of log K.  The function fills ``report`` in place.  As a
+    result, the caller has the memory plan even when the solve fails.
     """
     from ._streaming import _stream_factorization
     from .factorization import _nnal_factorization
@@ -206,7 +197,7 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
     rep.update(mode=mode, memory_plan=note, spectra=spectra)
     if mode == "stream":
         rep["chunk_pixels"] = chunk
-        if str(device).startswith("cuda"):           # each chunk and its successor are pinned host copies
+        if str(device).startswith("cuda"):           # Each chunk and the next one are held as pinned host copies.
             from .loading import _check_host_memory
             _check_host_memory(2 * min(chunk, P) * K * T.dtype.itemsize, "the stream's pinned chunk copies")
     t0 = time.perf_counter()
@@ -233,7 +224,9 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
     rep["solve_seconds"] = round(time.perf_counter() - t0, 2)
     if mode == "full":
         rep["loss_mle"] = _loss(W, H, T, device)
-    else:       # the last polish pass's loss is at the final W and H; with free-signed W it is not the MLE's
+    # Otherwise, the loss of the last pass is at the final W and H.  With unconstrained W, this
+    # loss is not the MLE loss.
+    else:
         rep["loss_mle"] = stats["loss"][-1] if spectra != "unconstrained" else None
     steps_text = f"{rep['steps']} steps" if "steps" in rep else f"{rep['passes']} polish passes"
     log.info("factorization: %s, %s in %.1f s, loss %s", mode, steps_text, rep["solve_seconds"],
@@ -261,7 +254,7 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
         support_text = (f", mean {rep['mean_support_size']:.2f} materials per pixel" if "mean_support_size" in rep
                         else "")
         log.info("%s spectra%s: loss %.6g", spectra, support_text, rep["loss_final"])
-    # On the factors returned, in every mode: the maximum-likelihood fit, or the spectra estimator's with W >= 0.
+    # These checks apply to the returned factors in every mode.
     _report_zero_counts(rep, W, H, Td if mode == "full" else T, device, P if mode == "full" else chunk)
     if not (bool(torch.isfinite(W).all()) and bool(torch.isfinite(H).all())):
         log.warning("the fit's factors are not finite")

@@ -19,34 +19,41 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
                        bg_option="global", zinger_correction=True, auto_crop=False,
                        det_rotation=0.0, verbose=1):
     """
-    Load a Zeiss Versa or Ultra scan, compute its sinogram, and return a model ready to reconstruct.
-
-    An Ultra scan gives a ParallelBeamModel.  A Versa scan, or a scan whose scanner type cannot be
-    read from the file, gives a ConeBeamModel.  The per-view shifts recorded in the file are applied
-    to the sinogram.
+    This function loads a Zeiss Versa or Ultra scan, computes its sinogram, and returns a model
+    that is ready to reconstruct.  An Ultra scan gives a ParallelBeamModel.  Any other scan
+    gives a ConeBeamModel.  The file records a shift for each view.  The function applies
+    these shifts to the sinogram.
 
     Args:
-        dataset_dir (str): Path to the ``.txrm`` file.
-        downsample_factor (tuple[int, int], optional): Detector (row, channel) downsampling.  Defaults to (1, 1).
-        subsample_view_factor (int, optional): Keep every n-th view.  Defaults to 1.
-        crop_pixels_sides (int, optional): Pixels to crop from each side of the detector.  Defaults to 0.
-        crop_pixels_top (int, optional): Pixels to crop from the top.  Defaults to 0.
-        crop_pixels_bottom (int, optional): Pixels to crop from the bottom.  Defaults to 0.
-        alu_unit (str, optional): The length unit of the model: 'um', 'mm', 'cm', or 'm'.  Defaults to 'mm'.
-        bg_option (str or None, optional): Background offset removal, 'global' or 'per_view', or None
-            for none; see :func:`~mbirtorch.preprocess.correct_background_offset`.  Defaults to 'global'.
-        zinger_correction (bool, optional): If True, replace zinger pixels; see
+        dataset_dir (str): The path to the ``.txrm`` file.
+        downsample_factor (tuple[int, int], optional): The downsampling factors along the
+            detector rows and channels.  Defaults to (1, 1).
+        subsample_view_factor (int, optional): The function keeps every n-th view.
+            Defaults to 1.
+        crop_pixels_sides (int, optional): The number of pixels to crop from each side of the
+            detector.  Defaults to 0.
+        crop_pixels_top (int, optional): The number of pixels to crop from the top.
+            Defaults to 0.
+        crop_pixels_bottom (int, optional): The number of pixels to crop from the bottom.
+            Defaults to 0.
+        alu_unit (str, optional): The length unit of the model: 'um', 'mm', 'cm', or 'm'.
+            Defaults to 'mm'.
+        bg_option (str or None, optional): The method of background offset removal: 'global',
+            'per_view', or None for no removal.  See
+            :func:`~mbirtorch.preprocess.correct_background_offset`.  Defaults to 'global'.
+        zinger_correction (bool, optional): If True, the function replaces zinger pixels.  See
             :func:`~mbirtorch.preprocess.correct_zinger_pixels`.  Defaults to True.
-        auto_crop (bool, optional): If True, remove the blank margins of the sinogram and shrink the
-            reconstruction to match.  Defaults to False.
-        det_rotation (float, optional): Detector rotation in radians, removed from every view.
-            Defaults to 0.0.
-        verbose (int, optional): 0 prints nothing, 1 prints progress.  Defaults to 1.
+        auto_crop (bool, optional): If True, the function removes the blank margins of the
+            sinogram and shrinks the reconstruction to match.  Defaults to False.
+        det_rotation (float, optional): The detector rotation in radians.  The function removes
+            this rotation from every view.  Defaults to 0.0.
+        verbose (int, optional): The value 0 prints nothing, and 1 prints progress.
+            Defaults to 1.
 
     Returns:
-        tuple: ``(sino, model)``: the sinogram, shape (num_views, num_det_rows, num_det_channels), and
-        the model with its parameters set.  Weights are not returned; make them with
-        ``mbirtorch.gen_weights``.
+        tuple: ``(sino, model)``.  sino is the sinogram, with shape (num_views, num_det_rows,
+        num_det_channels).  model is the model with its parameters set.  Use
+        ``mbirtorch.gen_weights`` to compute the weights.
 
     Example:
         .. code-block:: python
@@ -64,17 +71,15 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
 
 def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm', bg_option="global", zinger_correction=True, det_rotation=0.0, verbose=1):
     """
-    Compute the sinogram and the model parameters from a Zeiss Ultra or Versa ``.txrm`` dataset.
-
-    This is the private helper for :func:`get_sino_and_model`, which documents the arguments.
-
-    Thanks to contributions of Amir Koushyar Ziabari of Oak Ridge National Laboratory (ORNL).
-    Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
+    This function computes the sinogram and the model parameters from a Zeiss Ultra or Versa
+    ``.txrm`` dataset.  :func:`get_sino_and_model` calls this function and documents the
+    arguments.  Thanks to Amir Koushyar Ziabari of ORNL.  Portions are adapted from the
+    DXchange library.
 
     Returns:
-        tuple: ``(sino, required_params, optional_params)``.  ``required_params`` holds the model
-        constructor arguments and a ``geometry_type`` entry that ``build_model`` uses to select the
-        model class.  ``optional_params`` holds the ``set_params`` arguments.
+        tuple: ``(sino, required_params, optional_params)``.  ``required_params`` holds the
+        arguments of the model constructor and ``geometry_type``.  ``optional_params`` holds
+        the arguments for ``set_params``.
     """
     if verbose > 0:
         print("\n\n########## Loading object, blank, dark scans, and geometry parameters from Zeiss dataset directory")
@@ -102,7 +107,7 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
         print("\n\n########## Correcting any residual background sinogram offset")
     sino = mtp.correct_background_offset(sino, option=bg_option)
 
-    # Zinger detection needs the background-corrected sinogram.  It must run before the per-view shifts below.
+    # Zinger detection must run after the background correction and before the view shifts.
     if zinger_correction:
         if verbose > 0:
             print("\n\n########## Correcting zinger pixels")
@@ -117,7 +122,7 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
         print('blank_scan shape = ', blank_scan.shape)
         print('dark_scan shape = ', dark_scan.shape)
 
-    # An 'ultra' scan is parallel beam.  Every other scanner type is treated as cone beam.
+    # An 'ultra' scan is parallel beam.  Every other scanner type is cone beam.
     scanner_type = zeiss_metadata['scanner_type']
     if scanner_type == 'ultra':
         geometry_params['geometry_type'] = str(mbirtorch.ParallelBeamModel)
@@ -128,27 +133,26 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
 
 def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
     """
-    Load the scan data and geometry from a Zeiss scan directory.
-
-    Notes:
-        Thanks to contributions of Amir Koushyar Ziabari of Oak Ridge National Laboratory (ORNL).
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
+    This function loads the scan data and geometry from a Zeiss ``.txrm`` file.  Thanks to Amir
+    Koushyar Ziabari of ORNL.  Portions are adapted from the DXchange library.
 
     Args:
-        dataset_dir (str): Path to the Zeiss ``.txrm`` file itself, not to a directory. The scan data
-            and the geometry parameters are both read from that file.
-        subsample_view_factor (int): view subsample factor. Every n-th view is read.
-        verbose (int, optional): Verbosity level. Defaults to 1.
+        dataset_dir (str): The path to the Zeiss ``.txrm`` file itself, not to a directory.
+        subsample_view_factor (int): The view subsampling factor.  The function reads every
+            n-th view.
+        verbose (int, optional): The verbosity level.  Defaults to 1.
 
     Returns:
         tuple: (obj_scan, blank_scan, dark_scan, zeiss_params)
 
-            - obj_scan (numpy.ndarray): 3D object scan with shape ``(num_views, num_det_rows, num_channels)``.
-            - blank_scan (numpy.ndarray): 3D blank scan with shape ``(num_reference, num_det_rows, num_channels)``,
-              where ``num_reference`` is the number of reference images stored in the file.
-            - dark_scan (numpy.ndarray): 3D array of zeros with the shape of ``obj_scan``. The ``.txrm``
-              format carries no dark scan, so one is never loaded.
-            - zeiss_params (dict): Geometry parameters read from the ``.txrm`` file.
+            - obj_scan (numpy.ndarray): The 3D object scan with shape
+              ``(num_views, num_det_rows, num_channels)``.
+            - blank_scan (numpy.ndarray): The 3D blank scan with shape
+              ``(num_reference, num_det_rows, num_channels)``.  It holds one image for each
+              reference image in the file.
+            - dark_scan (numpy.ndarray): An array of zeros with the shape of ``obj_scan``.  The
+              ``.txrm`` format has no dark scan.
+            - zeiss_params (dict): The geometry parameters read from the ``.txrm`` file.
     """
     data_dir = _parse_filenames_from_dataset_dir(dataset_dir)
 
@@ -186,11 +190,11 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
 
     blank_scan = zeiss_params["reference"]
 
-    # TODO: Currently we assume that there is no dark scan for txrm file
+    # TODO: The txrm file is assumed to have no dark scan.
     dark_scan = np.zeros(obj_scan.shape, dtype=obj_scan.dtype)
 
     try:
-        axis_names = zeiss_params.get("axis_names")  # This is a list of names: ['Sample X', 'Sample Y', ..., 'CCD_X', ...]
+        axis_names = zeiss_params.get("axis_names")  # ['Sample X', ..., 'CCD_X', ...]
         axis_units = zeiss_params.get("axis_units")  # This is a list of units: ['um', 'um', ..., ]
 
         source_iso_dist = zeiss_params["source_iso_dist"]
@@ -281,25 +285,27 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
 
 def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm'):
     """
-    Convert geometry parameters from zeiss into mbirtorch format, including modifications to reflect crop.
-
-    Notes:
-        Thanks to contributions of Amir Koushyar Ziabari of Oak Ridge National Laboratory (ORNL).
+    This function converts Zeiss geometry parameters into mbirtorch parameters.  The mbirtorch
+    parameters account for the crop.  Thanks to Amir Koushyar Ziabari of ORNL.
 
     Args:
-        zeiss_params (dict): Required Zeiss geometry parameters for reconstruction.
-        downsample_factor ((int, int), optional) - Down-sample factors along the detector rows and channels respectively.
-            If scan size is not divisible by `downsample_factor`, the scans will be first truncated to a size that is divisible by `downsample_factor`.
-        crop_pixels_sides (int, optional): The number of pixels to crop from each side of the sinogram. Defaults to 0.
-        crop_pixels_top (int, optional): The number of pixels to crop from top of the sinogram. Defaults to 0.
-        crop_pixels_bottom (int, optional): The number of pixels to crop from bottom of the sinogram. Defaults to 0.
-        alu_unit (str, optional): The physical unit used to define 1 ALU (Arbitrary Length Unit). Defaults to 'mm'.
-            Supported units input: 'um', 'mm', 'cm', 'm'.
+        zeiss_params (dict): The Zeiss geometry parameters needed for reconstruction.
+        downsample_factor ((int, int), optional): The downsampling factors along the detector
+            rows and channels.  If the scan size is not divisible by a factor, the function
+            first truncates the scan.  Defaults to (1, 1).
+        crop_pixels_sides (int, optional): The number of pixels to crop from each side of the
+            sinogram.  Defaults to 0.
+        crop_pixels_top (int, optional): The number of pixels to crop from top of the sinogram.
+            Defaults to 0.
+        crop_pixels_bottom (int, optional): The number of pixels to crop from bottom of the
+            sinogram.  Defaults to 0.
+        alu_unit (str, optional): The physical unit of 1 ALU: 'um', 'mm', 'cm', or 'm'.
+            Defaults to 'mm'.
 
     Returns:
-        geometry_params (dict): Required parameters for the tomography model constructor.
-        optional_params (dict): Additional geometry model parameters to be set using set_params()
-        zeiss_metadata (dict): some metadata stored in Zeiss txrm file.
+        geometry_params (dict): The required parameters of the tomography model constructor.
+        optional_params (dict): Additional model parameters to set with ``set_params()``.
+        zeiss_metadata (dict): Metadata from the Zeiss txrm file.  It holds the scanner type.
     """
     source_iso_dist, iso_det_dist, source_iso_dist_unit, iso_det_dist_unit = itemgetter('source_iso_dist', 'iso_det_dist', 'source_iso_dist_unit', 'iso_det_dist_unit')(zeiss_params)
     delta_det_channel, delta_det_row, delta_det_channel_unit, delta_det_row_unit = itemgetter('delta_det_channel', 'delta_det_row', 'delta_det_channel_unit', 'delta_det_row_unit')(zeiss_params)
@@ -311,7 +317,6 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
 
     scanner_type = zeiss_params['scanner_type']
 
-    # One ALU is defined as one unit of alu_unit.
     alu_value = 1
 
     source_iso_dist = lu.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
@@ -327,7 +332,7 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
     else:
         pass
 
-    # In this case the detector is a scintillator.
+    # The detector is a scintillator.
     if opt_mag is not None and not np.isinf(opt_mag):
         scintillator_mag = source_detector_dist/source_iso_dist
         magnification = opt_mag * scintillator_mag
@@ -338,11 +343,11 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
     delta_det_channel = magnification * iso_pixel_pitch
     delta_det_row = magnification * iso_pixel_pitch
 
-    # det_channel_offset and det_row_offset are in pixels here.  Convert them to ALU.
+    # The offsets are in pixels here.  These lines convert them to ALU.
     det_channel_offset *= delta_det_channel
     det_row_offset *= delta_det_row
 
-    # The crop is in raw detector pixels, and the offsets are in ALU.  Downsampling is applied afterward.
+    # The crop is in detector pixels before downsampling.  The offsets are in ALU.
     num_det_rows, num_det_channels, det_row_offset, det_channel_offset = lu.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
@@ -355,7 +360,6 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
 
     iso_pixel_pitch *= downsample_factor[0]
 
-    # 'ultra' is treated as parallel-beam, and 'versa' is treated as cone-beam.
     if scanner_type == "ultra":
         num_views = len(angles)
         geometry_params = dict()
@@ -365,7 +369,7 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
         optional_params = dict()
         optional_params['delta_det_channel'] = delta_det_channel
         optional_params['delta_det_row'] = delta_det_row
-        optional_params['delta_voxel'] = delta_det_channel    # For parallel-beam geometry, there is no geometric magnification
+        optional_params['delta_voxel'] = delta_det_channel  # Parallel beam has no magnification.
         optional_params['det_row_offset'] = det_row_offset
         optional_params['det_channel_offset'] = det_channel_offset
         optional_params['alu_unit'] = alu_unit
@@ -387,7 +391,6 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
         optional_params['alu_unit'] = alu_unit
         optional_params['alu_value'] = alu_value
 
-    # TODO: More metadata will be added in the future based on users' interest
     zeiss_metadata = {"scanner_type": scanner_type}
 
     return geometry_params, optional_params, zeiss_metadata
@@ -396,14 +399,16 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
 ######## subroutines for parsing Zeiss object scan, blank scan, and dark scan
 def _parse_filenames_from_dataset_dir(dataset_dir):
     """
-    Given a path to a Zeiss scan directory, automatically parse the paths to the following files and directories：
-        - the txrm file store the projection data
+    This function checks that ``dataset_dir`` is an existing ``.txrm`` file and returns it.
+
+    The function raises ValueError for any other file type.  It raises FileNotFoundError if the
+    file does not exist.
 
     Args:
-        dataset_dir (string): Path to the directory containing the Zeiss scan files.
+        dataset_dir (string): The path to the Zeiss ``.txrm`` file.
 
     Returns:
-        Path to the txrm file storing the projection data
+        The path to the ``.txrm`` file that holds the projection data.
     """
     if os.path.isfile(dataset_dir):
         if dataset_dir.endswith(".txrm"):
@@ -416,35 +421,31 @@ def _parse_filenames_from_dataset_dir(dataset_dir):
 
 def read_xrm(fname, normalize_to_float32=True):
     """
-    Read a single Xradia ``.xrm`` radiograph and its metadata (zeiss reader).
-
-    Thin wrapper over :func:`mbirtorch.preprocess._xradia_ole.read_xrm` that binds this module's
-    :func:`read_metadata`.  See that function for argument and return details.
+    This function reads a single Xradia ``.xrm`` radiograph and its metadata.  It calls
+    :func:`mbirtorch.preprocess._xradia_ole.read_xrm` with the :func:`read_metadata` function
+    of this module.
     """
     return _xradia_ole.read_xrm(fname, read_metadata, normalize_to_float32=normalize_to_float32)
 
 
 def read_xrm_dir(dir_path):
     """
-    Read all ``.xrm`` files in a directory and stack them (zeiss reader).
-
-    Thin wrapper over :func:`mbirtorch.preprocess._xradia_ole.read_xrm_dir` that binds this module's
-    :func:`read_metadata`.  See that function for argument and return details.
+    This function reads all ``.xrm`` files in a directory and stacks them.  It calls
+    :func:`mbirtorch.preprocess._xradia_ole.read_xrm_dir` with the :func:`read_metadata`
+    function of this module.
     """
     return _xradia_ole.read_xrm_dir(dir_path, read_metadata)
 
 def read_metadata(ole):
     """
-    Read metadata from an xradia OLE file (.xrm, .txrm, .txm).
-
-    Notes:
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
+    This function reads metadata from an xradia OLE file (.xrm, .txrm, .txm).  Portions are
+    adapted from the DXchange library: https://github.com/data-exchange/dxchange
 
     Args:
-        ole (OleFileIO instance) : An ole file to read from.
+        ole (OleFileIO instance): The OLE file to read.
 
     Returns:
-        dict: A dictionary of image metadata.
+        dict: The image metadata.
     """
 
     number_of_images = _read_ole_value(ole, "ImageInfo/NoOfImages", "<I")
@@ -521,18 +522,18 @@ def read_metadata(ole):
 
 def _read_ole_reference(ole, labels, struct_fmt):
     """
-    Reads the reference-related value from any matching label in an ole file
-
-    First tries to unpack the data as a scalar value. If that does not work,
-    it attempts to unpack it as a NumPy array.
+    This function reads a reference value from the first matching label in an OLE file.  The
+    function first tries to read the value as a scalar.  If that fails, it reads the value as a
+    NumPy array.
 
     Args:
-        ole (OleFileIO): An ole file to read from.
-        labels (list of str): List of possible labels associated with the reference data parameters.
-        struct_fmt (str): Format of the OLE file.
+        ole (OleFileIO): The OLE file to read.
+        labels (list of str): The possible labels of the reference data parameter.
+        struct_fmt (str): The struct format string of the value.
 
     Returns:
-        int, float, or ndarray: The unpacked value from a matching label. Return None if no matching label exists.
+        int, float, or ndarray: The value of the first matching label, or None if no label
+        matches.
     """
     for label in labels:
         if ole.exists(label):
@@ -548,13 +549,11 @@ def _read_ole_reference(ole, labels, struct_fmt):
 
 def classify_zeiss_system(fname):
     """
-    Determine the Zeiss microscope system type from a .txrm file.
-
-    The classification is based on the presence of system-specific metadata:
-    Ultra files contain "ConfigZonePlates", while Versa files contain "ConfigXrayFilters/Filter0/Name".
+    This function returns the Zeiss system type of a .txrm file.  An Ultra file contains the
+    entry "ConfigZonePlates".  A Versa file contains the entry "ConfigXrayFilters/Filter0/Name".
 
     Args:
-        fname (str): Path to a Zeiss .txrm file.
+        fname (str): The path to a Zeiss .txrm file.
 
     Returns:
         str: 'versa'   -- cone-beam micro-CT (Xradia Versa)
@@ -591,38 +590,28 @@ def classify_zeiss_system(fname):
 
 def correct_sino_shifts(sino, zeiss_params, downsample_factor, subsample_view_factor):
     """
-    Align each sinogram view based on the per-view projection offset.
-
-    The txrm file stores the horizontal (x-shift) and vertical (y-shift) offsets for each projection.
-    This function compensates the object's vibration by shifting each view of the sinogram accordingly.
-
-    Coordinate convention (view from source):
-      • x-shift: shift should be applied in the horizontal direction. Positive x-shift means the view should be shifted to the right
-      • y-shift: shift should be applied in the vertical direction. Positive y-shift means the view should be shifted down
-
-    For each view, the function:
-      1. Reads the corresponding offset (x-shift, y-shift)
-      2. Translate the view based on the (x-shift, y-shift)
-
-    Padding is added before shifting to handle image boundary,
-    and the padding is removed afterward.
+    This function shifts each sinogram view by the offset that the txrm file stores for that
+    view.  The shifts remove the vibration of the object.  As seen from the source, a
+    positive x-shift moves the view right, and a positive y-shift moves the view down.
 
     Args:
-        sino (numpy.ndarray): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
-        zeiss_params (dict): parameters stored in Zeiss txrm file.
-        downsample_factor (Tuple[int, int], optional): Downsample factors for detector rows and channels. Defaults to (1, 1).
-        subsample_view_factor (int, optional): Factor by which to subsample views. Defaults to 1.
+        sino (numpy.ndarray): The 3D sinogram with shape (num_views, num_det_rows,
+            num_det_channels).
+        zeiss_params (dict): The parameters stored in the Zeiss txrm file.
+        downsample_factor (Tuple[int, int]): The downsampling factors for the detector rows and
+            channels.
+        subsample_view_factor (int): The view subsampling factor.
 
     Returns:
-        corrected_sino (numpy.ndarray): 3D sinogram data after alignment
+        corrected_sino (numpy.ndarray): The 3D sinogram after alignment.
     """
-    # The scaling is out of place.  An in-place division would rescale the caller's copy of zeiss_params.
+    # These are new arrays, so the zeiss_params of the caller is not rescaled.
     sino_x_offset = np.asarray(zeiss_params["x_shifts"][::subsample_view_factor],
                                dtype=np.float64) / downsample_factor[1]
     sino_y_offset = np.asarray(zeiss_params["y_shifts"][::subsample_view_factor],
                                dtype=np.float64) / downsample_factor[0]
 
-    # Each view is translated by its absolute offset, so the padding covers the largest absolute shift.
+    # The padding covers the largest shift in absolute value.
     pad_size = int(np.ceil(np.maximum(np.max(np.abs(sino_x_offset)),
                                       np.max(np.abs(sino_y_offset)))))
 

@@ -1,34 +1,12 @@
-"""Device placement, safe transfer, and per-device threaded execution.
-A single process drives every device, bands move device-to-device, and one
-python thread per device issues the work -- the
-substrate the jax fbp-filter parallelism study selected and the torch
-substrate spikes revalidated (measurements in the plans repo).
+"""This module divides arrays among several devices and moves data between them.
 
-The jax global sharded array (make_array_from_single_device_arrays) has no
-counterpart here -- DTensor is deliberately avoided as immature for these
-index-heavy kernels -- so the
-device form of a sharded array here is a :class:`Shards` container: the
-per-device tensors plus their :class:`Placement`.  A single device is the
-trivial 1-shard case, and the placement functions keep returning PLAIN
-tensors there,
-so the n=1 reconstruction path is unchanged.
-
-Under view/slice sharding the only data that crosses the recon<->sino
-boundary is voxel cylinders (the sinogram is written locally on its
-view-shard and never moves).  The two directions cut a different axis of the
-cylinder.
-
-The back projection cuts the SLICE axis.  ``sum_band_to_owner`` (a
-reduce-scatter) sums each view-owner's band partials onto the band's
-slice-owner.
-
-The forward projection cuts the PIXEL axis.  ``transfer_cylinder_batch``
-assembles one batch of full-height voxel cylinders on one view-owner.  A
-geometry whose slices project onto a range of detector rows needs the whole
-slice axis before it can produce any of its own rows, so a slice band buys it
-nothing.  A row-aligned geometry could produce its rows from a band, and takes
-the same cylinder transfer because its kernel is markedly faster on the wider
-block of values.
+One process controls every device, with one Python thread per device.  The module splits an
+array along one axis into contiguous blocks, one block (shard) per device.  A :class:`Shards`
+container holds the shards, and a :class:`Placement` records which block each device holds.
+The sinogram stays on its devices, and only voxel data moves between devices.  The function
+``sum_band_to_owner`` sums the partial back projections from the devices.  The function
+``transfer_cylinder_batch`` collects the voxel data that a forward projection needs.  Here a
+cylinder is the set of voxels at one (row, col) pixel over all slices.
 """
 
 import contextlib
@@ -43,32 +21,23 @@ import torch
 
 
 class Placement:
-    """Defines how one array type is distributed across devices: the mapping
-    from each device to the contiguous block (shard) of the array it owns,
-    determined by a sharded axis and a device list.
+    """This class is used to record how an array is divided among devices.  It
+    gives the axis that is split and the list of devices.  Each device holds one
+    contiguous block of the array along that axis.
 
-    The device form of the sharded axis is exactly as long as the problem's
-    own axis.  Each device owns one contiguous block, the block lengths
-    differ by at most one, and the longer blocks come first.  A device count
-    larger than the axis length leaves the trailing devices with empty
-    blocks.  The axis is never padded: the device form is a list of
-    per-device tensors, so blocks of unequal length are allowed.
-
-    Placements compare by VALUE, not by identity: see :meth:`__eq__` for what
-    that does and does not certify about two arrays held under equal
-    placements.
+    The block lengths differ by at most one, with the longer blocks first.  If
+    there are more devices than entries on the axis, the last devices hold
+    nothing.
 
     Args:
-        devices (sequence of torch.device or str): the devices this array
-            type lives on.  A single device is the trivial (1-shard)
-            placement.
-        axis (int): the axis of this array type that is partitioned across
-            the devices (may be negative; resolved against an array's rank
-            where used).  Recon-like -> the slice axis (-1); sino-like -> the
-            view axis (0).
-        axis_len (int or None): the length of the sharded axis (e.g.
-            num_views for a sino placement).  When given, it is the axis
-            length :meth:`shard_ranges` splits by default.
+        devices (sequence of torch.device or str): The devices that hold the
+            array.  A single device means that the array is not divided.
+        axis (int): The axis that is divided among the devices.  It may be
+            negative.  A reconstruction is divided along the slice axis (-1),
+            and a sinogram along the view axis (0).
+        axis_len (int or None): The length of the divided axis, such as
+            num_views for a sinogram.  If given, :meth:`shard_ranges` splits
+            this length by default.
     """
 
     def __init__(self, devices, axis, axis_len=None):
@@ -79,32 +48,10 @@ class Placement:
         self.axis_len = int(axis_len) if axis_len is not None else None
 
     def __eq__(self, other):
-        """Two placements are equal when they name the same devices and split
-        the same axis of the same length.
-
-        Those three fields are all a placement has, and the block boundaries
-        follow from them alone, so equal placements cut the axis into the same
-        blocks on the same devices.  Shard tensors held under equal placements
-        are therefore interchangeable between the two owners: this is what lets
-        one model hand its sharded array to another model configured the same
-        way.
-
-        What equality does NOT certify is the array's UNSHARDED extents.  A
-        placement carries no record of them -- a recon placement says how the
-        slice axis is divided and nothing about the rows and columns -- so two
-        arrays under equal placements can still disagree on their other axes.
-        The whole-volume shape check is the one
-        :meth:`~mbirtorch.TomographyModel.configure_devices` performs when it
-        is given ``like=``, and that is where a model built at the wrong shape
-        is caught.
-
-        One property worth knowing: ``torch.device('cuda')`` and
-        ``torch.device('cuda:0')`` do not compare equal, so a model left on an
-        unindexed device and a model on an indexed one have unequal placements
-        even when they run on the same hardware.  That is the conservative
-        direction -- refuse rather than wrongly accept -- and a caller who
-        builds one layout from another with ``like=`` copies the device list
-        verbatim, so the two always match exactly.
+        """This method returns True when both placements have the same devices
+        and split the same axis of the same length.  It does not compare the
+        other axes of the array.  It treats ``torch.device('cuda')`` and
+        ``torch.device('cuda:0')`` as different devices.
         """
         if not isinstance(other, Placement):
             return NotImplemented
@@ -113,14 +60,7 @@ class Placement:
                 and self.axis_len == other.axis_len)
 
     def __hash__(self):
-        """Hash over the same three fields :meth:`__eq__` compares.
-
-        Placements are treated as immutable once constructed: nothing rebuilds
-        one in place, and a layout change builds a new one.  Nothing in the
-        library uses a placement as a dict key or a set member today, but
-        defining ``__eq__`` alone would silently make every instance
-        unhashable, so both are defined together.
-        """
+        """This method returns a hash of the three fields that :meth:`__eq__` compares."""
         return hash((tuple(self.devices), self.axis, self.axis_len))
 
     def __repr__(self):
@@ -133,25 +73,20 @@ class Placement:
 
     @property
     def is_trivial(self):
-        """True when this placement is a single device (1 shard)."""
+        """This property is True when the placement has a single device."""
         return len(self.devices) == 1
 
     def shard_ranges(self, axis_len=None):
-        """The half-open axis range each device owns when an axis of length
-        ``axis_len`` is split into contiguous blocks, one per device.
-
-        The block lengths differ by at most one, and the longer blocks come
-        first.  That is ``numpy.array_split``'s convention, which the index
-        arithmetic below uses directly, and it matches the convention the
-        slice bands already follow.  An axis length smaller than the device
-        count gives the trailing devices empty ranges.
+        """This method splits an axis of length ``axis_len`` into contiguous
+        blocks, one per device.  It returns the half-open range of each block.
+        The blocks are the same as those of ``numpy.array_split``.
 
         Args:
-            axis_len (int, optional): the length of the sharded axis to
-                split.  Defaults to this placement's ``axis_len``.
+            axis_len (int, optional): The length of the axis to split.
+                Defaults to the ``axis_len`` of this placement.
 
         Returns:
-            list of (device, (start, end)): the half-open block owned by each
+            list of (device, (start, end)): The half-open range held by each
             device, in device order.
         """
         if axis_len is None:
@@ -167,21 +102,18 @@ class Placement:
                 for i, dev in enumerate(self.devices)]
 
 
-#: How many bytes of one shard the host gather moves at a time.  Each host thread
-#: stages its part through two pinned slots, so a gather holds twice this much
-#: pinned memory per thread.
+#: The number of bytes that ``Shards.gather`` copies to the CPU in one step.  Each CPU
+#: thread copies through two pinned buffers of this size.
 GATHER_SLOT_BYTES = 16 * 2 ** 20
 
-#: The most host threads the gather uses per shard.
+#: The maximum number of CPU threads that ``Shards.gather`` uses per shard.
 GATHER_THREADS_PER_SHARD = 16
 
 
 def _gather_threads_per_shard(n_shards):
-    """Return the number of host threads each shard's block is written with.
-
-    The threads of all shards together are meant to occupy the CPUs this
-    process may run on, so the count is the CPUs divided by the shard count
-    and by torch's own intra-op thread count.
+    """This function returns the number of CPU threads used to copy each shard.
+    The number is the count of available CPUs divided by the number of shards
+    and by torch's intra-op thread count.
     """
     try:
         cpus = len(os.sched_getaffinity(0))
@@ -192,9 +124,9 @@ def _gather_threads_per_shard(n_shards):
 
 
 def _split_grid(rows, width, parts):
-    """Return up to ``parts`` (row0, row1, col0, col1) sub-grids of a
-    (rows, width) grid, one per thread.  Each sub-grid is a range of whole
-    rows, or a range of columns when the grid has a single row."""
+    """This function splits a (rows, width) grid into at most ``parts`` pieces,
+    each given as (row0, row1, col0, col1).  The pieces are groups of whole rows.
+    If the grid has one row, the pieces are groups of columns."""
     if rows == 1 and parts > 1:
         bounds = np.linspace(0, width, min(parts, width) + 1).astype(int)
         return [(0, 1, int(a), int(b))
@@ -205,9 +137,8 @@ def _split_grid(rows, width, parts):
 
 
 def _slab_pieces(rows, width, slot_elems):
-    """Yield the (row0, row1, col0, col1) pieces of a (rows, width) grid that
-    each fit in ``slot_elems`` elements.  A piece is as many whole rows as
-    fit, or part of one row when a whole row does not fit."""
+    """This function yields the pieces (row0, row1, col0, col1) of a (rows,
+    width) grid.  Each piece has at most ``slot_elems`` elements."""
     rows_per_slab = slot_elems // width
     if rows_per_slab >= 1:
         for r0 in range(0, rows, rows_per_slab):
@@ -219,15 +150,9 @@ def _slab_pieces(rows, width, slot_elems):
 
 
 def _copy_through_slots(source, dest, slots):
-    """Move part of a shard into its block of the host array, one slab at a
-    time through two staging slots.
-
-    ``source`` is a contiguous (rows, width) tensor on the shard's device,
-    ``dest`` is the matching view of the host array, and ``slots`` is two
-    host tensors of equal length.  Each slab is copied into a slot and then
-    written from the slot into place.  With two slots the copy of the next
-    slab is issued before the current slab is written, so a CUDA shard's
-    copies overlap the writes.  An event per slab says when it has landed.
+    """This function copies a contiguous (rows, width) part of a shard into the
+    CPU array ``dest``.  It copies one piece at a time and alternates between the
+    two pinned buffers in ``slots``.
     """
     rows, width = source.shape
     if rows == 0 or width == 0:
@@ -251,7 +176,7 @@ def _copy_through_slots(source, dest, slots):
     for k in range(len(pieces)):
         staged, landed = pending
         if k + 1 < len(pieces):
-            # Into the other slot, whose last slab has already been written.
+            # This copy goes into the other buffer, whose last piece has already been written to dest.
             pending = issue(k + 1)
         if landed is not None:
             landed.synchronize()
@@ -260,16 +185,9 @@ def _copy_through_slots(source, dest, slots):
 
 
 def _fill_from_shards_in_slabs(sources, out, axis):
-    """Copy every shard into its block of ``out`` at once, several host
-    threads per shard, each thread moving its part in slabs of
-    :data:`GATHER_SLOT_BYTES`.
-
-    ``sources`` are the shards in axis order, ``out`` is the contiguous host
-    array they fill, and ``axis`` is the sharded axis as a non-negative
-    index.  The array is handled as a grid whose rows are the indices before
-    the sharded axis, so a shard's block is the same range of columns in
-    every row.  Each thread takes a range of those rows, or of the columns
-    when there is a single row.  Slots for a CUDA shard are pinned.
+    """This function copies every shard into its block of the CPU array ``out``.
+    It uses several CPU threads per shard and copies :data:`GATHER_SLOT_BYTES` at a
+    time.
     """
     shape = tuple(out.shape)
     rows = math.prod(shape[:axis])
@@ -296,8 +214,8 @@ def _fill_from_shards_in_slabs(sources, out, axis):
             slots = [torch.empty(slot_elems, dtype=out.dtype, pin_memory=pinned)
                      for _ in range(2)]
         except RuntimeError:
-            # Pinned memory is unavailable.  Ordinary host memory makes the
-            # copies wait, which is slower and gives the same values.
+            # Pinned memory is unavailable.  Ordinary CPU memory gives the same
+            # values, but the copies are slower.
             slots = [torch.empty(slot_elems, dtype=out.dtype) for _ in range(2)]
         _copy_through_slots(source2d, dest2d, slots)
 
@@ -309,14 +227,12 @@ def _fill_from_shards_in_slabs(sources, out, axis):
 
 
 class Shards:
-    """The device form of a sharded array: one tensor per device plus the
-    placement that says which global block each covers.
+    """This class is used to hold an array that is divided among devices.  It
+    holds one tensor per device and a :class:`Placement`.  The placement records
+    which block of the whole array each tensor holds.
 
-    This is the explicit-placement stand-in for jax's shard-backed global
-    array.  It is
-    a plain container -- no arithmetic; the drivers and the VCD loop operate on
-    the per-device tensors directly.  ``gather()`` is the host exit
-    (:math:`\\to` numpy, the shards laid end to end on the sharded axis).
+    This class does no arithmetic.  The projectors and the VCD loop work on the
+    tensors directly.  :meth:`gather` returns the whole array as a numpy array.
     """
 
     def __init__(self, tensors, placement):
@@ -325,8 +241,8 @@ class Shards:
                 f"{len(tensors)} shard tensors for {placement.n_devices} devices.")
         self.tensors = list(tensors)
         self.placement = placement
-        # Each shard must live on its placement's device.  An unindexed form such
-        # as 'cuda' matches any index of its type, and two indexed forms must agree.
+        # Each shard must be on its placement device.  A device without an index,
+        # such as 'cuda', matches any index of its type.
         for t, d in zip(self.tensors, placement.devices):
             if t.device.type != d.type or (
                     t.device.index is not None and d.index is not None
@@ -337,41 +253,21 @@ class Shards:
 
     @property
     def dtype(self):
-        """The shards' common dtype (from the first shard)."""
+        """This property returns the dtype of the first shard."""
         return self.tensors[0].dtype
 
     def gather(self):
-        """Return the whole array on the host, as one numpy array.
-
-        The shards are laid end to end along the sharded axis in device order,
-        which is global order, so the result is the array the shards stand
-        for.  It is a fresh, C-contiguous host array of the shards' own dtype;
-        nothing in it aliases a shard.
-
-        The host array is allocated ONCE, at full size, and each shard is
-        copied straight into its own block of it.  The obvious alternative --
-        bring every shard over as its own host array and concatenate them --
-        holds the whole volume twice on the host at the peak, once as the
-        separate pieces and once as the joined result.  It is also slow in the
-        layout that matters most: a recon shards on its LAST axis, and joining
-        on the last axis means neither the reading nor the writing runs along
-        contiguous memory.
-
-        CUDA shards cross all at once, each in slabs through a small pinned
-        staging area (:func:`_fill_from_shards_in_slabs`).  A plain copy of
-        each shard into its strided block would instead stage the whole shard
-        in pageable host memory, one device after another, which moves a
-        large volume at a fraction of the transfer rate.  Shards on other
-        devices are copied into place directly.
+        """This method returns the whole array as a numpy array.  It places the
+        shards end to end along the divided axis.  The result is a new
+        C-contiguous array that shares no memory with the shards.
 
         Returns:
-            numpy.ndarray: the assembled array on the host.
+            numpy.ndarray: The whole array.
         """
         first = self.tensors[0]
-        # The sharded axis may be negative, so it is resolved against the rank.
+        # The divided axis may be negative.
         axis = self.placement.axis % first.ndim
-        # The whole array has one shard's shape with the sharded axis grown to the
-        # total the shards cover.  A device that owns nothing contributes length zero.
+        # A device that holds nothing contributes length zero.
         lengths = [int(t.shape[axis]) for t in self.tensors]
         shape = [int(n) for n in first.shape]
         shape[axis] = sum(lengths)
@@ -380,19 +276,17 @@ class Shards:
             raise ValueError(
                 f'The shards cover {shape[axis]} entries of axis {axis}, but '
                 f'their placement says that axis is {axis_len} long.')
-        # The destination is a host tensor, and the numpy view at the end shares
-        # this same memory.
+        # The numpy array returned at the end shares memory with this CPU tensor.
         out = torch.empty(shape, dtype=first.dtype, device='cpu')
-        # Each shard is paired with a view of the part of the finished array it
-        # owns, so the copies below write straight to their final position.
+        # Each shard is paired with a view of its block in ``out``.
         pairs = []
         start = 0
         for tensor, length in zip(self.tensors, lengths):
             block = out.narrow(axis, start, length)
             start += length
             if tuple(tensor.shape) != tuple(block.shape):
-                # Shards that disagree on their other axes do not describe one array,
-                # and without this check the copy below would stretch a small shard.
+                # Without this check, the copy below would broadcast a shard with a
+                # wrong shape.
                 raise ValueError(
                     f'A shard of shape {tuple(tensor.shape)} does not fill the '
                     f'{tuple(block.shape)} block of the whole array it covers.')
@@ -403,40 +297,32 @@ class Shards:
         else:
             for source, block in pairs:
                 if block.numel() == 0:
-                    continue            # this device holds nothing to copy
+                    continue            # This device holds nothing.
                 try:
                     block.copy_(source)
                 except RuntimeError:
-                    # Not every backend writes at an arbitrary byte offset.  Metal
-                    # copies only at 4-byte boundaries, which a 1-byte or 2-byte
-                    # dtype can fall between.  Such a shard comes to the host on its
-                    # own, at the price of one shard-sized temporary.
+                    # Metal copies only at 4-byte boundaries.  A 1-byte or 2-byte dtype
+                    # must be copied to the CPU first.
                     block.copy_(source.cpu())
-        # This shares memory with `out` rather than copying it, and `out` is
-        # contiguous, so the result is a C-contiguous host array.
+        # The result shares memory with ``out``, so it is C-contiguous.
         return out.numpy()
 
 
 def reject_shards(function_name, **arrays):
-    """Refuse an array in the divided device form at a function's entry.
+    """This function raises an error if any argument is a :class:`Shards`
+    container.
 
-    A :class:`Shards` holds one tensor per device rather than one array, so it
-    has no shape of its own and does not support indexing, reshaping, or
-    arithmetic.  A function that works on whole arrays and is handed one anyway
-    fails somewhere further down on a missing attribute, an unsupported
-    operand, or -- worse -- a 0-d object array that numpy builds without
-    complaint.  None of those messages say what the caller did wrong.  Checking
-    at the entry turns them into a refusal that names the function, the
+    A ``Shards`` container has no shape and does not support indexing,
+    reshaping, or arithmetic.  The error message names the function, the
     argument, and the fix.
 
     Args:
-        function_name (str): name of the calling function, used in the message.
-        **arrays: the calling function's array arguments, given by parameter
-            name.  Anything that is not a ``Shards`` is ignored, so an argument
-            can be passed in without being checked first.
+        function_name (str): The name of the calling function, for the message.
+        **arrays: The array arguments of the calling function, given by name.
+            The function ignores any value that is not a ``Shards`` container.
 
     Raises:
-        TypeError: if any of the given arguments is a ``Shards`` container.
+        TypeError: If any of the given arguments is a ``Shards`` container.
     """
     divided = [name for name, value in arrays.items() if isinstance(value, Shards)]
     if divided:
@@ -446,17 +332,13 @@ def reject_shards(function_name, **arrays):
             'pass the host array.'.format(function_name, ', '.join(divided)))
 
 
-# A direct device-to-device copy is probed once per device set, and transfers
-# route through host memory when the probe fails.  The probe exists because jax's
-# device_put corrupted device-resident transfers on some GPUs, such as the L40S.
+# This flag records whether move_shard has already warned that it copies through CPU memory.
 _warned_host_bounce = False
 
 
 def is_dev2dev_safe(devices) -> bool:
-    """Empirically test that a direct device-to-device copy is correct.
-
-    Moves a small known array from devices[0] to devices[1] and checks the
-    value survives.  Returns True for a single device (nothing to move).
+    """This function tests whether a direct copy from devices[0] to devices[1]
+    gives correct values.  It returns True for a single device.
     """
     devices = [torch.device(d) for d in devices]
     if len(devices) < 2:
@@ -468,18 +350,16 @@ def is_dev2dev_safe(devices) -> bool:
 
 
 def move_shard(x, target, dev2dev_safe=True):
-    """Place tensor ``x`` on ``target``, choosing a hardware-safe path.
+    """This function copies ``x`` to the device ``target``.
 
-    The single cross-device transfer primitive.  A move to the tensor's own
-    device is a no-op (``tensor.to`` returns self), so the single-device case
-    carries no overhead.
+    If ``x`` is already on ``target``, the function returns ``x`` unchanged.
 
     Args:
-        x (tensor): possibly resident on another device.
-        target (torch.device): destination.
-        dev2dev_safe (bool): the cached result of :func:`is_dev2dev_safe` for
-            this device set.  When False, route through host memory (always
-            correct, one warning per process).
+        x (tensor): The tensor to copy.
+        target (torch.device): The destination device.
+        dev2dev_safe (bool): The result of :func:`is_dev2dev_safe` for these
+            devices.  If False, the copy goes through CPU memory.  The function
+            then warns once per process.
     """
     if dev2dev_safe:
         return x.to(target)
@@ -493,145 +373,101 @@ def move_shard(x, target, dev2dev_safe=True):
     return torch.as_tensor(x.detach().cpu().numpy()).to(target)
 
 
-#: How many bytes of one arriving partial the reduce moves at a time.  A band
-#: smaller than one slab moves in a single piece.
+#: The number of bytes of one partial back projection that ``sum_band_to_owner``
+#: copies in one step.
 REDUCE_SLAB_BYTES = 256 * 2 ** 20
 
 
 def reduce_slab_rows(num_rows, row_bytes):
-    """How many rows of a band partial :func:`sum_band_to_owner` moves per
-    step, given the bytes in one row of it.
-
-    Shared with the memory ledger, which prices the transient this bounds:
-    the size the code moves and the size the model charges must not be able
-    to drift apart.
+    """This function returns the number of rows of a partial back projection
+    that :func:`sum_band_to_owner` copies in one step.  The argument ``row_bytes``
+    is the number of bytes in one row.  The memory estimate in ``_memory_ledger``
+    also uses this function.
     """
-    # The answer is a loop step, so it is never zero.
+    # The result is a loop step, so it must be at least 1.
     if row_bytes <= 0:
         return max(1, int(num_rows))
     return max(1, min(int(num_rows), int(REDUCE_SLAB_BYTES) // int(row_bytes)))
 
 
 def sum_band_to_owner(partials, owner, dev2dev_safe=True):
-    """Move per-device partials onto ``owner`` and sum them there.
+    """This function copies the partial back projections to ``owner`` and sums
+    them.
 
-    The cross-device reduce used by sharded back projection: under
-    view-sharding each device computed only a partial back projection (its
-    own views' contribution) for some band of slices; the true value is the
-    sum over devices, formed and left resident on the band's slice-owner.
-
-    The sum is STREAMED in row slabs, and that is what bounds the owner's
-    peak.  Moving every partial across first and then summing them held n
-    whole bands on the owner at once, and because one band is the whole shard
-    by default, that transient did not shrink as devices were added: n
-    devices each holding a band of 1/n of the volume is the same number of
-    bytes at every device count.  Streaming leaves the owner holding its
-    running total and one bounded slab per source instead, so what it holds
-    ABOVE the total is a fixed number of bytes rather than a share of the
-    volume.
-
-    The summation order is unchanged.  Every element is still accumulated in
-    the order the partials are given, so the result is bit for bit what the
-    unstreamed reduce produced: streaming partitions the elements, and no
-    element's own sequence of additions is touched.
-
-    The partials are read and never written.  The first one is copied (or
-    moved) to make the running total, so a caller may still use its arrays
-    after the call.
+    When the views are divided among the devices, each device computes a
+    partial back projection of a contiguous range of slices.  The device that
+    holds those slices is ``owner``.  This function sums the partials on
+    ``owner`` a group of rows at a time.  This limits the extra memory on
+    ``owner`` to one group of rows per source device.  The function sums the
+    partials in the order given and does not modify them.
 
     Args:
-        partials (list of tensor): one band partial per contributing device,
-            all of the same shape, summed in the order given.
-        owner (torch.device): the band's slice-owner, where the sum is formed
-            and left resident.
-        dev2dev_safe (bool): forwarded to :func:`move_shard`.
+        partials (list of tensor): One partial back projection per device.  All
+            have the same shape.
+        owner (torch.device): The device that holds the slices.  The sum is
+            computed and left on this device.
+        dev2dev_safe (bool): This value is passed to :func:`move_shard`.
     """
     if len(partials) == 1:
         return move_shard(partials[0], owner, dev2dev_safe=dev2dev_safe)
     total = move_shard(partials[0], owner, dev2dev_safe=dev2dev_safe)
     if total is partials[0]:
-        # move_shard handed back the caller's own tensor, so accumulate into a
-        # copy rather than writing through to an array the caller still holds.
+        # move_shard returned the caller's tensor.  The sum goes into a copy so
+        # that the caller's tensor is not modified.
         total = total.clone()
     num_rows = int(total.shape[0])
     row_bytes = (total.numel() // max(1, num_rows)) * total.element_size()
     step = reduce_slab_rows(num_rows, row_bytes)
     for start in range(0, num_rows, step):
         stop = min(start + step, num_rows)
-        # A partial is (pixels, slices) with the slices contiguous, so a slab of
-        # rows is one contiguous piece and each transfer is a single flat copy.
+        # A partial has shape (pixels, slices) with the slices contiguous.  So each
+        # group of rows is contiguous, and each transfer is a single copy.
         slabs = [move_shard(p[start:stop], owner, dev2dev_safe=dev2dev_safe)
                  for p in partials[1:]]
         rows = total[start:stop]
         for slab in slabs:
             rows.add_(slab)
-        # The slabs are released here.  The next iteration's list comprehension is
-        # evaluated before `slabs` is rebound, so without this release the previous
-        # slabs stay live through the next transfers and double the memory in use.
+        # The copies must be released before the next list is built.  Otherwise the
+        # memory in use doubles.
         slabs = None
     return total
 
 
 def transfer_cylinder_batch(shard_tensors, p0, p1, target, dev2dev_safe=True):
-    """Assemble one batch of FULL-HEIGHT voxel cylinders on ``target``.
+    """This function collects the voxels at pixels ``[p0:p1]`` over all slices
+    onto the device ``target``.
 
-    The forward's transfer primitive, built from :func:`move_shard`.  Each
-    slice-owner holds the same pixels for its own slices, so moving every
-    owner's ``[p0:p1]`` rows to one device and concatenating them along the
-    slice axis assembles those pixels' whole cylinders there.
-
-    This is the cross-device shape a geometry needs when one recon slice
-    projects onto a RANGE of detector rows: such a view-owner cannot produce
-    any of its own rows from a slice band, because every slice contributes to
-    the rows it owns.  It takes a batch of whole cylinders instead.  What one
-    transfer costs is then set by the width of the pixel batch and not by the
-    device count, which is what makes the shape usable at volumes where the
-    whole cylinder array would not fit.  A row-aligned geometry, which could
-    work from a band, takes the same transfer for a performance reason
-    instead: what it gets back is a full-width block of values, which is the
-    width regime its kernel is efficient in.
-
-    The concatenation is in shard order, which is global slice order, so each
-    assembled cylinder covers the whole slice axis exactly once.  The shards
-    may differ in length, and a shard that owns no slices contributes a
-    zero-width piece, which the concatenation accepts.
-
-    This changes which device assembles which voxels, never which device
-    produces which sinogram rows, so it has no adjoint of its own: the back
-    projection is untouched and still reduces through
-    :func:`sum_band_to_owner`.
+    The slices are divided among the devices.  The function copies rows
+    ``[p0:p1]`` of each shard to ``target`` with :func:`move_shard`.  It then
+    concatenates the copies in slice order.  A shard that holds no slices
+    contributes a piece of width zero.
 
     Args:
-        shard_tensors (sequence of tensor): the slice-sharded cylinders, each
-            (num_pixels, local_slices), in global slice order.
-        p0 (int): first pixel of the batch.
-        p1 (int): one past the last pixel of the batch.
-        target (torch.device): the view-owner the cylinders are assembled on.
-        dev2dev_safe (bool): forwarded to :func:`move_shard`.
+        shard_tensors (sequence of tensor): The shards of the reconstruction, in
+            slice order.  Each shard has shape (num_pixels, local_slices).
+        p0 (int): The first pixel of the batch.
+        p1 (int): One past the last pixel of the batch.
+        target (torch.device): The device that holds the views to project.
+        dev2dev_safe (bool): This value is passed to :func:`move_shard`.
 
     Returns:
-        tensor: (p1 - p0, total_slices) on ``target``.
+        tensor: A tensor of shape (p1 - p0, total_slices) on ``target``.
     """
     pieces = [move_shard(t[p0:p1], target, dev2dev_safe=dev2dev_safe)
               for t in shard_tensors]
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=1)
 
 
-# One extra CUDA stream per device, used only for the cylinder transfer's
-# cross-device copies.  A stream runs its work one item at a time, so a stream of
-# its own lets a copy and a projection run at the same time.  The streams are
-# created once and cached per device index, and the lock guards only creation.
+# Each CUDA device has one extra stream for copies, so a copy and a projection can run
+# at the same time.  The lock protects only the creation of a stream.
 _COPY_STREAMS = {}
 _COPY_STREAM_LOCK = threading.Lock()
 
 
 def copy_stream(device):
-    """The dedicated copy stream for ``device``, or None when it has none.
-
-    None is returned for every non-CUDA device, and it is the signal the
-    callers below read as "this device has no streams to arrange": each of
-    them then does the plain synchronous thing, which is what the CPU and MPS
-    paths have always done.
+    """This function returns the copy stream for ``device``.  It returns None
+    for a device that is not a CUDA device.  The callers then copy
+    synchronously.
     """
     device = torch.device(device)
     if device.type != 'cuda':
@@ -649,9 +485,8 @@ def copy_stream(device):
 
 
 def _transfer_stream_devices(shard_tensors, target):
-    """Return the distinct CUDA devices one transfer touches, which are every
-    shard's device and the target it assembles on.  They are ordered by device
-    index, so the nested stream contexts are entered in the same order."""
+    """This function returns the CUDA devices that one transfer uses, sorted by
+    device index.  These are the devices of the shards and the target."""
     seen = {}
     for dev in [t.device for t in shard_tensors] + [torch.device(target)]:
         if dev.type == 'cuda':
@@ -662,14 +497,10 @@ def _transfer_stream_devices(shard_tensors, target):
 
 
 def open_copy_streams(devices):
-    """Let the copy streams start: each waits for its device's compute stream.
-
-    The shards a transfer reads were written by earlier kernels on the compute
-    stream, and a copy stream knows nothing of that stream's ordering, so
-    without this a copy could read a shard before the kernel that filled it
-    had finished.  Called once per forward rather than per batch: it orders
-    the copy stream behind everything queued so far, which covers every batch
-    that follows.
+    """This function makes each copy stream wait for the compute stream of its
+    device.  As a result, no copy reads a shard before the kernel that writes the
+    shard has finished.  The caller calls this function once per forward
+    projection.
     """
     for dev in devices:
         stream = copy_stream(dev)
@@ -678,13 +509,9 @@ def open_copy_streams(devices):
 
 
 def close_copy_streams(devices):
-    """The other half of :func:`open_copy_streams`: each compute stream waits
-    for its copy stream.
-
-    A copy READS a slice-owner's shard, and whatever writes that shard next
-    runs on the compute stream.  Nothing else orders those two, so without
-    this a later update could overwrite a shard while a copy was still
-    reading it.
+    """This function makes each compute stream wait for the copy stream of its
+    device.  It is the counterpart of :func:`open_copy_streams`.  As a result, no
+    later update overwrites a shard while a copy is still reading it.
     """
     for dev in devices:
         stream = copy_stream(dev)
@@ -694,25 +521,21 @@ def close_copy_streams(devices):
 
 def transfer_cylinder_batch_async(shard_tensors, p0, p1, target,
                                   dev2dev_safe=True):
-    """:func:`transfer_cylinder_batch`, issued on the copy streams.
-
-    The values are the same either way; what this adds is that the copies do
-    not go into the queue the projections run in, so one transfer can be
-    moving while an earlier batch is projected.
+    """This function runs :func:`transfer_cylinder_batch` on the copy streams.
+    The result is the same.  The transfer can run at the same time as the
+    projection of an earlier batch.
 
     Returns:
-        (tensor, ready): the assembled cylinder batch, and an event that fires
-        once its copies have landed -- or None for the event off CUDA, where
-        the copies are already finished by the time this returns.
+        (tensor, ready): The batch of voxels, and a CUDA event that is recorded
+        after the copies finish.  On a device that is not a CUDA device, the
+        event is None and the copies are finished when the function returns.
     """
     stream = copy_stream(target)
     if stream is None:
         return transfer_cylinder_batch(shard_tensors, p0, p1, target,
                                        dev2dev_safe), None
-    # Both ends of every copy have to be on a copy stream.  Torch issues the copy
-    # on the source's current stream and orders the destination's current stream
-    # behind it, so leaving either end on its default stream puts the copy back in
-    # the queue the projections run in.
+    # Both ends of every copy must use a copy stream.  Otherwise the copy waits
+    # behind the projections on the compute stream.
     with contextlib.ExitStack() as stack:
         for dev in _transfer_stream_devices(shard_tensors, target):
             stack.enter_context(torch.cuda.stream(copy_stream(dev)))
@@ -720,63 +543,47 @@ def transfer_cylinder_batch_async(shard_tensors, p0, p1, target,
                                            dev2dev_safe)
         ready = torch.cuda.Event()
         ready.record(stream)
-    # The cylinder batch is allocated on the copy stream and read on the compute
-    # stream.  Without this the caching allocator could hand its block to the next
-    # transfer while the projection is still reading it.
+    # The compute stream reads the batch.  Without this line, the allocator could
+    # reuse the memory of the batch while the projection still reads the batch.
     cylinder.record_stream(torch.cuda.current_stream(torch.device(target)))
     return cylinder, ready
 
 
 def wait_for_cylinder_batch(target, ready):
-    """Hold ``target``'s compute stream until one batch's copies have landed.
-
-    The event is per batch and is waited on immediately before the projection
-    that reads that batch.  Waiting on the copy stream as a whole instead
-    would also wait for the batch transferred ahead, which is exactly the work
-    meant to be moving during this projection, and the overlap would collapse
-    back into taking turns.
+    """This function makes the compute stream of ``target`` wait until a batch
+    has arrived.  It waits on the event of that batch only.  As a result, the
+    transfer of the next batch can continue during the projection of this batch.
     """
     if ready is not None:
         torch.cuda.current_stream(torch.device(target)).wait_event(ready)
 
 
-# ── per-device threaded execution ─────────────────────────────────────────────
+# Running one thread per device.
 def device_pool(n):
-    """A reusable thread pool for repeated :func:`run_per_device` calls.
-
-    Use as a context manager; pass the pool as ``executor=`` so a loop of
-    many per-device fan-outs (e.g. per-band streaming) reuses one pool.
+    """This function returns a thread pool that several :func:`run_per_device`
+    calls can share.  The caller uses the pool as a context manager and passes it
+    as ``executor=``.
     """
     return ThreadPoolExecutor(max_workers=n)
 
 
 def run_per_device(devices, worker_fn, executor=None):
-    """Run worker_fn once per device, each in its own thread.
+    """This function runs worker_fn once per device, each in its own thread.
 
-    Torch ops need no thread-local default device: tensors carry their
-    device, so a torch op dispatches correctly from any thread.  A RAW
-    kernel launch does not.  A Triton launch targets the launching thread's
-    current CUDA device and that device's current stream, and a fresh
-    thread's current device is 0, so a kernel body called from these workers
-    must bracket its own launch in ``with torch.cuda.device(...)`` (the
-    wrappers in triton_cone.py and triton_parallel.py do; the measured
-    defect is in the kernel-sharding findings in the plans repo).
-    Results are returned in DEVICE order (result[i] corresponds to
-    devices[i]), not completion order.  No synchronization is performed --
-    callers that need values materialized (before assembling or reading)
-    synchronize explicitly, which lets a caller overlap the next band's
-    transfer with the current band's compute.
-
-    A single device short-circuits to a direct call on the calling thread --
-    no pool, no thread hop -- so code written uniformly over shards costs a
-    plain function call at n=1.
+    The function returns the results in device order, so result[i] belongs to
+    devices[i].  The function does not synchronize the devices.  A caller that
+    needs the values must synchronize.  With a single device, the function runs
+    worker_fn on the calling thread.  A worker must wrap each Triton launch in
+    ``with torch.cuda.device(...)``, because the current CUDA device of a new
+    thread is 0.
 
     Args:
-        devices (sequence): devices to run on; one thread per device.
-        worker_fn (callable): worker_fn(i, device) -> result.
-        executor (ThreadPoolExecutor, optional): a pool to reuse (e.g. from
-            :func:`device_pool`); when None a private pool is created and
-            closed for this call.
+        devices (sequence): The devices to run on, with one thread per device.
+        worker_fn (callable): The function worker_fn(i, device), which returns a
+            result.
+        executor (ThreadPoolExecutor, optional): A thread pool to use, such as
+            one from :func:`device_pool`.  If None, the function creates a new
+            pool and shuts it down before it returns.
     """
     devices = list(devices)
     n = len(devices)
@@ -793,36 +600,30 @@ def run_per_device(devices, worker_fn, executor=None):
 
 
 def exchange_qggmrf_halos(recon_shards, dev2dev_safe=True):
-    """The boundary-slice exchange for the sharded qGGMRF prior.
+    """This function exchanges the boundary slices that the qGGMRF prior needs
+    when the slices are divided among devices.
 
-    Each slice-shard's inter-slice term needs the slice immediately beyond
-    each of its boundaries: the LAST slice of the shard to its left and the
-    FIRST slice of the shard to its right (each a (num_pixels,) column,
-    moved to the shard's device).  True volume edges get None, which the
-    prior maps to the reflected boundary condition -- so a single shard
-    reproduces the single-device result exactly.
-
-    A shard that holds no slices counts as absent.  Such a shard gets None
-    on both of its sides.  The neighbor that does hold slices also gets None
-    in that direction, so the prior applies the reflected boundary condition
-    at the last real slice.
+    Each shard receives the last slice of the shard to its left and the first
+    slice of the shard to its right.  Each received slice is a (num_pixels,)
+    tensor on the device of the receiving shard.  At an edge of the volume, and
+    next to a shard that holds no slices, the function returns None.  The prior
+    treats None as a reflected boundary.
 
     Args:
-        recon_shards (Shards): the slice-sharded flat recon, each tensor
-            (num_pixels, local_slices).
-        dev2dev_safe (bool): forwarded to :func:`move_shard`.
+        recon_shards (Shards): The reconstruction, divided along the slice axis.
+            Each tensor has shape (num_pixels, local_slices).
+        dev2dev_safe (bool): This value is passed to :func:`move_shard`.
 
     Returns:
-        (left_halos, right_halos): lists in device order, entries (num_pixels,)
-        tensors on the receiving shard's device, or None at a true edge and at
-        a boundary with a shard that holds no slices.
+        (left_halos, right_halos): Two lists in device order.  Each entry is a
+        (num_pixels,) tensor, or None at an edge of the volume or next to a
+        shard that holds no slices.
     """
     tensors = recon_shards.tensors
     devs = recon_shards.placement.devices
     n = len(tensors)
-    # A boundary carries a halo only when the shards on both sides hold slices.
-    # A shard with no slices comes last, because the slice axis is split with the
-    # longer blocks first, so no halo comes from beyond such a shard.
+    # A boundary slice is sent only when the shards on both sides hold slices.
+    # Shards with no slices are always last.
     joined =[t.shape[1] > 0 and u.shape[1] > 0
               for t, u in zip(tensors[:-1], tensors[1:])]
     left = [None] + [move_shard(tensors[i][:, -1].contiguous(), devs[i + 1],

@@ -1,59 +1,36 @@
-"""Once-per-process availability probe for the hand-written (Triton) kernel
-paths, and the per-kernel value self-checks.
+"""This module checks whether the hand-written Triton kernels can run.  It also checks
+whether each kernel gives the same values as the torch code that it replaces.
 
-The kernel paths are an OPTIMIZATION, so an environment that cannot run them
-must fall back to the torch.compile paths silently -- but not
-silently-unexplained.  The probe returns (usable, reason), and the reason
-string is the record of WHY a node is not using the custom kernels (the same
-question a benchmark asks first).
-
-The probe compiles and runs a trivial kernel end to end rather than trusting
-version checks: it is the toolchain, not the version number, that breaks.  It
-is exception-safe by construction -- every failure becomes a (False, reason)
-pair -- because a broken optional path must never break a caller who only
-wanted to know whether it was there.
-
-The probe answers "can this node run a triton kernel at all".  The second gate
-is per KERNEL and per DEVICE: :func:`cone_back_kernel_usable`,
-:func:`cone_forward_kernel_usable`, :func:`parallel_back_kernel_usable`,
-:func:`parallel_forward_kernel_usable`, :func:`multiaxis_back_kernel_usable`
-and :func:`multiaxis_forward_kernel_usable` each run one kernel-vs-torch-body
-comparison at a tiny shape on the device that will run it (milliseconds) and
-fall back on a tolerance breach.  This is the guard the kernel design puts on
-the correct axis -- probe the hardware you are on, never trust a vendor list
--- so the kernels may default on wherever both gates pass, on any
-architecture, and a miscompiling toolchain is caught even on a swept one.
-
-Capability is not policy.  Every gate here answers only whether a kernel
-REPRODUCES its torch body on this device; whether it is actually selected is
-decided in the geometry's ``_view_batch_bodies``, where a kernel awaiting its
-composed performance gate stays behind an opt-in environment variable (the
-names live here, beside the kill switch, so one module carries the whole
-switchboard).
+Every check returns (usable, reason) and never raises an error.  The first check compiles
+and runs a trivial kernel once per process.  Each kernel check, such as
+:func:`cone_back_kernel_usable`, compares one kernel with its torch code on a tiny problem.
+The kernel check runs on the device that will run the kernel.  When a check fails, the
+caller uses the torch code.  The ``_view_batch_bodies`` method of each geometry chooses
+which code runs.
 """
 
 import os
 
 import torch
 
-# Setting this variable to 1 forces the fallback paths for every kernel.
+# Setting this environment variable to 1 makes mbirtorch use the torch code for every kernel.
 DISABLE_ENV_VAR = 'MBIRTORCH_DISABLE_TRITON'
 
-# Nothing reads the three names below.  They stay defined so that a script
-# still exporting one of them is harmless.
+# mbirtorch does not read the three names below.  They are defined so that an old script that
+# imports them does not fail.
 ENABLE_FWD_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_FWD'
 ENABLE_PBACK_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_PBACK'
 ENABLE_PFWD_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_PFWD'
 
-# Relative tolerance of the value self-checks.  It is set to catch a
-# miscompiled kernel, not a difference of a few units in the last place.
+# The relative tolerance of the kernel checks.  It detects a kernel that was compiled
+# incorrectly.  It allows a difference of a few units in the last place.
 SELF_CHECK_REL_TOL = 1e-4
 
-# The probe result is cached, because the answer cannot change in a process.
+# The result of the first check is cached, because it cannot change within a process.
 _PROBE_RESULT = None
 
-# The self-check results are cached per device string.  Each answer is a
-# property of the device and its toolchain, not of the calling model.
+# The results of the kernel checks are cached by device string.  Each result depends on the
+# device and its compiler, not on the model that asks.
 _CONE_BACK_RESULTS = {}
 _CONE_FWD_RESULTS = {}
 _PARALLEL_BACK_RESULTS = {}
@@ -61,20 +38,20 @@ _PARALLEL_FWD_RESULTS = {}
 _MULTIAXIS_BACK_RESULTS = {}
 _MULTIAXIS_FWD_RESULTS = {}
 
-# A self-check builds its own small model, which asks this module which bodies to
-# use.  While any check runs, every gate must answer with the torch body.
+# A kernel check builds its own small model, and that model asks this module which code to
+# use.  While any check runs, every check must answer that the torch code is used.
 _SELF_CHECK_ACTIVE = False
 
 
 def triton_available():
-    """(usable, reason): whether the hand-written Triton kernel paths may be
-    used, and why not when they cannot.  Cached per process.
+    """This function returns (usable, reason).  The value usable says whether mbirtorch may use
+    the hand-written Triton kernels.  The function caches the result for the process.
 
     Returns:
-        (bool, str): True with a short description of what was probed, or
-        False with the reason -- the kill switch, no CUDA platform, no triton
-        import, or a trivial kernel that failed to compile, failed to run, or
-        returned the wrong value.
+        (bool, str): If usable is True, reason describes the Triton version and the GPU.  If
+        usable is False, reason gives the cause.  The possible causes are these: the disable
+        variable is set, CUDA is not available, triton cannot be imported, or a trivial
+        kernel failed to compile, failed to run, or returned the wrong value.
     """
     global _PROBE_RESULT
     if _PROBE_RESULT is None:
@@ -83,7 +60,10 @@ def triton_available():
 
 
 def _probe_triton():
-    """Run the probe once (see :func:`triton_available`); never raises."""
+    """This function compiles and runs a trivial Triton kernel and returns (usable, reason).
+
+    The function never raises an error.
+    """
     if os.environ.get(DISABLE_ENV_VAR, '0') == '1':
         result = (False, f'disabled by {DISABLE_ENV_VAR}=1')
     else:
@@ -117,109 +97,77 @@ def _probe_triton():
 
 
 def cone_back_kernel_usable(model):
-    """(usable, reason): whether the Triton cone back body may replace the
-    torch one for ``model``, on ``model.torch_device``.
+    """This function returns (usable, reason).  The value usable says whether the Triton cone
+    back projection may replace the torch version on ``model.torch_device``.
 
-    Two gates in order: the process-wide triton probe above, then a first-use
-    VALUE self-check on this device -- a tiny cone problem projected through
-    both bodies at coeff_power 1 and 2, compared at
-    :data:`SELF_CHECK_REL_TOL`.  Cached per device string and exception-safe:
-    any failure is a (False, reason) pair, never a raise into a caller who
-    only asked whether the fast path was available.
-
-    Under a multi-device configuration the check runs on device 0 alone (the
-    bodies are shared across devices, and a node's devices share an
-    architecture and a toolchain).
+    The function first requires :func:`triton_available` to pass.  It then compares the two
+    versions on a tiny problem with coeff_power 1 and 2.  The largest relative difference
+    must be at most :data:`SELF_CHECK_REL_TOL`.  The function caches the result for each
+    device.  With several devices, the check runs on device 0.
     """
     return _kernel_usable(model, _CONE_BACK_RESULTS, _cone_back_self_check)
 
 
 def cone_forward_kernel_usable(model):
-    """(usable, reason): whether the Triton cone forward body may replace the
-    torch one for ``model``, on ``model.torch_device``.
+    """This function returns (usable, reason).  The value usable says whether the Triton cone
+    forward projection may replace the torch version on ``model.torch_device``.
 
-    The same two gates in the same order as :func:`cone_back_kernel_usable`,
-    with the forward body's own value comparison -- unbanded and banded, since
-    the forward carries its slice band in the VALUES argument rather than in a
-    band_slices keyword.  Cached per device string and exception-safe.
-
-    This answers CAPABILITY only.  Whether the forward kernel is actually
-    selected is policy, and until its composed performance gate passes that
-    selection applies this gate alone (the opt-in era ended with the
-    composed-gate pass).
-    process never pays for the check).
+    The function runs the checks of :func:`cone_back_kernel_usable` on all slices and on an
+    interior range of slices.
     """
     return _kernel_usable(model, _CONE_FWD_RESULTS, _cone_forward_self_check)
 
 
 def parallel_back_kernel_usable(model):
-    """(usable, reason): whether the Triton parallel back body may replace the
-    torch one for ``model``, on ``model.torch_device``.
+    """This function returns (usable, reason).  The value usable says whether the Triton
+    parallel back projection may replace the torch version on ``model.torch_device``.
 
-    The same two gates in the same order as :func:`cone_back_kernel_usable`,
-    with the parallel back body's own value comparison at coefficient powers 1
-    and 2 -- run both unbanded and on an interior ROW band, which is how a
-    row-aligned geometry bands (the band rides in the sinogram's row axis, not
-    in a band keyword).  Cached per device string and exception-safe.
-
-    This answers CAPABILITY only; selection is policy, and while the parallel
-    kernels are opt-in (see :data:`ENABLE_PBACK_ENV_VAR`) a process that has
-    not opted in never calls this and never pays for the check.
+    The function runs the checks of :func:`cone_back_kernel_usable` on all detector rows and
+    on an interior range of rows.
     """
     return _kernel_usable(model, _PARALLEL_BACK_RESULTS,
                           _parallel_back_self_check)
 
 
 def parallel_forward_kernel_usable(model):
-    """(usable, reason): whether the Triton parallel forward body may replace
-    the torch one for ``model``, on ``model.torch_device``.
+    """This function returns (usable, reason).  The value usable says whether the Triton
+    parallel forward projection may replace the torch version on ``model.torch_device``.
 
-    The same two gates in the same order, with the parallel forward body's own
-    value comparison -- unbanded and on a row band, which the forward carries
-    in the COLUMN count of its values (rows track slices, so a slice band is a
-    row band).  Cached per device string and exception-safe; capability only,
-    as above.
+    The function runs the checks of :func:`cone_back_kernel_usable` on all slices and on an
+    interior range of slices.
     """
     return _kernel_usable(model, _PARALLEL_FWD_RESULTS,
                           _parallel_forward_self_check)
 
 
 def multiaxis_back_kernel_usable(model):
-    """(usable, reason): whether the Triton multiaxis back body may replace the
-    torch one for ``model``, on ``model.torch_device``.
+    """This function returns (usable, reason).  The value usable says whether the Triton
+    multiaxis back projection may replace the torch version on ``model.torch_device``.
 
-    The same two gates in the same order as :func:`cone_back_kernel_usable`,
-    with the multiaxis back body's own value comparison at coefficient powers 1
-    and 2, run both unbanded and on an interior SLICE band -- multiaxis bands
-    its back projection the way cone does, through the ``slice_start`` and
-    ``band_slices`` keywords, with the slice-to-row map anchored on the full
-    slice count.  Cached per device string and exception-safe.
-
-    This answers CAPABILITY only; whether the kernel is selected is policy, and
-    that is decided in the geometry's ``_view_batch_bodies``, which says there
-    what this pair's selection does and does not rest on.
+    The function runs the checks of :func:`cone_back_kernel_usable` on all slices and on an
+    interior range of slices.
     """
     return _kernel_usable(model, _MULTIAXIS_BACK_RESULTS,
                           _multiaxis_back_self_check)
 
 
 def multiaxis_forward_kernel_usable(model):
-    """(usable, reason): whether the Triton multiaxis forward body may replace
-    the torch one for ``model``, on ``model.torch_device``.
+    """This function returns (usable, reason).  The value usable says whether the Triton
+    multiaxis forward projection may replace the torch version on ``model.torch_device``.
 
-    The same two gates in the same order, with the multiaxis forward body's own
-    value comparison -- unbanded and on an interior band, which the forward
-    carries in the COLUMNS of its values beside a ``slice_start``, as the cone
-    forward does.  Cached per device string and exception-safe; capability
-    only, as above.
+    The function runs the checks of :func:`cone_back_kernel_usable` on all slices and on an
+    interior range of slices.
     """
     return _kernel_usable(model, _MULTIAXIS_FWD_RESULTS,
                           _multiaxis_forward_self_check)
 
 
 def _kernel_usable(model, cache, self_check):
-    """Apply the recursion guard, the process wide probe, and this device's
-    cached self-check, in that order.  Returns (usable, reason)."""
+    """This function returns (usable, reason) from three checks in order.
+
+    First, no kernel check may be running.  Second, :func:`triton_available` must pass.
+    Third, the kernel check for this device must pass.  The function caches the third check.
+    """
     if _SELF_CHECK_ACTIVE:
         result = (False, 'kernel self-check in progress (its own probe model '
                          'uses the torch bodies)')
@@ -236,11 +184,10 @@ def _kernel_usable(model, cache, self_check):
 
 
 def _cone_self_check_cell(device_key):
-    """Build the small cone problem the cone self-checks run on.
+    """This function returns (model, pixel_indices, view_params, kwargs) for a small cone
+    beam test problem.
 
-    Returns (model, pixel_indices, view_params, body kwargs).  It uses four
-    views so the back kernel's view reduction runs, a real cone angle, and one
-    pixel dropped so the pixel count is not a multiple of any tile size.
+    The problem has four views, a nonzero cone angle, and an odd number of pixels.
     """
     import numpy as np
 
@@ -263,10 +210,10 @@ def _cone_self_check_cell(device_key):
 
 
 def _parallel_self_check_cell(device_key):
-    """Build the small parallel beam problem the parallel self-checks run on.
+    """This function returns (model, pixel_indices, view_params, kwargs) for a small parallel
+    beam test problem.
 
-    Returns (model, pixel_indices, view_params, body kwargs).  The angles cover
-    a half turn, so the projected footprint varies from view to view.
+    The view angles of the problem cover a half turn.
     """
     import numpy as np
 
@@ -288,12 +235,10 @@ def _parallel_self_check_cell(device_key):
 
 
 def _multiaxis_self_check_cell(device_key):
-    """Build the small multiaxis problem the multiaxis self-checks run on.
+    """This function returns (model, pixel_indices, view_params, kwargs) for a small multiaxis
+    test problem.
 
-    Returns (model, pixel_indices, view_params, body kwargs).  The elevations
-    are spread away from zero, because at zero elevation this geometry reduces
-    to parallel beam and the terms it adds would go untested.  The spread stays
-    inside the model's 45 degree warning.
+    The elevation angles of the problem are nonzero and less than 45 degrees.
     """
     import numpy as np
 
@@ -317,14 +262,17 @@ def _multiaxis_self_check_cell(device_key):
 
 
 def _rel_diff(kernel_out, reference):
-    """Max relative difference of a kernel output against its torch body."""
+    """This function returns the largest relative difference between a kernel output and the
+    output of its torch version."""
     return (float((kernel_out - reference).abs().max())
             / max(float(reference.abs().max()), 1e-12))
 
 
 def _cone_back_self_check(device_key):
-    """Run the cone back kernel-vs-torch-body comparison once on one device
-    (see :func:`cone_back_kernel_usable`); never raises."""
+    """This function compares the cone back kernel with its torch version on one device.
+
+    The function never raises an error.
+    """
     global _SELF_CHECK_ACTIVE
     _SELF_CHECK_ACTIVE = True
     try:
@@ -333,8 +281,8 @@ def _cone_back_self_check(device_key):
 
         model, pixel_indices, view_params, args = _cone_self_check_cell(
             device_key)
-        # A private generator keeps this check from advancing the global RNG
-        # streams, which the seeded recon tests depend on.
+        # A private generator keeps this check from advancing the global random state,
+        # which the tests with fixed seeds depend on.
         generator = torch.Generator().manual_seed(0)
         sinogram = torch.rand(tuple(model.get_params('sinogram_shape')),
                               generator=generator).to(model.torch_device)
@@ -358,8 +306,10 @@ def _cone_back_self_check(device_key):
 
 
 def _cone_forward_self_check(device_key):
-    """Run the cone forward kernel-vs-torch-body comparison once on one device
-    (see :func:`cone_forward_kernel_usable`); never raises."""
+    """This function compares the cone forward kernel with its torch version on one device.
+
+    The function never raises an error.
+    """
     global _SELF_CHECK_ACTIVE
     _SELF_CHECK_ACTIVE = True
     try:
@@ -374,8 +324,8 @@ def _cone_forward_self_check(device_key):
                             generator=generator).to(model.torch_device)
 
         worst_rel = 0.0
-        # The check runs the whole volume and then an interior band, which
-        # exercises the slice_start seam.
+        # The check runs on all slices and then on an interior range of slices, which
+        # tests the use of slice_start.
         interior = max(1, num_slices // 3)
         bands = ((0, num_slices), (interior, num_slices - 2 * interior))
         for slice_start, band_len in bands:
@@ -397,8 +347,10 @@ def _cone_forward_self_check(device_key):
 
 
 def _parallel_back_self_check(device_key):
-    """Run the parallel back kernel-vs-torch-body comparison once on one device
-    (see :func:`parallel_back_kernel_usable`); never raises."""
+    """This function compares the parallel back kernel with its torch version on one device.
+
+    The function never raises an error.
+    """
     global _SELF_CHECK_ACTIVE
     _SELF_CHECK_ACTIVE = True
     try:
@@ -407,15 +359,15 @@ def _parallel_back_self_check(device_key):
 
         model, pixel_indices, view_params, args = _parallel_self_check_cell(
             device_key)
-        # A private generator keeps this check from advancing the global RNG
-        # streams, which the seeded recon tests depend on.
+        # A private generator keeps this check from advancing the global random state,
+        # which the tests with fixed seeds depend on.
         generator = torch.Generator().manual_seed(0)
         sinogram = torch.rand(tuple(model.get_params('sinogram_shape')),
                               generator=generator).to(model.torch_device)
 
         worst_rel = 0.0
-        # A row aligned geometry bands in the sinogram's row axis, so slicing
-        # the input is the whole of the banded seam.
+        # In parallel beam, each detector row corresponds to one slice.  For this reason,
+        # the test of a range of rows only needs to slice the sinogram.
         num_rows = int(sinogram.shape[1])
         interior = max(1, num_rows // 3)
         bands = ((0, num_rows), (interior, num_rows - 2 * interior))
@@ -439,8 +391,10 @@ def _parallel_back_self_check(device_key):
 
 
 def _parallel_forward_self_check(device_key):
-    """Run the parallel forward kernel-vs-torch-body comparison once on one
-    device (see :func:`parallel_forward_kernel_usable`); never raises."""
+    """This function compares the parallel forward kernel with its torch version on one device.
+
+    The function never raises an error.
+    """
     global _SELF_CHECK_ACTIVE
     _SELF_CHECK_ACTIVE = True
     try:
@@ -455,8 +409,8 @@ def _parallel_forward_self_check(device_key):
                             generator=generator).to(model.torch_device)
 
         worst_rel = 0.0
-        # The forward carries its band in the column count of the values, and
-        # each band produces the matching detector rows.
+        # The forward projection receives a range of slices as the columns of the values.
+        # Each range of slices produces the matching detector rows.
         interior = max(1, num_slices // 3)
         bands = ((0, num_slices), (interior, num_slices - 2 * interior))
         for slice_start, band_len in bands:
@@ -477,8 +431,10 @@ def _parallel_forward_self_check(device_key):
 
 
 def _multiaxis_back_self_check(device_key):
-    """Run the multiaxis back kernel-vs-torch-body comparison once on one
-    device (see :func:`multiaxis_back_kernel_usable`); never raises."""
+    """This function compares the multiaxis back kernel with its torch version on one device.
+
+    The function never raises an error.
+    """
     global _SELF_CHECK_ACTIVE
     _SELF_CHECK_ACTIVE = True
     try:
@@ -487,15 +443,15 @@ def _multiaxis_back_self_check(device_key):
 
         model, pixel_indices, view_params, args = _multiaxis_self_check_cell(
             device_key)
-        # A private generator keeps this check from advancing the global RNG
-        # streams, which the seeded recon tests depend on.
+        # A private generator keeps this check from advancing the global random state,
+        # which the tests with fixed seeds depend on.
         generator = torch.Generator().manual_seed(0)
         sinogram = torch.rand(tuple(model.get_params('sinogram_shape')),
                               generator=generator).to(model.torch_device)
 
         worst_rel = 0.0
-        # The interior band exercises the band_slices seam, and its length is
-        # not a multiple of the kernel's padded launch width.
+        # The interior range of slices tests the use of band_slices.  Its length is not a
+        # multiple of the padded launch width of the kernel.
         num_slices = int(args['num_slices'])
         interior = max(1, num_slices // 3)
         bands = ((0, num_slices), (interior, num_slices - 2 * interior))
@@ -520,8 +476,10 @@ def _multiaxis_back_self_check(device_key):
 
 
 def _multiaxis_forward_self_check(device_key):
-    """Run the multiaxis forward kernel-vs-torch-body comparison once on one
-    device (see :func:`multiaxis_forward_kernel_usable`); never raises."""
+    """This function compares the multiaxis forward kernel with its torch version on one device.
+
+    The function never raises an error.
+    """
     global _SELF_CHECK_ACTIVE
     _SELF_CHECK_ACTIVE = True
     try:
@@ -536,8 +494,8 @@ def _multiaxis_forward_self_check(device_key):
                             generator=generator).to(model.torch_device)
 
         worst_rel = 0.0
-        # The check runs the whole volume and then an interior band, which
-        # exercises the slice_start seam.
+        # The check runs on all slices and then on an interior range of slices, which
+        # tests the use of slice_start.
         interior = max(1, num_slices // 3)
         bands = ((0, num_slices), (interior, num_slices - 2 * interior))
         for slice_start, band_len in bands:
@@ -560,7 +518,8 @@ def _multiaxis_forward_self_check(device_key):
 
 
 def _self_check_verdict(name, device_key, worst_rel):
-    """(usable, reason) from a self-check's worst relative difference."""
+    """This function converts the largest relative difference of a kernel check to
+    (usable, reason)."""
     if worst_rel <= SELF_CHECK_REL_TOL:
         result = (True, f'{name} kernel matches the torch body on '
                         f'{device_key} (rel {worst_rel:.1e} <= '
@@ -573,15 +532,16 @@ def _self_check_verdict(name, device_key, worst_rel):
 
 
 def _reset_probe_cache():
-    """Drop the cached probe result so the next call probes again.  The kill
-    switch is read inside the probe, so changing it takes effect only after
-    this reset."""
+    """This function clears the cached result of :func:`triton_available`.
+
+    A change to the disable variable takes effect only after this call.
+    """
     global _PROBE_RESULT
     _PROBE_RESULT = None
 
 
 def _reset_self_check_cache():
-    """Drop the cached per-device self-check results."""
+    """This function clears the cached results of the kernel checks for all devices."""
     _CONE_BACK_RESULTS.clear()
     _CONE_FWD_RESULTS.clear()
     _PARALLEL_BACK_RESULTS.clear()

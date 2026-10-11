@@ -1,4 +1,5 @@
-"""``python -m mbirtorch.hsnt`` runs the command-line interface (see mbirtorch.hsnt.cli)."""
+"""This module runs the command line program for ``python -m mbirtorch.hsnt``.  The program
+itself is defined in ``mbirtorch.hsnt.cli``."""
 import sys
 
 from .cli import main

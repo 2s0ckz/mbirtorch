@@ -15,33 +15,34 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
                        crop_pixels_sides=None, crop_pixels_top=None, crop_pixels_bottom=None,
                        auto_crop=False, verbose=1, offset_correction=True):
     """
-    Load an NSI scan, compute its sinogram, and return a cone beam model ready to reconstruct.
-
-    The scan directory holds the radiographs, the blank and dark scans, the ``.nsipro`` config file,
-    and the geometry report.  The crops default to the values in the config file, and the top and
-    bottom crops are always made equal, to the larger of the two.  The background offset is removed
-    per view.  Lengths in the model are in mm.
+    This function loads an NSI scan, computes its sinogram, and returns a cone beam model for
+    the scan.  Each crop that is None takes its value from the NSI config file.  When the top
+    and bottom crops differ, this function sets both of them to the larger value.  The model
+    measures all lengths in mm.
 
     Args:
         dataset_dir (str): Path to the NSI scan directory.
-        downsample_factor (tuple[int, int], optional): Detector (row, channel) downsampling.  Defaults to (1, 1).
-        subsample_view_factor (int, optional): Keep every n-th view.  Defaults to 1.
-        crop_pixels_sides (int, optional): Pixels to crop from each side of the detector.  None takes
-            the value in the config file.  Defaults to None.
-        crop_pixels_top (int, optional): Pixels to crop from the top.  None takes the config file value.
-            Defaults to None.
-        crop_pixels_bottom (int, optional): Pixels to crop from the bottom.  None takes the config file
-            value.  Defaults to None.
-        auto_crop (bool, optional): If True, remove the blank margins of the sinogram and shrink the
-            reconstruction to match.  Defaults to False.
-        verbose (int, optional): 0 prints nothing, 1 prints progress.  Defaults to 1.
-        offset_correction (bool, optional): If True, take the detector position from the geometry report
-            rather than the config file.  Defaults to True.
+        downsample_factor (tuple[int, int], optional): The downsampling factors along the
+            detector rows and channels.  Defaults to (1, 1).
+        subsample_view_factor (int, optional): This function keeps every n-th view, where n
+            is this factor.  Defaults to 1.
+        crop_pixels_sides (int, optional): The number of pixels to crop from each side of the
+            detector.  None means the value in the config file.  Defaults to None.
+        crop_pixels_top (int, optional): The number of pixels to crop from the top of the
+            detector.  None means the value in the config file.  Defaults to None.
+        crop_pixels_bottom (int, optional): The number of pixels to crop from the bottom of
+            the detector.  None means the value in the config file.  Defaults to None.
+        auto_crop (bool, optional): If True, this function removes the blank margins of the
+            sinogram and shrinks the reconstruction to match.  Defaults to False.
+        verbose (int, optional): The value 0 prints nothing, and 1 prints progress.  Defaults
+            to 1.
+        offset_correction (bool, optional): If True, this function takes the detector position
+            from the geometry report instead of the config file.  Defaults to True.
 
     Returns:
-        tuple: ``(sino, model)``: the sinogram, shape (num_views, num_det_rows, num_det_channels), and
-        a ConeBeamModel with its parameters set.  Weights are not returned; make them with
-        ``mbirtorch.gen_weights``.
+        tuple: ``(sino, model)``.  The sinogram ``sino`` has shape (num_views, num_det_rows,
+        num_det_channels).  The ``model`` is a ConeBeamModel with its parameters set.  The
+        function ``mbirtorch.gen_weights`` computes the weights for the reconstruction.
 
     Example:
         .. code-block:: python
@@ -60,21 +61,21 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
 def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1,
                              crop_pixels_sides=None, crop_pixels_top=None, crop_pixels_bottom=None, verbose=1, offset_correction=True):
     """
-    Load NSI scans and compute the sinogram and the model parameters.
-
-    This is the private helper for :func:`get_sino_and_model`, which documents the arguments.
+    This function loads NSI scans and computes the sinogram and the model parameters for
+    :func:`get_sino_and_model`.  The docstring of :func:`get_sino_and_model` describes the
+    arguments.
 
     Returns:
-        tuple: ``(sino, required_params, optional_params)``.  ``required_params`` holds the
-        ConeBeamModel constructor arguments and a ``geometry_type`` entry that ``build_model`` uses
-        to select the model class.  ``optional_params`` holds the ``set_params`` arguments.
+        tuple: ``(sino, required_params, optional_params)``.  The dict ``required_params``
+        holds the ConeBeamModel constructor arguments and ``geometry_type``.  The dict
+        ``optional_params`` holds the arguments for ``set_params``.
     """
     if verbose > 0:
         print("\n\n########## Loading object, blank, dark scans, and geometry parameters from NSI dataset directory")
     obj_scan, blank_scan, dark_scan, nsi_params, defective_pixel_array = \
             load_scans_and_params(dataset_dir, subsample_view_factor=subsample_view_factor, verbose=verbose, offset_correction=offset_correction)
 
-    # TODO:  adjust detector offsets for asymmetric crops
+    # TODO: Adjust the detector offsets for asymmetric crops.
     max_crop = nsi_params['max_crop']
     if crop_pixels_sides is None:
         crop_pixels_sides = max_crop
@@ -103,11 +104,11 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
 
     if verbose > 0:
         print("\n\n########## Computing sinogram (downsample -> transmission -> detector rotation, fused)")
-    # det_rotation is not an allowed TomographyModel parameter, so pop it for the fused pipeline.
+    # scan_to_sino applies det_rotation to the sinogram, so the model does not receive it.
     det_rotation = optional_params.pop("det_rotation")
     sino = mtp.scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array,
                             downsample_factor=downsample_factor, det_rotation=det_rotation)
-    del obj_scan, blank_scan, dark_scan  # delete scan images to save memory
+    del obj_scan, blank_scan, dark_scan  # This frees the memory of the scan images.
 
     if verbose > 0:
         print("\n\n########## Correcting sinogram data to account for background offset")
@@ -123,10 +124,12 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
 
 def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsample_view_factor=1, verbose=1, offset_correction=True):
     """
-    Load the object scan, blank scan, dark scan, view angles, defective pixel information, and geometry parameters from an NSI scan directory.
+    This function loads the scans and the geometry from an NSI scan directory.  It loads the
+    object, blank, and dark scans.  It also loads the defective pixels and the geometry
+    parameters.
 
     Args:
-        dataset_dir (string): Path to an NSI scan directory. The directory is assumed to have the following structure:
+        dataset_dir (string): Path to an NSI scan directory, which holds:
 
             - ``*.nsipro`` (NSI config file)
             - ``Geometry*.rtf`` (geometry report)
@@ -135,21 +138,28 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
             - ``**/offset.tif`` (dark scan image)
             - ``**/*.defect`` (defective pixel information)
 
-        view_id_start (int, optional): view index corresponding to the first view.
-        view_id_end (int, optional): view index one past the last view. If None, this is set to the number of views recorded in the ``.nsipro`` config file.
-        subsample_view_factor (int, optional): view subsample factor.
-        verbose (int, optional): Verbosity level. Defaults to 1.
-        offset_correction (bool): Whether to apply detector offset correction using values from the Geometry Report. Defaults to True.
-
+        view_id_start (int, optional): The index of the first view to load.  Defaults to 0.
+        view_id_end (int, optional): The index one past the last view to load.  None means
+            the number of views in the ``.nsipro`` config file.  Defaults to None.
+        subsample_view_factor (int, optional): This function loads every n-th view, where n
+            is this factor.  Defaults to 1.
+        verbose (int, optional): The verbosity level.  Defaults to 1.
+        offset_correction (bool): If True, this function takes the detector position from the
+            geometry report.  Defaults to True.
 
     Returns:
         tuple: (obj_scan, blank_scan, dark_scan, nsi_params, defective_pixel_array)
 
-            - obj_scan (numpy.ndarray): 3D object scan with shape (num_views, num_det_rows, num_det_channels).
-            - blank_scan (numpy.ndarray): 3D blank scan with shape (1, num_det_rows, num_det_channels).
-            - dark_scan (numpy.ndarray): 3D dark scan with shape (1, num_det_rows, num_det_channels).
-            - nsi_params (dict): Geometry parameters read from the NSI config file (e.g., geometry vectors, spacings, and angles).
-            - defective_pixel_array (numpy.ndarray | tuple): If a defective-pixel file is present, an (N, 2) integer array of (detector_row_idx, detector_channel_idx) pairs; otherwise an empty tuple ``()``.
+            - obj_scan (numpy.ndarray): 3D object scan with shape (num_views, num_det_rows,
+              num_det_channels).
+            - blank_scan (numpy.ndarray): 3D blank scan with shape (1, num_det_rows,
+              num_det_channels).
+            - dark_scan (numpy.ndarray): 3D dark scan with shape (1, num_det_rows,
+              num_det_channels).
+            - nsi_params (dict): The geometry parameters read from the NSI config file.
+            - defective_pixel_array (numpy.ndarray | tuple): An (N, 2) integer array of
+              (detector_row_idx, detector_channel_idx) pairs.  The value is ``()`` when there
+              is no defective pixel file.
     """
     config_file_path, geom_report_path, obj_scan_dir, blank_scan_path, dark_scan_path, defective_pixel_path = \
         _parse_filenames_from_dataset_dir(dataset_dir)
@@ -163,26 +173,26 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
               f"    - Dark scan image: {dark_scan_path}\n",
               f"    - Defective pixel information: {defective_pixel_path}\n")
 
-    ### These are the parameter tags read from the nsipro file.
-    tag_section_list = [['source', 'Result'],                           # vector from origin to source
-                        ['reference', 'Result'],                        # vector from origin to first row and column of the detector
-                        ['pitch', 'Object Radiograph'],                 # detector pixel pitch
-                        ['width pixels', 'Detector'],                   # number of detector rows
-                        ['height pixels', 'Detector'],                  # number of detector channels
+    # Each entry is a [tag, section] pair to read from the nsipro file.
+    tag_section_list = [['source', 'Result'],                           # origin to source
+                        ['reference', 'Result'],                        # first detector pixel
+                        ['pitch', 'Object Radiograph'],                 # pixel pitch
+                        ['width pixels', 'Detector'],                   # number of detector channels
+                        ['height pixels', 'Detector'],                  # number of detector rows
                         ['number', 'Object Radiograph'],                # number of views
-                        ['Rotation range', 'CT Project Configuration'], # Range of rotation angle (usually 360)
-                        ['rotate', 'Correction'],                       # rotation of radiographs
-                        ['flipH', 'Correction'],                        # Horizontal flip (boolean)
-                        ['flipV', 'Correction'],                        # Vertical flip (boolean)
-                        ['angleStep', 'Object Radiograph'],             # step size of adjacent view angles
-                        ['clockwise', 'Processed'],                     # rotation direction (boolean)
-                        ['axis', 'Result'],                             # unit vector in direction ofrotation axis
-                        ['normal', 'Result'],                           # unit vector in direction of source-detector line
-                        ['horizontal', 'Result'],                       # unit vector in direction of detector rows
-                        ['crop', 'Radiograph']                          # 4-tuple of pixels to crop from each view
+                        ['Rotation range', 'CT Project Configuration'], # usually 360 degrees
+                        ['rotate', 'Correction'],                       # radiograph rotation
+                        ['flipH', 'Correction'],                        # horizontal flip
+                        ['flipV', 'Correction'],                        # vertical flip
+                        ['angleStep', 'Object Radiograph'],             # view angle step
+                        ['clockwise', 'Processed'],                     # rotation direction
+                        ['axis', 'Result'],                             # rotation axis
+                        ['normal', 'Result'],                           # detector normal
+                        ['horizontal', 'Result'],                       # direction of detector rows
+                        ['crop', 'Radiograph']                          # pixels to crop per side
                        ]
     assert(os.path.isfile(config_file_path)), f'Error! NSI config file does not exist. Please check whether {config_file_path} is a valid file.'
-    # raw_nsi_fields holds the raw strings from the nsipro file in the order of tag_section_list.
+    # The strings in raw_nsi_fields are in the order of tag_section_list.
     raw_nsi_fields = _read_str_from_config(config_file_path, tag_section_list)
 
     # r_s is the vector from the origin to the source.
@@ -193,7 +203,7 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
     r_r = raw_nsi_fields[1].split(' ')
     r_r = np.array([np.single(elem) for elem in r_r])
 
-    # The Geometry Report gives a more accurate coordinate for the (0,0) detector pixel.
+    # The geometry report gives a more accurate position of the (0,0) detector pixel.
     if offset_correction:
         if geom_report_path is not None:
             x_r, y_r = _read_detector_location_from_geom_report(geom_report_path)
@@ -216,10 +226,10 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
 
     num_acquired_scans = int(raw_nsi_fields[5])
 
-    # The total rotation is usually 360 degrees, or 360 times the number of turns for 4D data.
+    # The total rotation is usually 360 degrees.  For 4D data, it is 360 times the number of turns.
     total_angles = int(raw_nsi_fields[6])
 
-    # The radiograph rotation is in degrees.
+    # The radiograph rotation, in degrees.
     scan_rotate = int(raw_nsi_fields[7])
     if (scan_rotate == 180) or (scan_rotate == 0):
         if verbose > 0:
@@ -241,7 +251,7 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
     else:
         flipV = False
 
-    # The angle step between views is in degrees.
+    # The angle step between views, in degrees.
     angle_step = np.single(raw_nsi_fields[10])
 
     if raw_nsi_fields[11] == "True":
@@ -254,15 +264,13 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
 
     r_a = raw_nsi_fields[12].split(' ')
     r_a = np.array([np.single(elem) for elem in r_a])
-    # The rotation axis is made to point down.
+    # This code makes the rotation axis point down.
     if r_a[1] > 0:
         r_a = -r_a
 
-    # r_n is the detector normal vector.
     r_n = raw_nsi_fields[13].split(' ')
     r_n = np.array([np.single(elem) for elem in r_n])
 
-    # r_h is the detector horizontal vector.
     r_h = raw_nsi_fields[14].split(' ')
     r_h = np.array([np.single(elem) for elem in r_h])
     crops = raw_nsi_fields[15].split(' ')
@@ -352,19 +360,24 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
 
 def convert_nsi_to_mbirtorch_params(nsi_params, downsample_factor=(1, 1), crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0):
     """
-    Convert geometry parameters from nsi into mbirtorch format, including modification to reflect crop and downsample.
+    This function converts NSI geometry parameters into mbirtorch parameters.  The mbirtorch
+    parameters account for the crop and the downsampling.
 
     Args:
-        nsi_params (dict):
-        downsample_factor ((int, int), optional) - Down-sample factors along the detector rows and channels respectively.
-            If scan size is not divisible by `downsample_factor`, the scans will be first truncated to a size that is divisible by `downsample_factor`.
-        crop_pixels_sides (int, optional): The number of pixels to crop from each side of the sinogram. Defaults to 0.
-        crop_pixels_top (int, optional): The number of pixels to crop from top of the sinogram. Defaults to 0.
-        crop_pixels_bottom (int, optional): The number of pixels to crop from bottom of the sinogram. Defaults to 0.
+        nsi_params (dict): The NSI geometry parameters.
+        downsample_factor ((int, int), optional): The downsampling factors along the detector
+            rows and channels.  When the number of rows or channels is not divisible by its
+            factor, this function rounds the result down.  Defaults to (1, 1).
+        crop_pixels_sides (int, optional): The number of pixels to crop from each side of the
+            sinogram.  Defaults to 0.
+        crop_pixels_top (int, optional): The number of pixels to crop from the top of the
+            sinogram.  Defaults to 0.
+        crop_pixels_bottom (int, optional): The number of pixels to crop from the bottom of the
+            sinogram.  Defaults to 0.
 
     Returns:
-        cone_beam_params (dict): Required parameters for the ConeBeamModel constructor.
-        optional_params (dict): Additional ConeBeamModel parameters to be set using set_params().
+        cone_beam_params (dict): The required parameters for the ConeBeamModel constructor.
+        optional_params (dict): The other ConeBeamModel parameters, to be set with set_params().
     """
     r_a, r_n, r_h, r_s, r_r = itemgetter('r_a', 'r_n', 'r_h', 'r_s', 'r_r')(nsi_params)
     delta_det_channel, delta_det_row = itemgetter('delta_det_channel', 'delta_det_row')(nsi_params)
@@ -374,7 +387,7 @@ def convert_nsi_to_mbirtorch_params(nsi_params, downsample_factor=(1, 1), crop_p
     det_channel_offset, det_row_offset = calc_row_channel_params(r_a, r_n, r_h, r_s, r_r, delta_det_channel, delta_det_row, num_det_channels, num_det_rows, magnification)
     recon_slice_offset = - det_row_offset / magnification
 
-    # The crop is in raw detector pixels, and the offsets are in ALU.  Downsampling is applied afterward.
+    # The crop is in raw detector pixels.  The offsets are in ALU.
     num_det_rows, num_det_channels, det_row_offset, det_channel_offset = lu.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
@@ -399,34 +412,29 @@ def convert_nsi_to_mbirtorch_params(nsi_params, downsample_factor=(1, 1), crop_p
     optional_params["det_channel_offset"] = det_channel_offset
     optional_params["det_row_offset"] = det_row_offset
     optional_params['recon_slice_offset'] = recon_slice_offset
-    optional_params["det_rotation"] = det_rotation # tilt angle of rotation axis
-    optional_params["alu_unit"] = 'mm' # NSI always uses mm has the unit
-    optional_params["alu_value"] = 1.0  # We have set everything in mm, so 1 ALU = 1 mm
+    optional_params["det_rotation"] = det_rotation # tilt angle of the rotation axis, in radians
+    optional_params["alu_unit"] = 'mm' # NSI files always give lengths in mm.
+    optional_params["alu_value"] = 1.0  # 1 ALU is 1 mm.
 
     return cone_beam_params, optional_params
 
 
 ######## subroutines for parsing NSI metadata
 def _parse_filenames_from_dataset_dir(dataset_dir):
-    """ Given the path to an NSI dataset directory, automatically parse the paths to the following files and directories:
-            - NSI config file (nsipro file),
-            - geometry report (Geometry Report.rtf),
-            - object scan directory (Radiographs/),
-            - blank scan (Corrections/gain0.tif),
-            - dark scan (Corrections/offset.tif),
-            - defective pixel information (Corrections/defective_pixels.defect),
-        If multiple files with the same patterns are found, then the user will be prompted to select the correct file.
+    """This function returns the paths of the NSI files in an NSI dataset directory.  When
+    several files match one pattern, this function asks the user to choose one.
 
     Args:
         dataset_dir (string): Path to the directory containing the NSI scans and metadata.
     Returns:
         6-element tuple containing:
             - config_file_path (string): Path to the NSI config file (nsipro file).
-            - geom_report_path (string): Path to the geometry report file (Geometry Report.rtf)
-            - obj_scan_dir (string): Path to the directory containing the object scan images (radiographs).
+            - geom_report_path (string): Path to the geometry report file (Geometry
+              Report.rtf), or None when there is no geometry report.
+            - obj_scan_dir (string): Path to the directory of object scan images (radiographs).
             - blank_scan_path (string): Path to the blank scan image.
             - dark_scan_path (string): Path to the dark scan image.
-            - defective_pixel_path (string): Path to the file containing defective pixel information.
+            - defective_pixel_path (string): Path to the defective pixel file.
     """
     config_file_path_list = glob.glob(os.path.join(dataset_dir, "*.nsipro"))
     config_file_path = _prompt_user_choice("NSI config files", config_file_path_list)
@@ -454,8 +462,8 @@ def _parse_filenames_from_dataset_dir(dataset_dir):
 
 
 def _prompt_user_choice(file_description, file_path_list):
-    """ Given a list of candidate files, prompt the user to select the desired one.
-        If only one candidate exists, the function will return the name of that file without any user prompts.
+    """This function asks the user to choose one file from a list of candidate files.  When
+    the list has one file, this function returns that file without asking.
     """
     assert(len(file_path_list) > 0), f"No {file_description} found!! Please make sure you provided a valid NSI scan path."
 
@@ -483,11 +491,9 @@ def _prompt_user_choice(file_description, file_path_list):
 
 
 def _read_detector_location_from_geom_report(geom_report_path):
-    """ Read the coordinates of the first detector row and column from "Geometry Report.rtf".
-
-        The function parses the "Image center" line of the report.  The line
-        "Image center    (95.707, 123.072) [mm]  / (3.768, 4.845) [in]" gives (95.707, 123.072).
-        These coordinates are more accurate than the <reference> field of the nsipro file.
+    """This function reads the (x, y) position in mm of the first detector row and column
+    from the "Image center" line of the geometry report.  This position is more accurate than
+    the <reference> field of the nsipro file.
 
     Returns:
         (x_r, y_r): The X and Y coordinates in mm.
@@ -507,14 +513,14 @@ def _read_detector_location_from_geom_report(geom_report_path):
 
 
 def _read_str_from_config(filepath, tags_sections):
-    """Returns strings about dataset information read from NSI configuration file.
+    """This function reads the values of the requested tags from an NSI configuration file
+    and returns them as strings.
 
     Args:
-        filepath (string): Path to NSI configuration file. The filename extension is '.nsipro'.
-        tags_sections (list[string,string]): Given tags and sections to locate the information we want to read.
+        filepath (string): Path to the NSI configuration file, with extension '.nsipro'.
+        tags_sections (list[string,string]): The [tag, section] pairs to read.
     Returns:
-        list[string], a list of strings have needed dataset information for reconstruction.
-
+        list[string]: The value of each tag, in the order of ``tags_sections``.
     """
     tag_strs = ['<' + tag + '>' for tag, section in tags_sections]
     section_starts = ['<' + section + '>' for tag, section in tags_sections]
@@ -527,7 +533,7 @@ def _read_str_from_config(filepath, tags_sections):
     except IOError:
         print("Could not read file:", filepath)
 
-    # TODO: Replace with more efficient code that doesn't use a nested loop
+    # TODO: Replace the nested loop with more efficient code.
     for tag_str, section_start, section_end in zip(tag_strs, section_starts, section_ends):
         section_start_inds = [ind for ind, match in enumerate(lines) if section_start in match]
         section_end_inds = [ind for ind, match in enumerate(lines) if section_end in match]
@@ -549,15 +555,17 @@ def _read_str_from_config(filepath, tags_sections):
 
 ######## subroutines for NSI-MBIR parameter conversion
 def calc_det_rotation(r_a, r_n, r_h, r_v):
-    """ Calculate the tilt angle between the rotation axis and the detector columns in unit of radians. User should call `preprocess.correct_det_rotation()` to rotate the sinogram images w.r.t. to the tilt angle.
+    """This function calculates the tilt angle in radians between the rotation axis and the
+    detector columns.  The function ``preprocess.correct_det_rotation()`` rotates the sinogram
+    by this angle.
 
     Args:
-        r_a: 3D real-valued unit vector in direction of rotation axis pointing down.
-        r_n: 3D real-valued unit vector perpendicular to the detector plan pointing from source to detector.
-        r_h: 3D real-valued unit vector in direction parallel to detector rows pointing from left to right.
-        r_v: 3D real-valued unit vector in direction parallel to detector columns pointing down.
+        r_a: The 3D unit vector along the rotation axis, pointing down.
+        r_n: The 3D unit vector normal to the detector plane, from source to detector.
+        r_h: The 3D unit vector along the detector rows, from left to right.
+        r_v: The 3D unit vector along the detector columns, pointing down.
     Returns:
-        float number specifying the angle between the rotation axis and the detector columns in units of radians.
+        float: The angle between the rotation axis and the detector columns, in radians.
     """
     r_a_p = lu.unit_vector(r_a - lu.project_vector_to_vector(r_a, r_n))
     det_rotation = -np.arctan(np.dot(r_a_p, r_h)/np.dot(r_a_p, r_v))
@@ -565,70 +573,78 @@ def calc_det_rotation(r_a, r_n, r_h, r_v):
 
 
 def calc_source_detector_params(r_a, r_n, r_h, r_s, r_r):
-    """ Calculate the MBIRTORCH geometry parameters: source_detector_dist, magnification, and rotation axis tilt angle.
+    """This function calculates source_detector_dist, source_iso_dist, magnification, and
+    det_rotation.
+
     Args:
-        r_a (tuple): 3D real-valued unit vector in direction of rotation axis pointing down.
-        r_n (tuple): 3D real-valued unit vector perpendicular to the detector plan pointing from source to detector.
-        r_h (tuple): 3D real-valued unit vector in direction parallel to detector rows pointing from left to right.
-        r_s (tuple): 3D real-valued vector from origin to the source location.
-        r_r (tuple): 3D real-valued vector from origin to the center of pixel on first row and colum of detector.
+        r_a (tuple): The 3D unit vector along the rotation axis, pointing down.
+        r_n (tuple): The 3D unit vector normal to the detector plane, from source to detector.
+        r_h (tuple): The 3D unit vector along the detector rows, from left to right.
+        r_s (tuple): The 3D vector from the origin to the source.
+        r_r (tuple): The 3D vector from the origin to the center of the first detector row and
+            column.
     Returns:
         4-element tuple containing:
-        - **source_detector_dist** (float): Distance between the X-ray source and the detector.
-        - **source_iso_dist** (float): Distance between the X-ray source and the center of rotation.
-        - **det_rotation (float)**: Angle between the rotation axis and the detector columns in units of radians.
-        - **magnification** (float): Magnification of the cone-beam geometry defined as
-            (source to detector distance)/(source to center-of-rotation distance).
+        - **source_detector_dist** (float): The distance from the X-ray source to the detector.
+        - **source_iso_dist** (float): The distance from the X-ray source to the center of
+          rotation.
+        - **magnification** (float): The ratio source_detector_dist / source_iso_dist.
+        - **det_rotation** (float): The angle between the rotation axis and the detector
+          columns, in radians.
     """
-    r_n = lu.unit_vector(r_n)      # make sure r_n is normalized
-    r_v = np.cross(r_n, r_h)    # r_v = r_n x r_h
+    r_n = lu.unit_vector(r_n)
+    r_v = np.cross(r_n, r_h)
 
-    # r_s_r points from the source to the center of rotation along the source to detector line.
-    r_s_r = lu.project_vector_to_vector(-r_s, r_n) # project -r_s to r_n
+    # r_s_r is the vector from the source to the center of rotation, projected onto r_n.
+    r_s_r = lu.project_vector_to_vector(-r_s, r_n)
 
-    # r_s_d points from the source to the detector along the source to detector line.
+    # r_s_d is the vector from the source to the detector, projected onto r_n.
     r_s_d = lu.project_vector_to_vector(r_r-r_s, r_n)
 
-    source_detector_dist = np.linalg.norm(r_s_d) # ||r_s_d||
-    source_iso_dist = np.linalg.norm(r_s_r) # ||r_s_r||
+    source_detector_dist = np.linalg.norm(r_s_d)
+    source_iso_dist = np.linalg.norm(r_s_r)
     magnification = source_detector_dist/source_iso_dist
-    det_rotation = calc_det_rotation(r_a, r_n, r_h, r_v) # rotation axis tilt angle
+    det_rotation = calc_det_rotation(r_a, r_n, r_h, r_v)
     return source_detector_dist, source_iso_dist, magnification, det_rotation
 
 
 def calc_row_channel_params(r_a, r_n, r_h, r_s, r_r, delta_det_channel, delta_det_row, num_det_channels, num_det_rows, magnification):
-    """ Calculate the MBIRTORCH geometry parameters: det_channel_offset, det_row_offset.
+    """This function calculates det_channel_offset and det_row_offset.
+
     Args:
-        r_a (tuple): 3D real-valued unit vector in direction of rotation axis pointing down.
-        r_n (tuple): 3D real-valued unit vector perpendicular to the detector plan pointing from source to detector.
-        r_h (tuple): 3D real-valued unit vector in direction parallel to detector rows pointing from left to right.
-        r_s (tuple): 3D real-valued vector from origin to the source location.
-        r_r (tuple): 3D real-valued vector from origin to the center of pixel on first row and colum of detector.
-        delta_det_channel (float): spacing between detector columns.
-        delta_det_row (float): spacing between detector rows.
-        num_det_channels (int): Number of detector channels.
-        num_det_rows (int): Number of detector rows.
-        magnification (float): Magnification of the cone-beam geometry.
+        r_a (tuple): The 3D unit vector along the rotation axis, pointing down.
+        r_n (tuple): The 3D unit vector normal to the detector plane, from source to detector.
+        r_h (tuple): The 3D unit vector along the detector rows, from left to right.
+        r_s (tuple): The 3D vector from the origin to the source.
+        r_r (tuple): The 3D vector from the origin to the center of the first detector row and
+            column.
+        delta_det_channel (float): The spacing between detector channels.
+        delta_det_row (float): The spacing between detector rows.
+        num_det_channels (int): The number of detector channels.
+        num_det_rows (int): The number of detector rows.
+        magnification (float): The magnification of the cone beam geometry.
     Returns:
         2-element tuple containing:
-        - **det_channel_offset** (float): Distance from center of detector to the source-detector line along a row.
-        - **det_row_offset** (float): Distance from center of detector to the source-detector line along a column.
+        - **det_channel_offset** (float): The distance from the detector center to the
+          source-detector line along a row.
+        - **det_row_offset** (float): The distance from the detector center to the
+          source-detector line along a column.
     """
-    r_n = lu.unit_vector(r_n) # make sure r_n is normalized
-    r_h = lu.unit_vector(r_h) # make sure r_h is normalized
-    r_v = np.cross(r_n, r_h) # r_v = r_n x r_h
+    r_n = lu.unit_vector(r_n)
+    r_h = lu.unit_vector(r_h)
+    r_v = np.cross(r_n, r_h)
 
-    # c_v points from the center of the detector to the first row and column along the detector columns.
+    # c_v is the vector from the first row and column to the detector center, along the columns.
     c_v = (num_det_rows-1)/2*delta_det_row*r_v
-    # c_h points from the center of the detector to the first row and column along the detector rows.
+    # c_h is the vector from the first row and column to the detector center, along the rows.
     c_h = (num_det_channels-1)/2*delta_det_channel*r_h
-    # r_s_r points from the source to the first detector row and column.
+    # r_s_r is the vector from the source to the first detector row and column.
     r_s_r = r_r - r_s
-    # r_delta points from the source to detector line to the center of the detector.
+    # r_delta is the vector from the source-detector line to the detector center.
     r_delta = r_s_r - lu.project_vector_to_vector(r_s_r, r_n) + c_v + c_h
     det_channel_offset = -np.dot(r_delta, r_h)
     det_row_offset = -np.dot(r_delta, r_v)
-    r_a = lu.unit_vector(r_a)  # make sure r_a is normalized
+    r_a = lu.unit_vector(r_a)
     rotation_offset = np.dot(r_s, np.cross(r_n, r_a))
     det_channel_offset += rotation_offset*magnification
     return det_channel_offset, det_row_offset

@@ -1,13 +1,11 @@
-"""Reading hyperspectral neutron data: TIFF stacks (with open beam) and hsnt HDF5 files, the data checks, and the
-streamed conversion to the hsnt HDF5 layout.
+"""This module reads hyperspectral neutron data from TIFF stacks and hsnt HDF5 files.  It also
+checks the data and converts the data to the hsnt HDF5 format.
 
-A TIFF stack is a directory of one image per wavelength bin, or a directory of such directories, one per view. A stack
-of counts needs an open-beam stack, shared by the views, to become a transmission ratio; a stack or file that already
-holds transmissions or attenuations is used as is, and the type is inferred from the values unless given. Both
-formats are read through block readers that return bins k0:k1 as (views, rows, cols, bins) float32, and both the
-in-memory load and the conversion go a block of bins at a time. Two optional corrections apply per block: a smoothing
-of the open beam, and a background calibration that divides each detector tile's transmission by that of boxes free
-of the sample.
+A TIFF stack is a directory with one image per wavelength bin.  A multi-view stack is a
+directory with one such subdirectory per view.  A stack of counts needs an open beam stack to
+compute the transmission ratio.  The module reads the data a block of bins at a time.  It can
+apply two optional corrections to each block.  The first correction smooths the open beam.  The
+second correction calibrates the background from boxes that contain no sample.
 """
 import json
 import logging
@@ -28,46 +26,42 @@ log = logging.getLogger(__name__)
 
 INPUT_TYPES = ("counts", "transmission", "attenuation")
 
-# An open-beam value below this fraction of its bin's median holds no count: it is the floating-point residue a dead
-# pixel keeps after processing (+-1e-12 in the ORNL Fe cube), which as a divisor would give transmissions of 1e14.
-# A live pixel's mean over n observations is at least 1/n count when it is positive.
+# An open beam value below this fraction of the median of its bin is treated as zero counts.
 _OPEN_BEAM_FLOOR = 1e-6
 
-# Instrument-specific presets for background_boxes. Boxes are (y0, y1, x0, x1) in full-resolution detector pixels and
-# must be free of the sample; tiles (rows, cols) split the detector into regions calibrated separately.
+# This dict holds the presets for background_boxes.  Each box is (y0, y1, x0, x1) in full-resolution pixels and must
+# contain no sample.  The tiles (rows, cols) split the detector into regions calibrated separately.
 _BACKGROUND_PRESETS = {
-    # ORNL SNAP (instrument-specific): a 512 x 512 detector of four 256 x 256 chips, one tile each, and the 100 x 100
-    # box in each chip's outer corner, as in the MBIRJAX hsnt preprocessing for SNAP; they assume a sample clear of the
-    # corners.
+    # ORNL SNAP has four 256 x 256 chips.  Each chip is one tile with a 100 x 100 box in its outer corner.
     "ornl-snap": dict(boxes=((10, 110, 10, 110), (10, 110, 410, 510), (410, 510, 10, 110), (410, 510, 410, 510)),
                       tiles=(2, 2), shape=(512, 512)),
 }
 
 
 class InputError(ValueError):
-    """A problem with the input data or the options, which the command line reports as a one-line message."""
+    """This class is used to report bad input data or options in a one-line message."""
 
 
 @dataclass
 class Check:
-    level: str          # 'ok', 'warn' or 'error'
+    level: str          # 'ok', 'warn', or 'error'.
     message: str
 
 
 @dataclass
 class Dataset:
-    """A loaded dataset as the solvers see it, with what is worth reporting about it."""
-    T: np.ndarray                       # transmission ratio, (pixels, bins), float32
-    dataset_type: str                   # type of the source data: counts, transmission or attenuation
-    spatial_shape: tuple                # (views, rows, cols) after view selection and downsampling
-    bin_indices: np.ndarray             # source spectral index of each column of T (first index of each bin group)
-    dose: float | None                  # open-beam counts per pixel and bin, if known
+    """This class is used to hold a loaded dataset and the information reported about it."""
+    T: np.ndarray                       # Transmission ratio, (pixels, bins), float32.
+    dataset_type: str                   # Type of the source data: counts, transmission, or attenuation.
+    spatial_shape: tuple                # (views, rows, cols) after view selection and downsampling.
+    bin_indices: np.ndarray             # Source spectral index of the first bin in each column of T.
+    dose: float | None                  # Open beam counts per pixel and bin, or None if unknown.
     source: str
     checks: list = field(default_factory=list)
     info: dict = field(default_factory=dict)
-    dose_per_bin: np.ndarray | None = None      # the open beam's median count in each bin, when it was measured
-    open_beam_observations: float = 0           # effective observations in the open beam (0: none measured)
-    metadata: dict = field(default_factory=dict)    # hsnt metadata of an HDF5 input, matched to the selection
+    dose_per_bin: np.ndarray | None = None      # Median open beam count in each bin, if measured.
+    open_beam_observations: float = 0           # Effective number of open beam observations, or 0 if none.
+    metadata: dict = field(default_factory=dict)    # hsnt metadata of an HDF5 input, cut to the selection.
 
     @property
     def pixels(self):
@@ -83,13 +77,13 @@ def _frac(mask):
 
 
 def _sample_stride(P, K):
-    """The row stride of the checks' value sample of a (P, K) matrix: about 4e6 entries of whole rows, so every bin
-    is seen."""
+    """This function returns the row stride that samples about 4e6 entries of a (P, K) matrix.
+    The samples are whole rows."""
     return max(1, -(-P * K // 4_000_000))
 
 
 def _stats(s):
-    """The range, mean and median of the finite values of s (in the checks, a row sample of T)."""
+    """This function returns the minimum, maximum, mean, and median of the finite values of s."""
     finite = s if np.isfinite(s).all() else s[np.isfinite(s)]
     have = finite.size > 0
     return dict(min=float(finite.min()) if have else float("nan"), max=float(finite.max()) if have else float("nan"),
@@ -98,11 +92,12 @@ def _stats(s):
 
 
 def infer_input_type(a, source_dtype=None):
-    """Guess whether an array holds counts, transmissions or attenuations from its values. Returns (type, reason).
+    """This function infers whether an array holds counts, transmissions, or attenuations.  It
+    returns the tuple (type, reason).
 
-    Integer data (an integer source dtype, or integer values) are counts; data with negative values are attenuations,
-    since a transmission cannot be negative; nonnegative values up to 1.05 are transmissions. Nonnegative
-    non-integer data with larger values could be noisy transmissions or attenuations, and raise ValueError.
+    Integer values are counts.  Data with negative values are attenuations.  Data with values up
+    to 1.05 are transmissions.  For other nonnegative non-integer data, the function raises
+    ``InputError``, which is a subclass of ValueError.
     """
     s = np.asarray(a).reshape(-1)[:: max(1, a.size // 200_000)]
     s = s[np.isfinite(s)]
@@ -122,17 +117,15 @@ def infer_input_type(a, source_dtype=None):
 
 
 def _check_elems(budget_mib):
-    """Entries per block of the data checks within a working-memory budget in MiB: a quarter of its bytes, since a
-    block's boolean masks take a byte per entry, and at least 2^20."""
+    """This function returns the number of entries per block in the data checks for a memory
+    budget in MiB.  The result is at least 2^20."""
     return max(2**20, int(budget_mib * 2**20) // 4)
 
 
 def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0, chunk_elems=2**24, dose_per_bin=None,
                     smoothing=None):
-    """The quantities the data checks need, from a transmission matrix held in memory. The per-pixel and per-bin
-    reductions, and the fractions of non-finite, negative, zero and above-one entries, run exactly by blocks of rows
-    of about chunk_elems entries, so their working set stays small next to T; the range, mean and median come from a
-    sample of whole rows. smoothing is the open-beam smoothing's summary, for the bright check."""
+    """This function computes the quantities that the data checks need from a transmission matrix
+    in memory."""
     P, K = T.shape
     rows = max(1, chunk_elems // max(K, 1))
     pos_px, mean_px = np.empty(P, dtype=np.int64), np.empty(P, dtype=np.float64)
@@ -161,28 +154,25 @@ def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0, chunk_elem
 
 
 def _ratio_expectation(mu):
-    """E[mu / S'] for S ~ Poisson(mu), where S' is S, or the median of S given S > 0 when S = 0: the mean ratio of an
-    open beam's expected count to the loader's open beam, whose zero entries take the bin's median positive value.
-    Exact to 1e-12 up to mu = 400 (the sum over S > 0 is mu e^-mu (Ei(mu) - gamma - ln mu)), and the asymptotic
-    series 1 + 1/mu + 2/mu^2 + 6/mu^3, exact to 1e-9, above."""
+    """This function returns E[mu / S'] for S ~ Poisson(mu).  Here S' equals S, except that a zero
+    is replaced by the median of S given S > 0.  The result is the mean bias that comes from
+    dividing by a noisy open beam."""
     from scipy.special import expi
     mu = np.maximum(np.asarray(mu, dtype=np.float64), 1e-3)
     out = (1 + 1 / mu + 2 / mu ** 2 + 6 / mu ** 3).reshape(-1)
     m = mu.reshape(-1)
-    exact, few = m <= 400, m < 40                   # from 40 counts a zero has probability below 5e-18
+    exact, few = m <= 400, m < 40
     out[exact] = m[exact] * np.exp(-m[exact]) * (expi(m[exact]) - np.euler_gamma - np.log(m[exact]))
     p0 = np.exp(-m[few])
     cdf = p0[:, None] * (1 + np.cumsum(np.cumprod(m[few, None] / np.arange(1, 81), axis=1), axis=1))
-    median = 1 + np.argmax(cdf >= (1 + p0[:, None]) / 2, axis=1)                  # of S given S > 0
+    median = 1 + np.argmax(cdf >= (1 + p0[:, None]) / 2, axis=1)                  # Median of S given S > 0.
     out[few] += p0 * m[few] / median
     return out.reshape(mu.shape)
 
 
 def _smoothed_ratio_expectation(m, width, side=256, seed=0):
-    """E[m / O'] for a smoothed open beam: O' is a field of independent Poisson(m) pixels smoothed by the loader's
-    width x width window (see _smooth_open_beam), its zeros replaced by the median positive value as the loader
-    replaces them. By simulation on a side x side field, one level per entry of m, with a fixed seed; the standard
-    error is below 1% from m = 0.3 up."""
+    """This function returns E[m / O'], where O' is a smoothed open beam of Poisson(m) pixels.  It
+    estimates the value by a simulation with a fixed seed."""
     m = np.maximum(np.asarray(m, dtype=np.float64).ravel(), 1e-3)
     rng = np.random.default_rng(seed)
     out = np.empty(m.size)
@@ -196,13 +186,9 @@ def _smoothed_ratio_expectation(m, width, side=256, seed=0):
 
 
 def _expected_ratio(dose_per_bin, n_obs, smoothing=None):
-    """(low, high): the range of the transmission a sample-free region reads at matched exposure through the ratio
-    of counts to the loader's open beam, the mean of n_obs observations (see _ratio_expectation, averaged over bins).
-    The open beam's expected summed count in a bin is known only through its median, n_obs * dose_per_bin, which after
-    the zero replacement lies within one count of it; the range covers the counts within one of the median. A smoothed
-    open beam (smoothing: its summary, n_obs its effective observations) is no Poisson count: its expectation is that
-    of independent pixels smoothed alike (see _smoothed_ratio_expectation) at the count that gives them its variance,
-    n_obs * dose_per_bin * sum(kernel**2). (1, 1) for an exact open beam (no observations) or an unknown dose."""
+    """This function returns (low, high), the expected range of transmission in a region with no
+    sample.  The range differs from 1 because the data are divided by a noisy open beam.  The function
+    returns (1, 1) for an exact open beam or an unknown dose."""
     if not n_obs or dose_per_bin is None:
         return 1.0, 1.0
     medians, weight = np.unique(n_obs * np.asarray(dose_per_bin, dtype=np.float64).ravel(), return_counts=True)
@@ -219,12 +205,9 @@ def _expected_ratio(dose_per_bin, n_obs, smoothing=None):
 
 def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0, dose_per_bin=None, chunk_elems=2**24,
                   smoothing=None):
-    """(level, low, high): the transmission of the most transparent regions, the 95th percentile of the per-pixel
-    means pooled over b x b blocks (b = 4 when the image allows), and the range a sample-free region reads at matched
-    exposure: the loader's expected ratio of counts to a noisy open beam (see _expected_ratio, from the dose per bin,
-    else the dose, and the open-beam smoothing's summary), widened by a margin of 0.03 plus five times the noise of a
-    block mean (from the bin-to-bin differences of the most transparent tenth of the pixel subsample sub, in blocks of
-    rows whose float64 values number about chunk_elems / 8), and by at least 0.05 below."""
+    """This function returns the tuple (level, low, high).  The value level is the transmission of
+    the most transparent regions.  The values low and high bound the expected transmission in a
+    region with no sample, with a margin for noise."""
     V, rows, cols = spatial_shape
     b = 4 if rows >= 16 and cols >= 16 else 1
     m = pixel_means.reshape(V, rows, cols)[:, :rows // b * b, :cols // b * b]
@@ -248,8 +231,7 @@ def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0, dose_per_
 
 
 def _checks_from_summary(sm, spatial_shape):
-    """The standard data checks for a summary (from _summary_from_T or the conversion's accumulators), as a list of
-    Check."""
+    """This function returns the standard data checks for a summary as a list of ``Check`` objects."""
     st, c = sm["stats"], []
     P, K = sm["pixels"], sm["bins"]
     c.append(Check("ok", f"{P:,} pixels x {K:,} bins ({spatial_shape[0]} view(s) x {spatial_shape[1]} x "
@@ -329,18 +311,21 @@ def _checks_from_summary(sm, spatial_shape):
 
 
 def _natural_key(name):
-    """Sort key that orders the digit runs of a name by value, so img_2 precedes img_19."""
+    """This function returns a sort key that orders runs of digits by value.  For example,
+    img_2 comes before img_19."""
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
 
 
 def _tif_names(directory):
-    """.tif/.tiff paths in a directory in natural order, in any letter case (a glob for *.tif misses .TIF on Linux)."""
+    """This function lists the .tif and .tiff paths in a directory in natural order.  The
+    extension match ignores case."""
     names = [f for f in os.listdir(directory) if f.lower().endswith((".tif", ".tiff"))]
     return [os.path.join(directory, f) for f in sorted(names, key=_natural_key)]
 
 
 def _tif_files(directory):
-    """(files, None) for a directory of TIFFs, or (None, subdirectories) for a directory of TIFF directories."""
+    """This function returns (files, None) for a directory of TIFF files.  It returns
+    (None, subdirs) for a directory of TIFF subdirectories."""
     files = _tif_names(directory)
     if not files:
         subdirs = [os.path.join(directory, d) for d in sorted(os.listdir(directory), key=_natural_key)
@@ -360,7 +345,8 @@ def _tif_files(directory):
 
 
 def _open_beam_dirs(paths):
-    """The open-beam stacks named by paths; a directory of observation subdirectories expands to all of them."""
+    """This function returns the open beam stacks in paths.  It replaces a directory of
+    observation subdirectories by those subdirectories."""
     dirs = []
     for p in paths:
         files, subdirs = _tif_files(p)
@@ -369,9 +355,9 @@ def _open_beam_dirs(paths):
 
 
 class _TiffBlocks:
-    """Bins k0:k1 of a TIFF stack (one image per bin) as (views, rows, cols, k1 - k0) float32, decoded in parallel. With
-    multi_view, a directory of view subdirectories, each such a stack with the same images, is read as the views (views
-    selects a range of them); otherwise one directory is one view."""
+    """This class is used to read bins k0:k1 of a TIFF stack as float32 with shape (views, rows,
+    cols, k1 - k0).  The stack has one image per bin.  With multi_view, each subdirectory is one
+    view."""
 
     def __init__(self, directory, wave_range, downsample, workers, desc, views=None, multi_view=False):
         import tifffile
@@ -414,8 +400,8 @@ class _TiffBlocks:
         return len(self.files)
 
     def read(self, k0, k1, full=False):
-        """Bins k0:k1 as (views, rows, cols, bins) float32 at the sampled pixels, or with full at full resolution and
-        not copied into that order (the images stay contiguous)."""
+        """This method returns bins k0:k1 as float32 with shape (views, rows, cols, bins).  It
+        returns the downsampled pixels, or all pixels if full is True."""
         import tifffile
         stack = []
         for files in self.view_files:
@@ -437,7 +423,7 @@ class _TiffBlocks:
 
 
 class _Hdf5Blocks:
-    """Bins k0:k1 of an HDF5 dataset in the hsnt layout as (views, rows, cols, k1 - k0) float32."""
+    """This class is used to read bins k0:k1 of an hsnt HDF5 dataset as float32 blocks."""
 
     def __init__(self, path, dataset, views, wave_range, downsample):
         import h5py
@@ -461,13 +447,13 @@ class _Hdf5Blocks:
         per_bin = g["open_beam_dose"][()] if "open_beam_dose" in g and g["open_beam_dose"].shape == source.shape \
             else None
         self.file_dose_per_bin = None if per_bin is None else np.asarray(per_bin, dtype=np.float64)[ks.start:ks.stop]
-        dose = attrs.get("dose")                                               # per file column; -1 when unknown
+        dose = attrs.get("dose")                                               # Per file column, or -1 if unknown.
         self.file_dose = float(dose) if dose is not None and float(dose) > 0 else None
         if self.file_dose is not None and self.file_dose_per_bin is not None and 0 < len(ks) < len(source):
-            self.file_dose = float(np.median(self.file_dose_per_bin))          # that of the selected columns
+            self.file_dose = float(np.median(self.file_dose_per_bin))          # The dose of the selected columns.
         self.file_observations = float(attrs.get("open_beam_observations", 0))
-        self.file_wave_bin = max(1, int(attrs.get("wave_bin", 1)))                 # source bins per column
-        self.file_background = _json_attr(attrs, "background")                     # recorded by convert
+        self.file_wave_bin = max(1, int(attrs.get("wave_bin", 1)))                 # Source bins per column.
+        self.file_background = _json_attr(attrs, "background")                     # Written by convert_to_hdf5.
         self.file_smoothing = _json_attr(attrs, "open_beam_smoothing")
         self.file_metadata = {k: g[k][()] for k in ALLOWED_KEYS
                               if k in g and k not in ("dataset_type", "dataset_modality")}
@@ -479,7 +465,8 @@ class _Hdf5Blocks:
                  d.chunks)
 
     def read(self, k0, k1, full=False):
-        """Bins k0:k1 as (views, rows, cols, bins) float32, at the sampled pixels or, with full, at full resolution."""
+        """This method returns bins k0:k1 as float32 with shape (views, rows, cols, bins).  It
+        returns the downsampled pixels, or all pixels if full is True."""
         a = self.d[(self.sel_full if full else self.sel) + (slice(self.first_index + k0, self.first_index + k1),)]
         if self.d.ndim == 3:
             a = a[None]
@@ -492,7 +479,8 @@ class _Hdf5Blocks:
 
 
 def _json_attr(attrs, key):
-    """A JSON-encoded attribute as a dict, or None when absent or not JSON."""
+    """This function returns a JSON-encoded attribute as a dict.  It returns None if the attribute
+    is absent or is not a JSON dict."""
     try:
         v = json.loads(_decode(attrs[key])) if key in attrs else None
     except (TypeError, ValueError):
@@ -501,7 +489,8 @@ def _json_attr(attrs, key):
 
 
 def _file_source_bins(g, n_columns):
-    """The source bin of each column of an HDF5 dataset: its bin_indices when increasing, else the column index."""
+    """This function returns the source bin of each column.  It returns bin_indices if they are
+    increasing.  Otherwise it returns the column indices."""
     if "bin_indices" in g and g["bin_indices"].shape == (n_columns,):
         b = np.asarray(g["bin_indices"][()], dtype=np.int64)
         if n_columns < 2 or bool(np.all(np.diff(b) > 0)):
@@ -511,8 +500,8 @@ def _file_source_bins(g, n_columns):
 
 
 def _columns_in_range(source_bins, wave_range):
-    """The contiguous range of columns whose source bin lies in wave_range, a (start, stop) slice over the source bins
-    0 .. max(source_bins); None selects every column."""
+    """This function returns the range of columns whose source bin lies in wave_range.  If
+    wave_range is None, it returns every column."""
     if not wave_range:
         return range(len(source_bins))
     lo, hi, _ = slice(*wave_range).indices(int(source_bins[-1]) + 1 if len(source_bins) else 0)
@@ -520,8 +509,8 @@ def _columns_in_range(source_bins, wave_range):
 
 
 def _selected_metadata(meta, views, wave_cols, wave_bin, downsample):
-    """hsnt metadata matched to a selection: angles by view, wavelengths by column (averaged over each bin group),
-    and the detector spacings times the downsampling."""
+    """This function returns the hsnt metadata adjusted to a selection of views and columns and to
+    the downsampling."""
     out = {}
     for k, v in meta.items():
         v = _decode(v)
@@ -539,7 +528,7 @@ def _selected_metadata(meta, views, wave_cols, wave_bin, downsample):
 
 
 def _open_source(path, dataset, views, wave_range, downsample, workers, open_beam):
-    """The block reader for an input path (a TIFF directory or an HDF5 file)."""
+    """This function returns the block reader for a TIFF directory or an HDF5 file."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"input not found: {path}")
     if os.path.isdir(path):
@@ -560,7 +549,8 @@ def _open_source(path, dataset, views, wave_range, downsample, workers, open_bea
 
 
 def _open_beam_blocks(paths, wave_range, downsample, workers, sample):
-    """One block reader per open-beam observation, checked against the sample's geometry."""
+    """This function opens each open beam observation.  It checks that each observation has the
+    same shape as the sample."""
     obs = [_TiffBlocks(d, wave_range, downsample, workers, desc=f"open beam {os.path.basename(d)}")
            for d in _open_beam_dirs(paths)]
     for o in obs:
@@ -571,7 +561,8 @@ def _open_beam_blocks(paths, wave_range, downsample, workers, sample):
 
 
 def _open_beam_mean(obs, k0, k1):
-    """The mean over open-beam observations of bins k0:k1, as (pixels, bins), or None without observations."""
+    """This function returns the mean open beam of bins k0:k1 with shape (pixels, bins).  It
+    returns None if there is no open beam."""
     ob = None
     for o in obs:
         blk = o.read(k0, k1)
@@ -587,18 +578,19 @@ def _open_beam_mean(obs, k0, k1):
 
 @dataclass
 class _Background:
-    """Sample-free boxes that calibrate the transmission of each detector tile, per bin (see _background)."""
+    """This class is used to hold the boxes with no sample that calibrate each detector tile in
+    each bin."""
     name: str
-    boxes: tuple                        # (y0, y1, x0, x1) in full-resolution pixels
-    tiles: tuple                        # (tile rows, tile cols)
-    box_tile: np.ndarray                # the tile of each box
-    pixel_tile: np.ndarray              # the tile of each sampled pixel of a view, in row-major order
+    boxes: tuple                        # (y0, y1, x0, x1) in full-resolution pixels.
+    tiles: tuple                        # (tile rows, tile cols).
+    box_tile: np.ndarray                # The tile of each box.
+    pixel_tile: np.ndarray              # The tile of each downsampled pixel of a view, in row-major order.
 
 
 def _background(spec, tiles, src, downsample):
-    """The background calibration from a preset name or a list of (y0, y1, x0, x1) boxes in full-resolution pixels,
-    and a (tile rows, tile cols) grid of detector regions calibrated separately (default: the preset's, else one).
-    Each box calibrates the tile holding its center, and every tile needs a box. None without a spec."""
+    """This function returns the background calibration from a preset name or from a list of
+    boxes.  Each box is (y0, y1, x0, x1) in full-resolution pixels.  If spec is None, the function
+    returns None.  Each tile of the detector must contain a box."""
     if spec is None:
         if tiles is not None:
             raise InputError("background tiles need background boxes (--background-boxes)")
@@ -636,8 +628,8 @@ def _background(spec, tiles, src, downsample):
 
 
 def _box_sums(full, boxes, attenuation=False):
-    """(views, boxes, bins) float64 sums over each box of a full-resolution block (views, rows, cols, bins), of the
-    transmission for attenuation data; non-finite values count as zero."""
+    """This function returns the float64 sum over each box of a full-resolution block.  The result
+    has shape (views, boxes, bins)."""
     sums = []
     for y0, y1, x0, x1 in boxes:
         box = full[:, y0:y1, x0:x1]
@@ -649,16 +641,16 @@ def _box_sums(full, boxes, attenuation=False):
 
 
 def _smoothing_kernel(width):
-    """The open-beam smoothing window: the normalized square root of the outer product of a Hamming window of odd
-    width, the filter of the ORNL SNAP preprocessing."""
+    """This function returns the 2D window that smooths the open beam.  The window is the square
+    root of the outer product of a Hamming window with itself, normalized to sum to 1."""
     h = np.hamming(width)
     k = np.sqrt(np.outer(h, h))
     return k / k.sum()
 
 
 def _open_beam_total(obs, bins, block):
-    """The open beam's summed count per full-resolution pixel (views, rows, cols), over the source bins 0:bins of
-    every observation, read in blocks of bins; values <= 0 count as zero."""
+    """This function returns the open beam count summed over the selected bins, for each
+    full-resolution pixel.  The result has shape (views, rows, cols)."""
     total = None
     for k0 in range(0, bins, block):
         for o in obs:
@@ -668,10 +660,8 @@ def _open_beam_total(obs, bins, block):
 
 
 def _dead_mask(total):
-    """The dead detector pixels of an open beam, (views, rows, cols, 1), from its summed count per pixel over the
-    selected bins (see _open_beam_total): those with none, or less than _OPEN_BEAM_FLOOR of the median. A live pixel of c expected counts has none with probability
-    e^-c, so they are told apart only when the median pixel's count is at least 20 (a probability below 2.1e-9); None
-    when no pixel is dead or the counts are too few to tell."""
+    """This function returns a mask of the dead detector pixels of an open beam, with shape (views,
+    rows, cols, 1).  It returns None if no pixel is dead or if the counts are too low to tell."""
     if total is None:
         return None
     dead = total <= _OPEN_BEAM_FLOOR * np.median(total)
@@ -685,16 +675,12 @@ def _dead_mask(total):
 
 
 def _smooth_open_beam(full, width, dead=None):
-    """Smooth a full-resolution open beam (views, rows, cols, bins) image by image, mirrored at the edges. The window
-    is separable, the outer product of the normalized square root of the Hamming window with itself. The dead pixels
-    (a mask that broadcasts to the image, see _dead_mask) are left out: the window is renormalized over the rest, so
-    they neither lower their neighbors nor stay zero unless their whole neighborhood is. A zero count of a live pixel
-    stays in, since leaving out the zeros of an open beam of lam counts would raise it by 1 / (1 - e^-lam); so the
-    mask comes from every selected bin, not from the bins at hand."""
+    """This function smooths a full-resolution open beam with shape (views, rows, cols, bins).  It
+    smooths each image separately and leaves out the dead pixels."""
     from scipy.ndimage import correlate1d
     w = np.sqrt(np.hamming(width))
     w /= w.sum()
-    order = np.argsort(full.strides, kind="stable")[::-1]              # filter in memory order, which is far faster
+    order = np.argsort(full.strides, kind="stable")[::-1]              # The filter runs in memory order.
     rows, cols = int(np.flatnonzero(order == 1)[0]), int(np.flatnonzero(order == 2)[0])
 
     def smooth(a):
@@ -703,16 +689,15 @@ def _smooth_open_beam(full, width, dead=None):
 
     if dead is None or not dead.any():
         return smooth(full)
-    weight = smooth(np.broadcast_to(~dead, full.shape[:-1] + (1,)).astype(np.float32))    # one per pixel, every bin
+    # The weight has one value per pixel, shared by all bins.
+    weight = smooth(np.broadcast_to(~dead, full.shape[:-1] + (1,)).astype(np.float32))
     out = smooth(np.where(dead, np.float32(0), full))
     return np.where(weight > 1e-6, out / np.maximum(weight, 1e-6), np.float32(0)).astype(np.float32)
 
 
 def _smoothing_variances(images, width, dead=None):
-    """(raw, smoothed): the variance across observations, summed over pixels, of full-resolution images
-    (observations, views, rows, cols, bins) before and after smoothing (leaving out the dead pixels, a (views, rows,
-    cols, 1) mask), each observation scaled to the mean exposure. Their ratio is the smoothing's variance reduction,
-    which is sum(kernel**2) only when the pixels' noise is independent."""
+    """This function returns (raw, smoothed), the variance across observations before and after
+    smoothing.  The ratio smoothed / raw is the variance reduction from smoothing."""
     n = images.shape[0]
     x = images.astype(np.float32).reshape(n * images.shape[1], *images.shape[2:])
     scale = x.reshape(n, -1).mean(1, dtype=np.float64)
@@ -724,11 +709,8 @@ def _smoothing_variances(images, width, dead=None):
 
 
 def _read_block(src, obs, itype, k0, k1, downsample, smoothing, background, dead=None):
-    """The inputs of bins k0:k1: the sample and the open-beam mean at the sampled pixels as (pixels, bins); with
-    background boxes the full-resolution box sums of both (views, boxes, bins), counts for counts and transmission for
-    transmission or attenuation data; and with smoothing and several observations the variance across them of the
-    block's first bins before and after smoothing (see _smoothing_variances). Smoothing applies to the open beam at full
-    resolution and leaves out the dead pixels (see _dead_mask)."""
+    """This function reads bins k0:k1 of the sample and of the mean open beam at the downsampled
+    pixels.  It also returns the box sums and the smoothing variances when they are needed."""
     P = src.views * src.rows * src.cols
     if background is None:
         a, box_a = src.read(k0, k1).reshape(P, k1 - k0), None
@@ -742,7 +724,7 @@ def _read_block(src, obs, itype, k0, k1, downsample, smoothing, background, dead
     if not smoothing and background is None:
         return a, _for_views(_open_beam_mean(obs, k0, k1), src.views), box_a, None, None
     ob, first = None, []
-    n_var = min(k1 - k0, max(1, 2**18 // int(np.prod(src.full_shape))))         # bins measured per block
+    n_var = min(k1 - k0, max(1, 2**18 // int(np.prod(src.full_shape))))         # Bins per block used for the variances.
     for o in obs:
         blk = o.read(k0, k1, full=True)
         if smoothing and len(obs) > 1:
@@ -758,14 +740,13 @@ def _read_block(src, obs, itype, k0, k1, downsample, smoothing, background, dead
 
 
 def _for_views(ob, views):
-    """The open beam of one view (pixels, bins) repeated for every view of the sample, which share it."""
+    """This function repeats the open beam of one view, with shape (pixels, bins), for every view."""
     return ob if views == 1 else np.tile(ob, (views, 1))
 
 
 def _tile_factors(box_a, box_ob, itype, wave_bin, background):
-    """The transmission of each tile's boxes per grouped bin, (views, tiles, bins): the ratio of their summed counts to
-    their summed open beam for counts (the ratio estimator the Poisson model calls for), their mean transmission
-    otherwise. A bin whose boxes hold no signal keeps factor 1."""
+    """This function returns the transmission of the boxes of each tile in each grouped bin.  The
+    result has shape (views, tiles, bins).  A bin whose boxes hold no signal gets factor 1."""
     n_tiles = background.tiles[0] * background.tiles[1]
     npix = np.array([(y1 - y0) * (x1 - x0) for y0, y1, x0, x1 in background.boxes], dtype=np.float64)
     num = _bin_spectral(box_a, wave_bin, "sum")
@@ -779,8 +760,8 @@ def _tile_factors(box_a, box_ob, itype, wave_bin, background):
 
 
 def _apply_background(T, factors, background, views):
-    """Divide each tile's transmission by its factor, per view and grouped bin, in place; returns the pixel-weighted
-    mean factor per bin (bins,), which scales the dose to the sample's exposure."""
+    """This function divides the transmission of each tile by its factor, in place.  It returns the
+    mean factor in each bin, weighted by the number of pixels in each tile."""
     P, Kb = T.shape
     per_view = P // views
     tile = np.tile(background.pixel_tile, views)
@@ -791,11 +772,9 @@ def _apply_background(T, factors, background, views):
 
 
 def _transmission_blocks(src, obs, itype, wave_bin, block, downsample, smoothing, background, dead=None):
-    """Yield (j0, j1, T, dose, info, factors) for successive blocks of grouped bins: the transmission (pixels, bins)
-    after the optional open-beam smoothing (leaving out the dead pixels) and background calibration, the block's
-    open-beam dose, the conversion notes (with 'dose_per_bin', when calibrated 'mean_factor' per bin, and when smoothed
-    with several observations 'smoothing_variances'), and the tile factors (views, tiles, bins) or None. The next block
-    is read while the caller processes this one."""
+    """This function yields (j0, j1, T, dose, info, factors) for successive blocks of grouped bins.
+    It applies the open beam smoothing and the background calibration.  A second thread reads the
+    next block while the caller processes the current one."""
     nb = src.bins
     starts = [k0 for k0 in range(0, nb - nb % wave_bin, block) if min(k0 + block, nb) // wave_bin * wave_bin > k0]
 
@@ -823,7 +802,8 @@ def _transmission_blocks(src, obs, itype, wave_bin, block, downsample, smoothing
 
 
 def _check_smoothing(width, obs):
-    """The open-beam smoothing width: 0 (none) or an odd width of at least 3, with an open beam to smooth."""
+    """This function checks and returns the smoothing width.  The width must be 0, which means no
+    smoothing, or an odd number of at least 3."""
     width = int(width or 0)
     if width and (width < 3 or width % 2 == 0):
         raise InputError(f"the open-beam smoothing width must be odd and at least 3, got {width}")
@@ -834,7 +814,8 @@ def _check_smoothing(width, obs):
 
 
 def _background_summary(background, factors, mean_factor):
-    """What the calibration found, for the checks, the report and the converted file's attributes."""
+    """This function returns a summary of the calibration for the checks, the report, and the file
+    attributes."""
     out = dict(name=background.name, boxes=[list(b) for b in background.boxes], tiles=list(background.tiles),
                factor_median=float(np.median(mean_factor)),
                tile_medians=[float(np.median(factors[:, t])) for t in range(factors.shape[1])],
@@ -845,7 +826,8 @@ def _background_summary(background, factors, mean_factor):
 
 
 def _resolve_input_type(input_type, src, probe, open_beam):
-    """The input type (given, from the file's dataset_type, or inferred from a probe of the values) and why."""
+    """This function returns the input type and the reason for it.  The type is given, read from
+    the file, or inferred from the data."""
     if input_type != "auto":
         if src.file_type and src.file_type != input_type:
             warnings.warn(f"the given input type {input_type} overrides the file's dataset_type {src.file_type!r}")
@@ -869,7 +851,8 @@ def _resolve_input_type(input_type, src, probe, open_beam):
 
 
 def _bin_spectral(a, n, how):
-    """Group n adjacent bins along the last axis ('sum' for counts, 'mean' for transmissions)."""
+    """This function combines each group of n adjacent bins.  It sums the group if how is 'sum'
+    and averages it otherwise."""
     if n <= 1:
         return a
     K = a.shape[-1] // n * n
@@ -878,16 +861,13 @@ def _bin_spectral(a, n, how):
 
 
 def _stack_to_transmission(a, input_type, open_beam=None, wave_bin=1):
-    """Convert (pixels, bins) values of the given type to a transmission ratio, binning bins if asked.
-
-    Returns (T, dose, info). Open-beam entries that hold no count (_no_open_beam_count) take the bin's median open
-    beam; every non-finite transmission becomes zero and negative ones are clipped at zero, as for the arrays dehydrate
-    takes (info records the shares, 'nonfinite_frac' and 'negative_frac').
-    """
+    """This function converts (pixels, bins) values of the given type to a transmission ratio.  It
+    groups adjacent bins if wave_bin > 1.  It returns the tuple (T, dose, info)."""
     info = {}
     if input_type == "counts":
         counts, ob = _bin_spectral(a, wave_bin, "sum"), _bin_spectral(open_beam, wave_bin, "sum")
-        stride = max(1, ob.shape[0] // 8192)                                       # medians on a pixel subsample
+        # The medians are computed on a subsample of pixels.
+        stride = max(1, ob.shape[0] // 8192)
         bad = _no_open_beam_count(ob, stride)
         if bad.any():
             info["open_beam_zero_frac"] = _frac(bad)
@@ -902,19 +882,21 @@ def _stack_to_transmission(a, input_type, open_beam=None, wave_bin=1):
         T, dose = _bin_spectral(a, wave_bin, "mean"), None
     elif input_type == "attenuation":
         with np.errstate(over="ignore", invalid="ignore"):
-            T = np.exp(-a.astype(np.float32, copy=False))     # +inf, as convert stores zero transmission, gives 0
-        info.update(_clean_transmission(T))                 # before binning, so that a NaN does not spoil its group
+            T = np.exp(-a.astype(np.float32, copy=False))     # convert_to_hdf5 stores T = 0 as +inf.
+        # T is cleaned before binning, so a NaN does not spread to its group.
+        info.update(_clean_transmission(T))
         return _bin_spectral(T, wave_bin, "mean"), None, info
     else:
         raise InputError(f"unknown input type {input_type!r}")
-    T = T.astype(np.float32)                                # a copy: the block can be the reader's array
+    # This copy is needed because the block can be the reader's array.
+    T = T.astype(np.float32)
     info.update(_clean_transmission(T))
     return T, dose, info
 
 
 def _no_open_beam_count(ob, stride):
-    """The entries of an open beam (pixels, bins) that hold no count: those at most zero, and those below
-    _OPEN_BEAM_FLOOR of their bin's median positive value over the pixels ob[::stride]."""
+    """This function returns a mask of the open beam entries that count as zero.  An entry counts
+    as zero if it is at most zero or below ``_OPEN_BEAM_FLOOR`` times the median of its bin."""
     bad = ob <= 0
     med = np.nanmedian(np.where(bad[::stride], np.nan, ob[::stride]), axis=0)
     return bad | (ob < _OPEN_BEAM_FLOOR * np.nan_to_num(med, nan=0.0)[None, :])
@@ -929,7 +911,8 @@ def _warn_conversion(info):
 
 
 def _check_host_memory(n_bytes, what):
-    """Refuse an allocation the host cannot hold, and warn about one that takes most of it."""
+    """This function raises MemoryError if an allocation exceeds the available CPU memory.  It
+    warns if the allocation exceeds half of the available memory."""
     import psutil
     avail = psutil.virtual_memory().available
     if n_bytes > avail:
@@ -941,9 +924,8 @@ def _check_host_memory(n_bytes, what):
 
 
 def _merge_dose(dose, estimate, src, wave_bin):
-    """The dose per grouped bin: the given one (per source bin, so times the source bins in a grouped bin: wave_bin
-    times those in a column of a converted file), checked against the open-beam estimate or the open-beam dose an
-    HDF5 input records, else the estimate, else the dose an HDF5 input records (per file column, times wave_bin)."""
+    """This function returns the dose per grouped bin.  The dose comes from the given dose, the open
+    beam estimate, or the dose recorded in an HDF5 input."""
     if dose is None:
         return estimate if estimate is not None or src.file_dose is None else src.file_dose * wave_bin
     if estimate is None and src.file_dose is not None:
@@ -955,12 +937,10 @@ def _merge_dose(dose, estimate, src, wave_bin):
 
 
 def _check_given_dose(dose, src):
-    """Warn when a given dose (per source bin) differs by more than 50% from the open-beam dose an HDF5 input
-    records, or, with a recorded calibration, lies nearer the recorded dose, which is scaled to the sample run's
-    exposure, than the open beam's: a given dose is the open beam's and is scaled by the calibration, so the scaled
-    dose inspect prints would be scaled twice."""
+    """This function warns if a given dose differs by more than 50% from the open beam dose recorded
+    in an HDF5 input."""
     factor = src.file_background["factor_median"] if src.file_background is not None else 1.0
-    open_beam = src.file_dose / factor / src.file_wave_bin                 # per source bin, before the calibration
+    open_beam = src.file_dose / factor / src.file_wave_bin                 # Per source bin, before the calibration.
     scaled = open_beam * factor
     note = (f" (the file's dose over its calibration factor {factor:.4f}): --dose is the open beam's count, which the "
             "calibration scales, so the scaled dose inspect prints would be scaled twice") if factor != 1.0 else ""
@@ -973,7 +953,8 @@ def _check_given_dose(dose, src):
 
 
 def _dose_per_bin(dose, estimate, src, wave_bin):
-    """The open beam's count in each grouped bin: measured here, or recorded by convert; None when a dose is given."""
+    """This function returns the open beam count per grouped bin.  It returns None if the dose is
+    given."""
     if dose is not None:
         return None
     if estimate is not None:
@@ -982,8 +963,8 @@ def _dose_per_bin(dose, estimate, src, wave_bin):
 
 
 def _probe_type(input_type, src, open_beam):
-    """The input type, from the arguments, the file, the open beam, or else 16 bins spread across the selected
-    range."""
+    """This function returns the input type.  It takes the type from the arguments, the file, or the
+    open beam, or it infers the type from 16 sampled bins."""
     known = input_type != "auto" or src.file_type in ("attenuation", "transmission") or \
         (open_beam and isinstance(src, _TiffBlocks))
     probe = None if known else np.concatenate(
@@ -995,14 +976,14 @@ def _probe_type(input_type, src, open_beam):
 
 
 def _open_beam_dose(per_bin):
-    """The open-beam dose: the median over bins of each bin's median open beam, whatever the blocks of bins, as a range
-    of a converted file takes it from the per-bin dose it records; None without an open beam."""
+    """This function returns the open beam dose, which is the median over bins of the per-bin
+    median open beam.  It returns None if there is no open beam."""
     return None if per_bin is None else float(np.median(per_bin))
 
 
 def _smoothing_dead_mask(obs, smoothing, src, wave_bin, block):
-    """The dead pixels the open-beam smoothing leaves out (see _dead_mask), from every observation over every bin
-    the load keeps; None without smoothing."""
+    """This function returns the mask of dead pixels that the open beam smoothing leaves out.  It
+    returns None if there is no smoothing."""
     if not smoothing:
         return None
     t0 = time.perf_counter()
@@ -1013,9 +994,8 @@ def _smoothing_dead_mask(obs, smoothing, src, wave_bin, block):
 
 
 def _ratio_dose(per_bin, dose, src, itype, wave_bin):
-    """The open-beam dose per bin at which the loaded transmission's ratio bias arises, for the bright check: the dose
-    per bin (or the dose), except for a transmission or attenuation input grouped by wave_bin, whose grouped T is the
-    mean of its columns' ratios and so carries their bias: the dose of each column."""
+    """This function returns the open beam dose per bin.  The check of the most transparent regions
+    uses this dose to predict the bias from dividing by a noisy open beam."""
     if itype == "counts" or wave_bin == 1:
         return per_bin
     if per_bin is not None:
@@ -1024,10 +1004,8 @@ def _ratio_dose(per_bin, dose, src, itype, wave_bin):
 
 
 def _effective_observations(n_obs, smoothing, variances, dead=None):
-    """The open beam's observations over the smoothing's variance reduction, and a summary of the smoothing (None
-    without it), with the dead pixels it left out. The reduction is measured across the observations when there are
-    several (variances: summed raw and smoothed variances); with one it is that of independent pixels,
-    sum(kernel**2)."""
+    """This function returns the effective number of open beam observations after smoothing.  It
+    also returns a summary of the smoothing."""
     if not smoothing or not n_obs:
         return n_obs, None
     independent = float((_smoothing_kernel(smoothing) ** 2).sum())
@@ -1039,9 +1017,9 @@ def _effective_observations(n_obs, smoothing, variances, dead=None):
 
 
 def _calibrated(dose, per_bin, n_eff, background, factor_parts, mean_factor):
-    """With a background calibration: its summary, and the dose, per-bin dose and effective open-beam observations in
-    units of the sample run's exposure (the observations shrink as the dose grows, so their product stays the open
-    beam's count, the noise model's open-beam term). Without one: (None, dose, per_bin, n_eff)."""
+    """This function returns the calibration summary, the dose, the per-bin dose, and the effective
+    number of open beam observations.  When there is a background calibration, it scales these
+    values to the exposure of the sample run."""
     if background is None:
         return None, dose, per_bin, n_eff
     bg = _background_summary(background, np.concatenate(factor_parts, axis=2), mean_factor)
@@ -1057,47 +1035,51 @@ def _sum_variances(parts):
 def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=None, views=None, wave_range=None,
                  wave_bin=1, downsample=1, workers=None, background_boxes=None, background_tiles=None,
                  open_beam_smoothing=0, memory_budget_mib=512):
-    """Load a TIFF stack or an hsnt HDF5 file as a transmission ratio, with the data checks.
+    """This function loads a TIFF stack or an hsnt HDF5 file as a transmission ratio and runs the
+    data checks.
 
-    The stack is read in blocks of bins and checked in blocks of pixels; memory holds the result and about
-    memory_budget_mib of working set.
+    The function reads the data in blocks of bins.  So the memory use is the size of the result
+    plus about memory_budget_mib.
 
     Args:
-        path (str): A directory of one TIFF per wavelength bin (or of such directories, one per view), or an HDF5
-            file in the hsnt layout.
-        open_beam (list of str, optional): Open-beam TIFF stack(s) for a stack of counts; a directory of observation
-            subdirectories is averaged over them. Defaults to None.
-        input_type (str, optional): 'counts', 'transmission', 'attenuation' or 'auto' (the file's dataset_type, else
-            inferred from the values). Defaults to 'auto'.
-        dataset (str, optional): HDF5 group holding 'data'. Defaults to None: the root, or the only group with one.
-        dose (float, optional): Open-beam counts per pixel and source bin, overriding the open-beam estimate and the
-            dose an HDF5 input records. The loaded dose is per grouped bin: this times wave_bin and times the source
-            bins in a column of a converted file, and with a background calibration (here or recorded at conversion)
-            scaled to the sample run's exposure. Defaults to None.
-        views (tuple, optional): (start, stop) of the views of 4-D HDF5 data or of a directory of view directories.
-            Defaults to None, all views.
-        wave_range (tuple, optional): (start, stop) over the source bins. Defaults to None, all bins.
-        wave_bin (int, optional): Group this many adjacent bins. Defaults to 1.
-        downsample (int, optional): Keep every n-th row and column. Defaults to 1.
-        workers (int, optional): Threads decoding TIFF images. Defaults to None, min(8, CPUs).
-        background_boxes (str or list, optional): Sample-free boxes (y0, y1, x0, x1) in full-resolution pixels, or the
-            name of an instrument preset ('ornl-snap': ORNL SNAP's four corner boxes, one per chip). In each bin,
-            each detector tile's transmission is divided by that of its boxes (for counts, their summed counts over
-            their summed open beam), which corrects a sample run and an open beam of different exposure; the dose
-            becomes the sample's. Defaults to None, no calibration.
-        background_tiles (tuple, optional): (rows, cols) of detector tiles calibrated separately, each by the boxes
-            whose centers it holds. Defaults to None: the preset's, else (1, 1).
-        open_beam_smoothing (int, optional): Smooth the averaged open beam per bin, at full resolution, with a
-            width x width window (odd, at least 3), the normalized square root of the outer product of two Hamming
-            windows, leaving out the pixels with no count in any selected bin of any observation (see _dead_mask);
-            the noise model counts the smoothed open beam as more observations, by the variance reduction
-            measured across the observations; with one observation it is taken as that of independent pixels, which
-            overstates the observations on a detector with correlated noise (SNAP's is). Defaults to 0, none.
-        memory_budget_mib (float, optional): Working memory for the blocks of bins and of the checks, in MiB.
-            Defaults to 512.
+        path (str): A TIFF directory or an HDF5 file in the hsnt format.  A TIFF directory holds
+            one TIFF per wavelength bin, or one such subdirectory per view.
+        open_beam (list of str, optional): The open beam TIFF stacks for a stack of counts.  The
+            function averages the subdirectories of a directory of observations.  Defaults to
+            None.
+        input_type (str, optional): 'counts', 'transmission', 'attenuation', or 'auto'.  With
+            'auto', the function uses the dataset_type in the file, or else infers the type from
+            the values.  Defaults to 'auto'.
+        dataset (str, optional): The HDF5 group that holds 'data'.  None means the root, or the
+            only group that holds 'data'.  Defaults to None.
+        dose (float, optional): The open beam counts per pixel and source bin.  This value
+            replaces the estimate.  The function multiplies it by the number of source bins per
+            group.  With a background calibration, the function also scales it to the exposure
+            of the sample run.  Defaults to None.
+        views (tuple, optional): The (start, stop) range of the views.  None means all views.
+            Defaults to None.
+        wave_range (tuple, optional): The (start, stop) range of the source bins.  None means all
+            bins.  Defaults to None.
+        wave_bin (int, optional): The number of adjacent bins in each group.  Defaults to 1.
+        downsample (int, optional): The function keeps every n-th row and column.  Defaults to 1.
+        workers (int, optional): The number of threads that decode TIFF images.  None means
+            min(8, CPUs).  Defaults to None.
+        background_boxes (str or list, optional): Boxes that contain no sample, or a preset name
+            such as 'ornl-snap'.  Each box is (y0, y1, x0, x1) in full-resolution pixels.  The
+            function divides the transmission of each detector tile by the transmission of its
+            boxes.  This corrects for a sample run and an open beam with different exposures.
+            Defaults to None.
+        background_tiles (tuple, optional): The (rows, cols) of the detector tiles that are
+            calibrated separately.  None means the tiles of the preset, or else (1, 1).  Defaults
+            to None.
+        open_beam_smoothing (int, optional): The width of the window that smooths the open beam
+            in each bin.  The width must be odd and at least 3.  The smoothing leaves out dead
+            pixels.  The value 0 means no smoothing.  Defaults to 0.
+        memory_budget_mib (float, optional): The working memory in MiB.  Defaults to 512.
 
     Returns:
-        Dataset: the transmission ratio (pixels, bins) with its geometry, dose, checks and load information.
+        Dataset: The transmission ratio with shape (pixels, bins), together with its geometry,
+            dose, checks, and load information.
     """
     t0 = time.perf_counter()
     workers = workers or min(8, os.cpu_count() or 1)
@@ -1145,7 +1127,7 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         n_eff, sm_note = _effective_observations(len(obs), smoothing, _sum_variances(variances), dead)
         bg, merged, per_bin, n_eff = _calibrated(merged, per_bin, n_eff, background, factor_parts, mean_factor)
         if dose is not None and merged is not None and src.file_background is not None:
-            merged *= src.file_background["factor_median"]          # a given dose, to the exposure the file records
+            merged *= src.file_background["factor_median"]          # Scales a given dose to the exposure in the file.
         if bg is not None:
             info["background"] = bg
         elif src.file_background is not None:
@@ -1163,7 +1145,7 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
                                                  src.first_index + nb), wave_bin, downsample))
     finally:
         if blocks is not None:
-            blocks.close()                                  # stops the prefetch before the source closes
+            blocks.close()                                  # This stops the read-ahead thread before the source closes.
         src.close()
     smoothed = ds.info.get("open_beam_smoothing")
     sm = dict(_summary_from_T(ds.T, ds.dose, ds.spatial_shape, bg, ds.open_beam_observations,
@@ -1176,17 +1158,15 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
 
 
 def _bytes_per_bin(sample, n_obs, full=False):
-    """Working memory per bin of a block: two blocks are alive (the one processed and the one prefetched), each the
-    sample plus the open-beam mean, one observation is read at full resolution before downsampling, and the
-    transmission and the output block exist; smoothing or background boxes (full) also keep the sample and the
-    open-beam mean at full resolution."""
+    """This function returns the working memory in bytes for one bin of a block."""
     full_bytes = int(np.prod(sample.full_shape)) * sample.views * 4
     small = sample.rows * sample.cols * sample.views * 4
     return full_bytes * (2 + (3 if n_obs else 0) + (4 if full else 0)) + small * 4
 
 
 def _block_bins(sample, n_obs, wave_bin, budget_mib, requested, full=False):
-    """Bins per block: the largest multiple of wave_bin whose working set fits the budget, and at least one group."""
+    """This function returns the number of bins per block.  The number is a multiple of wave_bin
+    that fits within the memory budget."""
     if requested:
         block = max(wave_bin, requested // wave_bin * wave_bin)
     else:
@@ -1200,7 +1180,8 @@ def _block_bins(sample, n_obs, wave_bin, budget_mib, requested, full=False):
 
 
 def _converted_path(path):
-    """The default output of convert: <input stem>_converted.h5 beside the input, so it never replaces the input."""
+    """This function returns the default output path of ``convert_to_hdf5``.  The path is
+    <input stem>_converted.h5 in the directory of the input."""
     return os.path.splitext(os.path.normpath(path))[0] + "_converted.h5"
 
 
@@ -1208,20 +1189,21 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
                     wave_range=None, wave_bin=1, downsample=1, as_type="attenuation", block_bins=None,
                     memory_budget_mib=256, workers=None, progress=False, background_boxes=None,
                     background_tiles=None, open_beam_smoothing=0):
-    """Convert a TIFF stack or HDF5 file to an hsnt HDF5 file, streamed in blocks of bins.
-
-    Memory holds a few blocks, not the stack. The arguments of :func:`load_dataset` select and interpret the input.
+    """This function converts a TIFF stack or an HDF5 file to an hsnt HDF5 file.  It processes the
+    data in blocks of bins.  The other arguments are the same as in :func:`load_dataset`.
 
     Args:
-        output (str, optional): Output path, which must not be the input. Defaults to None,
-            <input stem>_converted.h5.
-        as_type (str, optional): Quantity stored, 'attenuation' or 'transmission'. Defaults to 'attenuation'.
-        block_bins (int, optional): Bins per block. Defaults to None, from memory_budget_mib.
-        memory_budget_mib (float, optional): Working memory for the blocks in MiB. Defaults to 256.
-        progress (bool, optional): Show a progress bar. Defaults to False.
+        output (str, optional): The output path, which must differ from the input.  None means
+            <input stem>_converted.h5.  Defaults to None.
+        as_type (str, optional): 'attenuation' or 'transmission'.  Defaults to 'attenuation'.
+        block_bins (int, optional): The number of bins per block.  None means a number set by
+            memory_budget_mib.  Defaults to None.
+        memory_budget_mib (float, optional): The working memory in MiB.  Defaults to 256.
+        progress (bool, optional): If True, the function shows a progress bar.  Defaults to
+            False.
 
     Returns:
-        (path, checks, info): the output path, the data checks, and the conversion's statistics.
+        (path, checks, info): The output path, the data checks, and the conversion statistics.
     """
     import h5py
     from tqdm import tqdm
@@ -1303,7 +1285,8 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
             bg, dose, per_bin, n_eff = _calibrated(dose, per_bin, n_eff, background, factor_parts, mean_factor)
             n_eff = n_eff or src.file_observations
             if given_dose is not None and dose is not None and src.file_background is not None:
-                dose *= src.file_background["factor_median"]            # a given dose, to the exposure the file records
+                # This scales a given dose to the exposure recorded in the file.
+                dose *= src.file_background["factor_median"]
             if bg is None and src.file_background is not None:
                 bg = dict(src.file_background, recorded=True)
             if sm_note is None and src.file_smoothing is not None:
@@ -1343,7 +1326,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
             f.attrs.update(attrs)
     finally:
         if blocks is not None:
-            blocks.close()                                  # stops the prefetch before the source closes
+            blocks.close()                                  # This stops the read-ahead thread before the source closes.
         src.close()
     seconds = time.perf_counter() - t0
     info = dict(seconds=round(seconds, 2), block_bins=block, blocks=n_blocks, open_beam_observations=n_eff,

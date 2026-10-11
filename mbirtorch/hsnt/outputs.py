@@ -1,5 +1,9 @@
-"""Writing a factorization: the dehydrated file, the rehydrated (denoised) hyperspectral data, and the diagnostics
-reported with them (fit quality, distinguishability of the components, mean-pixel spectrum)."""
+"""This module writes the results of a factorization ``X = W H`` to HDF5 files.
+
+One file holds the maps W and the spectra H, which are the output of ``dehydrate``.  Another
+file holds the denoised data, which is the product of W and H.  The module also computes the
+fit diagnostics that are reported with these files.
+"""
 import logging
 
 import h5py
@@ -9,32 +13,31 @@ from .io import _create_hyperspectral, _write_metadata, _written_atomically, exp
 
 log = logging.getLogger(__name__)
 
-_CHUNK_ELEMENTS = 2 ** 23       # entries per block of the float64 diagnostics: 64 MiB per array
+_CHUNK_ELEMENTS = 2 ** 23       # Entries per block in fit_quality: 64 MiB per float64 array.
 
 
 def fit_quality(T, W, H, dose=None, device="cpu", dose_per_bin=None, open_beam_observations=0):
-    """Reduced chi-square of the fit against Poisson noise, the mean of (T - e^-X)^2 / var over the data.
+    """This function computes the reduced chi-square of the fit under a Poisson noise model.
+    The reduced chi-square is the mean of (T - e^-X)^2 / var over the data.
 
-    For counts c ~ Poisson(d e^-X) over an open beam of d counts per bin, var = e^-X / d; an open beam measured as the
-    mean of n observations adds its own noise, e^-2X / (n d). The chi-square is proportional to the dose, and a
-    component more lowers it by only about 1 / pixels + 1 / bins. Near 1 the residual is at the noise level; well
-    above 1 the rank is too small, the model is wrong or the dose is overestimated; well below 1 the dose is
-    underestimated or the noise model overstates the variance.
+    A value near 1 means that the residual is at the noise level.  A value well above 1 means
+    that the rank is too small, the model is wrong, or the dose is overestimated.  A value well
+    below 1 means that the dose is underestimated.
 
     Args:
-        T (numpy.ndarray): Transmission ratio, shape (pixels, bins).
-        W (numpy.ndarray or torch.Tensor): Maps, shape (pixels, rank).
-        H (numpy.ndarray or torch.Tensor): Spectra, shape (rank, bins).
-        dose (float, optional): Open-beam counts per pixel and bin. Defaults to None, which reports only the relative
-            residual in transmission.
-        device (str, optional): Torch device for the products. Defaults to 'cpu'.
-        dose_per_bin (numpy.ndarray, optional): The open beam's count in each bin, used instead of the scalar dose.
-            Defaults to None.
-        open_beam_observations (float, optional): Effective observations in a measured open beam; 0 treats the open
-            beam as exact. Defaults to 0.
+        T (numpy.ndarray): The transmission ratio, with shape (pixels, bins).
+        W (numpy.ndarray or torch.Tensor): The maps, with shape (pixels, rank).
+        H (numpy.ndarray or torch.Tensor): The spectra, with shape (rank, bins).
+        dose (float, optional): The open beam counts per pixel and bin.  If dose is None, the
+            function reports only the relative residual in transmission.  Defaults to None.
+        device (str, optional): The torch device for the matrix products.  Defaults to 'cpu'.
+        dose_per_bin (numpy.ndarray, optional): The open beam count in each bin.  The function
+            uses it in place of the scalar dose.  Defaults to None.
+        open_beam_observations (float, optional): The effective number of observations in a
+            measured open beam.  The value 0 treats the open beam as exact.  Defaults to 0.
 
     Returns:
-        dict: 'relative_residual', and 'reduced_chi2' when the dose is given.
+        dict: The key 'relative_residual', and also the key 'reduced_chi2' when the dose is given.
     """
     import torch
     W = torch.as_tensor(W, device=device)
@@ -62,15 +65,15 @@ def fit_quality(T, W, H, dose=None, device="cpu", dose_per_bin=None, open_beam_o
 
 
 def component_check(W, H, cos_warn=0.99):
-    """Whether the components are distinguishable, from the angle between their spectra.
-
-    Two nearly proportional spectra split one spectral shape between two maps in a proportion the data do not fix; on a
-    one-material sample fitted at rank 2 the spectra reach a cosine of 0.996. The maps of a correctly ranked, mixed
-    basis can correlate at 0.99 (the sphere phantom at rank 3), so the map correlation is reported but not used.
+    """This function uses the angle between the spectra to check whether the components can be
+    told apart.  If two spectra are nearly proportional, the two maps divide one spectral shape
+    between them.
 
     Returns:
-        dict: 'max_map_correlation', 'max_spectral_cosine', 'proportional_pairs' (i, j, cosine) above cos_warn, and
-        'row_noise_rel', each row's noise level from second differences relative to its median.
+        dict: The dict has four keys.  'max_map_correlation' is the largest correlation between
+            two maps.  'max_spectral_cosine' is the largest cosine between two spectra.
+            'proportional_pairs' lists the tuples (i, j, cosine) with cosine above cos_warn.
+            'row_noise_rel' gives the noise level of each spectrum relative to its median.
     """
     W = np.asarray(W, dtype=np.float64)
     H = np.asarray(H, dtype=np.float64)
@@ -93,13 +96,14 @@ def component_check(W, H, cos_warn=0.99):
 
 
 def mean_pixel_spectrum(W, H, frac=0.25):
-    """Attenuation of the average material pixel, sum_k mean(W_pk) H_k, and each component's share of it.
-
-    Unlike the rows of H it does not depend on how the solver split the spectrum among components, so it shows the
-    Bragg edges at any rank. Pixels count as material when their total map value exceeds frac of the 99th percentile.
+    """This function computes the attenuation spectrum of the average material pixel.  This
+    spectrum is sum_k mean(W_pk) H_k.  The function also computes the contribution of each
+    component to this spectrum.  A pixel counts as material when the sum of its map values
+    exceeds frac times the 99th percentile of that sum.
 
     Returns:
-        (total, contributions, pixels): the spectrum (bins,), the shares (rank, bins), and the pixels averaged.
+        tuple: (total, contributions, pixels).  total is the spectrum, with shape (bins,).
+            contributions has shape (rank, bins).  pixels is the number of pixels averaged.
     """
     total = W.sum(1)
     material = total > frac * np.percentile(total, 99)
@@ -110,7 +114,7 @@ def mean_pixel_spectrum(W, H, frac=0.25):
 
 
 def _provenance(path, bin_indices, attrs, metadata=None):
-    """Add the source bin index of each column, the input's hsnt metadata and the run's attributes to an HDF5 file."""
+    """This function adds the source bin indices, the hsnt metadata, and the run attributes to a file."""
     with h5py.File(path, "a") as f:
         if "bin_indices" not in f:
             f.create_dataset("bin_indices", data=np.asarray(bin_indices))
@@ -119,19 +123,22 @@ def _provenance(path, bin_indices, attrs, metadata=None):
 
 
 def write_dehydrated(path, W4, H, out_type, bin_indices, attrs, metadata=None):
-    """Write maps and spectra in the dehydrated layout, with the provenance and the mean-pixel spectrum.
+    """This function writes the maps and spectra to an hsnt file in the format that
+    ``dehydrate`` returns.  It also records the source bin indices, the metadata, and the run
+    attributes.
 
     Args:
-        path (str): Output .h5 path.
-        W4 (numpy.ndarray): Maps, shape (views, rows, cols, rank).
-        H (numpy.ndarray): Spectra, shape (rank, bins).
-        out_type (str): 'attenuation' or 'transmission', the quantity rehydrate reconstructs.
-        bin_indices (array): Source spectral index of each column of H.
-        attrs (dict): HDF5 attributes to record.
-        metadata (dict, optional): hsnt metadata of the input (angles, wavelengths, geometry). Defaults to None.
+        path (str): The output .h5 path.
+        W4 (numpy.ndarray): The maps, with shape (views, rows, cols, rank).
+        H (numpy.ndarray): The spectra, with shape (rank, bins).
+        out_type (str): 'attenuation' or 'transmission'.  This is the quantity that
+            ``rehydrate`` returns.
+        bin_indices (array): The source spectral index of each column of H.
+        attrs (dict): The HDF5 attributes to record.
+        metadata (dict, optional): The hsnt metadata of the input.  Defaults to None.
 
     Returns:
-        str: the path.
+        str: The path.
     """
     total, contrib, n_mat = mean_pixel_spectrum(W4.reshape(-1, H.shape[0]), H)
     with _written_atomically(path) as tmp:
@@ -149,23 +156,23 @@ def write_dehydrated(path, W4, H, out_type, bin_indices, attrs, metadata=None):
 
 
 def write_denoised(path, spatial_shape, W, H, out_type, bin_indices, attrs, metadata=None, block_pixels=16384):
-    """Write the rehydrated product W @ H in the hsnt hyperspectral layout, by blocks of whole rows.
-
-    The full array is never held in memory, and each block fills whole HDF5 chunks.
+    """This function writes the denoised data W @ H to an hsnt file.  It computes and writes the
+    data in blocks of whole rows, so it never holds the full array in memory.
 
     Args:
-        path (str): Output .h5 path.
-        spatial_shape (tuple): (views, rows, cols) of the pixels.
-        W (numpy.ndarray): Maps, shape (pixels, rank).
-        H (numpy.ndarray): Spectra, shape (rank, bins).
+        path (str): The output .h5 path.
+        spatial_shape (tuple): The pixel dimensions (views, rows, cols).
+        W (numpy.ndarray): The maps, with shape (pixels, rank).
+        H (numpy.ndarray): The spectra, with shape (rank, bins).
         out_type (str): 'attenuation' (W @ H) or 'transmission' (exp(-W @ H)).
-        bin_indices (array): Source spectral index of each column of H.
-        attrs (dict): HDF5 attributes to record.
-        metadata (dict, optional): hsnt metadata of the input (angles, wavelengths, geometry). Defaults to None.
-        block_pixels (int, optional): Approximate pixels per block. Defaults to 16384.
+        bin_indices (array): The source spectral index of each column of H.
+        attrs (dict): The HDF5 attributes to record.
+        metadata (dict, optional): The hsnt metadata of the input.  Defaults to None.
+        block_pixels (int, optional): The approximate number of pixels in each block.
+            Defaults to 16384.
 
     Returns:
-        str: the path.
+        str: The path.
     """
     R, K = H.shape
     V, rows, cols = spatial_shape

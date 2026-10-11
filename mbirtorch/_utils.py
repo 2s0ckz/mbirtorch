@@ -1,8 +1,6 @@
-"""Parameter defaults and small shared helpers.
-
-Defines the Param dataclass and the default parameter dictionaries.  The
-names, values, and recompile flags of those defaults are fixed by an external
-reference and must not be changed here.
+"""This module holds the ``Param`` dataclass, the default parameter dictionaries, and small
+helper functions that other modules share.  Other code depends on the names, values, and
+recompile flags of the defaults, so these must not be changed.
 """
 
 import copy
@@ -11,37 +9,20 @@ from typing import Any
 
 FILE_FORMAT_NUMBER = 1.0
 
-#: Width arguments to the hand written kernels are rounded up to this multiple.
-#: Triton compiles a faster kernel for an argument it can prove is a multiple of 16.
+#: mbirtorch rounds each width argument of a Triton kernel up to a multiple of this number.
 KERNEL_WIDTH_MULTIPLE = 16
 
 
 def padded_kernel_width(width):
-    """``width`` rounded up to the next multiple of 16.
-
-    A width that is already a multiple of 16 is returned unchanged, so a
-    caller can compare the result against its input and take its original
-    path when the two agree.
-
-    This is the ONE definition of the rule.  The Triton kernel wrappers call
-    it to size the launch and the arrays they allocate, and the memory ledger
-    calls it to charge those same arrays, so the code and the charge cannot
-    disagree.
-
-    The rule covers every width-class argument a kernel receives, including
-    the bound it masks its vector axis against, not only the arrays it
-    allocates.  The multiaxis forward wrapper padded its allocation and its
-    stride but passed the real detector row count as that bound, and it cost a
-    factor of 3.1 at every row count that was not a multiple of 16 (measured
-    2026-08-24; the record is multigpu_findings.md section 1.51 in the plans
-    repository).
+    """This function returns ``width`` rounded up to the next multiple of 16.  The Triton
+    kernel wrappers call this function for every width argument of a kernel.  The memory
+    estimate also calls this function.
 
     Args:
-        width (int): a non-negative length -- a slice band, a detector row
-            count, or a value-column count.
+        width (int): A non-negative length, such as a number of slices or detector rows.
 
     Returns:
-        int: the padded length.
+        int: The padded length.
     """
     width = int(width)
     remainder = width % KERNEL_WIDTH_MULTIPLE
@@ -90,7 +71,7 @@ _reconstruction_defaults_dict = {
     'positivity_flag': Param(False, False),
     'snr_db': Param(30.0, False),
     'sharpness': Param(1.0, False),
-    # The four 128 subset partitions are independent and are cycled after warmup.
+    # After the first iterations, the reconstruction cycles through the four partitions with 128 subsets.
     'granularity': Param([1, 2, 4, 8, 16, 32, 64, 128, 128, 128, 128], False),
     'partition_sequence': Param([2, 4, 6] + [7, 8, 9, 10] * 25, False),
     'verbose': Param(1, False),

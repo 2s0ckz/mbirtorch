@@ -1,23 +1,17 @@
-"""Command-line interface for the hsnt dehydration: ``mbirtorch-hsnt`` (or ``python -m mbirtorch.hsnt``).
+"""This module is the command line program ``mbirtorch-hsnt``, which runs the hsnt dehydration.
+The program also runs as ``python -m mbirtorch.hsnt``.
 
-    inspect    load a dataset, run the checks, print what a solve would see (no GPU needed)
-    convert    write a TIFF stack (with its open beam) or an HDF5 dataset in the package's HDF5 layout, streamed
-    dehydrate  fit the NNAL factorization X = W H and write it in the dehydrated layout, with plots and a JSON report
-    rehydrate  multiply a dehydrated file back into hyperspectral data (all bins or a range of them)
-    denoise    dehydrate and rehydrate in one run: write the denoised hyperspectral data (and the dehydrated file)
+    inspect    load a dataset, run the checks, and print what a solve would see (no GPU needed)
+    convert    write a TIFF stack (with its open beam) or an HDF5 dataset in the hsnt HDF5 layout
+    dehydrate  fit X = W H and write W and H in the dehydrated layout, with plots and a JSON report
+    rehydrate  multiply a dehydrated file back into hyperspectral data (all bins or a range)
+    denoise    dehydrate and rehydrate in one run
 
-The rank (the number of components, about the number of distinct materials) is estimated by likelihood-ratio tests
-unless --rank gives it. The components are a nonnegative basis of the data: a map and a spectrum each, which need not be
-the pure materials.
-
-Inputs are either an HDF5 file in the package layout (``data`` with the spectral axis last, ``dataset_type``,
-optionally inside a group) or a directory of one TIFF image per wavelength bin. A TIFF stack of counts needs an
-open-beam stack (``--open-beam``) to become a transmission ratio; a stack that already holds transmissions or
-attenuations is used as is, and the type is inferred from the values unless ``--input-type`` says otherwise.
-
-The dehydrated layout (``subspace_data`` = maps, ``subspace_basis`` = spectra, ``dataset_type``) is the one
-``import_hsnt_data_hdf5`` reads and ``rehydrate`` reconstructs from. Run any subcommand with ``-h`` for the options
-most runs need, or ``--help-all`` for every option.
+Dehydration fits the data X as the product W H of a few spectra H and their maps W.  The number
+of spectra is the rank.  The program estimates the rank by likelihood ratio tests unless the user
+gives ``--rank``.  An input is either an HDF5 file in the hsnt layout or a directory with one
+TIFF image per wavelength bin.  A TIFF stack of counts needs ``--open-beam``.  Any subcommand
+with ``-h`` shows the common options.  With ``--help-all``, it shows every option.
 """
 import argparse
 import json
@@ -42,7 +36,8 @@ _MAX_PLOTTED_VIEWS = 4
 
 
 def _parse_slice(text, name):
-    """'START:STOP' as a (start, stop) tuple of optional ints, or None for no text."""
+    """This function parses the text 'START:STOP' into the tuple (start, stop).  Each value is an
+    int, or None when its part of the text is empty."""
     if text is None:
         return None
     m = re.fullmatch(r"(-?\d*):(-?\d*)", text.strip())
@@ -52,7 +47,8 @@ def _parse_slice(text, name):
 
 
 def _box_arg(text):
-    """One word of --background-boxes: a box 'Y0:Y1,X0:X1' in full-resolution pixels, or a preset name."""
+    """This function parses one word of --background-boxes.  The word is either a preset name or
+    a box 'Y0:Y1,X0:X1' in pixels of the full resolution image."""
     if re.fullmatch(r"[a-z][a-z0-9-]*", text):
         return text
     m = re.fullmatch(r"(\d+):(\d+),(\d+):(\d+)", text.strip())
@@ -62,7 +58,8 @@ def _box_arg(text):
 
 
 def _background_spec(words):
-    """The background_boxes argument from the words of --background-boxes: one preset name, or boxes."""
+    """This function returns the background_boxes argument from the words given on the command
+    line."""
     if not words:
         return None
     names = [w for w in words if isinstance(w, str)]
@@ -87,7 +84,8 @@ def _rank_arg(text):
 
 
 def _number_arg(kind, low, inclusive):
-    """An argparse type: a number of the given kind above low (at or above it when inclusive)."""
+    """This function returns an argparse type that accepts a number greater than ``low``.  If
+    ``inclusive`` is True, the type also accepts ``low``."""
     def parse(text):
         try:
             value = kind(text)
@@ -115,7 +113,8 @@ def _pool_arg(text):
 
 
 def _load(args, log_checks=True):
-    """load_dataset with the command's input options, logging the checks unless the caller prints them."""
+    """This function runs load_dataset with the options of the command.  If ``log_checks`` is
+    True, the function logs the results of the data checks."""
     ds = load_dataset(args.input, open_beam=args.open_beam, input_type=args.input_type, dataset=args.dataset,
                       dose=args.dose, views=_parse_slice(args.views, "views"),
                       wave_range=_parse_slice(args.wave_range, "wave-range"), wave_bin=args.wave_bin,
@@ -129,7 +128,8 @@ def _load(args, log_checks=True):
 
 
 def _device(name):
-    """'auto' | 'cpu' | 'cuda' | 'cuda:N' as a validated torch device string."""
+    """This function checks a device name and returns the device to use.  The name is 'auto',
+    'cpu', 'cuda', or 'cuda:N'."""
     import torch
     from ._device import _default_device
     m = re.fullmatch(r"auto|cpu|cuda(?::(\d+))?", name)
@@ -144,7 +144,8 @@ def _device(name):
 
 
 def plan_memory(ds, device, mode, chunk_pixels, spectra="mle", compile_mode="auto"):
-    """A full or streamed solve for the loaded data on `device`. Returns (mode, chunk_pixels, warmup_pixels, note)."""
+    """This function chooses between a full solve and a streamed solve for the loaded data on
+    `device`.  The function returns (mode, chunk_pixels, warmup_pixels, note)."""
     from ._fit import _plan
     return _plan(ds.pixels, ds.bins, device, spectra, mode, chunk_pixels, compile_mode)
 
@@ -162,8 +163,8 @@ def _penalty_arg(text):
 
 
 def _load_basis(path, ds):
-    """The subspace_basis of a dehydrated file, checked like dehydrate's and against the loaded data's source bins and
-    background calibration."""
+    """This function reads the subspace_basis of a dehydrated file.  The function checks that the
+    basis matches the loaded data, and then returns it."""
     import h5py
     from .denoise import _check_basis
     if not os.path.isfile(path):
@@ -200,9 +201,10 @@ def _load_basis(path, ds):
 
 
 def solve(ds, args, device):
-    """Run the factorization and the requested spectra estimator. Returns (W, H, report) with W and H numpy."""
+    """This function runs the factorization and estimates the spectra.  The function returns the
+    numpy arrays W and H and a report."""
     from ._fit import _fit, _fit_fixed_basis
-    args.fit_report = {}                                # holds the memory plan for main's advice if the solve fails
+    args.fit_report = {}                                # main uses this memory plan for advice if the solve fails
     if args.basis:
         W, H, rep = _fit_fixed_basis(ds.T, args.basis_H, device=device, mode=args.mode, chunk_pixels=args.chunk_pixels,
                                      max_steps=args.max_steps, rel_tol=args.rel_tol, compile_mode=args.compile,
@@ -220,12 +222,13 @@ def solve(ds, args, device):
                      chunk_pixels=args.chunk_pixels, max_steps=args.max_steps, rel_tol=args.rel_tol,
                      max_passes=args.max_passes, compile_mode=args.compile, report=args.fit_report)
     rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=args.rank_detail)
-    args.fit_report = {"solved": True}                  # a later device failure is not the solve's
+    args.fit_report = {"solved": True}                  # a later device failure happens after the solve
     return W, H, rep
 
 
 def _output_path(output, default_name):
-    """-o names a directory (created if needed) unless it ends in .h5/.hdf5, which is then the path itself."""
+    """This function returns the output path.  If -o ends in .h5 or .hdf5, the path is -o.
+    Otherwise the path is ``default_name`` in the -o directory."""
     if output is not None and output.lower().endswith((".h5", ".hdf5")):
         path = output
     else:
@@ -235,7 +238,8 @@ def _output_path(output, default_name):
 
 
 def _check_outputs(paths, inputs, overwrite):
-    """Refuse an output that is an input of the run, and an existing output unless --overwrite."""
+    """This function raises FileExistsError if an output is also an input.  It also raises
+    FileExistsError if an output exists and --overwrite is not given."""
     existing = [p for p in paths if os.path.exists(p)]
     for p in existing:
         if any(i and os.path.exists(i) and os.path.samefile(p, i) for i in inputs):
@@ -252,7 +256,7 @@ def _out_type(ds, args):
 
 
 def _run_attrs(ds, rep, args, **extra):
-    """Provenance written as HDF5 attributes: where the data came from and how the solve was set up."""
+    """This function returns the HDF5 attributes that record the data source and the settings."""
     return dict(source=ds.source, input_type=ds.dataset_type, mode=rep["mode"],
                 spectra="given basis" if args.basis else args.spectra, support_penalty=str(args.support_penalty),
                 downsample=args.downsample, wave_bin=args.wave_bin, dose=-1.0 if ds.dose is None else float(ds.dose),
@@ -353,8 +357,8 @@ def cmd_convert(args):
 
 
 def _resolve_rank(ds, args, device):
-    """Set args.rank_value, args.rank_note and args.rank_detail from --basis, --rank N or the likelihood-ratio
-    estimate."""
+    """This function sets args.rank_value, args.rank_note, and args.rank_detail.  The rank comes
+    from --basis, from --rank N, or from the likelihood ratio estimate."""
     if args.basis:
         args.basis_H = _load_basis(args.basis, ds)
         R = args.basis_H.shape[0]
@@ -372,7 +376,8 @@ def _resolve_rank(ds, args, device):
 
 
 def _pipeline(args, denoise):
-    """load, checks, rank, solve, fit quality and outputs, for dehydrate and denoise."""
+    """This function runs the dehydrate or denoise command.  The function loads the data, solves,
+    and writes the outputs."""
     ds = _load(args)
     device = _device(args.device)
     stem = os.path.splitext(os.path.basename(os.path.normpath(args.input)))[0]
@@ -387,7 +392,7 @@ def _pipeline(args, denoise):
         return 0
     W, H, rep = solve(ds, args, device)
     R, out_type, outputs = H.shape[0], _out_type(ds, args), []
-    if not (denoise and args.no_dehydrated):          # the result is on disk before any diagnostic runs
+    if not (denoise and args.no_dehydrated):          # the result is written before any diagnostic runs
         outputs.append(write_dehydrated(base + "_dehydrated.h5", W.reshape(*ds.spatial_shape, R), H, out_type,
                                         ds.bin_indices, _run_attrs(ds, rep, args, rank=R, loss=rep["loss_final"]),
                                         ds.metadata))
@@ -423,7 +428,8 @@ def cmd_denoise(args):
 
 
 def cmd_rehydrate(args):
-    """Multiply a dehydrated file back into hyperspectral data, for all bins or a --wave-range of them."""
+    """This function rehydrates a dehydrated file.  The output covers all bins or the bins in
+    --wave-range."""
     import h5py
     from .io import import_hsnt_data_hdf5
     if not os.path.isfile(args.input):
@@ -489,7 +495,8 @@ _SPECTRA_HELP = ("how the component spectra are estimated. mle (default): the sp
 
 
 class _Options:
-    """Adds arguments to a parser, hiding the advanced ones from -h unless the full help was asked for."""
+    """This class is used to add arguments to the parser.  The class hides advanced arguments
+    unless the user asks for the full help."""
 
     def __init__(self, show_all):
         self.show_all = show_all
@@ -609,7 +616,8 @@ class _Options:
 
 
 def build_parser(show_all=False):
-    """The command-line parser; show_all=True puts the advanced options in the help as well."""
+    """This function builds the command line parser.  If ``show_all`` is True, the help lists the
+    advanced options."""
     opt = _Options(show_all)
     p = argparse.ArgumentParser(prog="mbirtorch-hsnt", description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=_EXAMPLES)
@@ -670,8 +678,8 @@ def build_parser(show_all=False):
     return p
 
 
-# Errors of cuBLAS, cuSOLVER and the CUDA runtime that an oversubscribed device raises in place of the allocator's
-# out-of-memory error (seen on a WSL2 laptop GPU, whose driver pages device memory instead of refusing it).
+# These CUDA library errors can occur instead of the allocator's out of memory error when
+# the device runs out of memory.
 _DEVICE_MEMORY_FAILURES = ("CUBLAS_STATUS_EXECUTION_FAILED", "CUBLAS_STATUS_ALLOC_FAILED",
                            "CUBLAS_STATUS_NOT_INITIALIZED", "CUSOLVER_STATUS_ALLOC_FAILED",
                            "CUSOLVER_STATUS_EXECUTION_FAILED", "CUSOLVER_STATUS_INTERNAL_ERROR",
@@ -679,7 +687,7 @@ _DEVICE_MEMORY_FAILURES = ("CUBLAS_STATUS_EXECUTION_FAILED", "CUBLAS_STATUS_ALLO
 
 
 def _is_device_out_of_memory(e):
-    """The allocator's out-of-memory error, or a RuntimeError naming one of _DEVICE_MEMORY_FAILURES."""
+    """This function returns True if ``e`` is an out of memory error of the device."""
     torch = sys.modules.get("torch")
     if torch is not None and isinstance(e, torch.cuda.OutOfMemoryError):
         return True
@@ -687,8 +695,8 @@ def _is_device_out_of_memory(e):
 
 
 def _out_of_memory_message(e, rep):
-    """The error line for a device out of memory: the failure, the memory plan of the solve it stopped (rep, the
-    solve's report so far) and the options that shrink the working set."""
+    """This function returns the error message for a device that ran out of memory.  The message
+    gives the memory plan of the solve and the options that reduce memory."""
     torch = sys.modules.get("torch")
     lines = str(e).strip().splitlines()
     what = ("ran out of memory" if torch is not None and isinstance(e, torch.cuda.OutOfMemoryError)
@@ -705,9 +713,10 @@ def _out_of_memory_message(e, rep):
 
 
 def main(argv=None):
-    """Run the command line. Errors in the data or the options exit with their message (the traceback with -vv)."""
+    """This function runs the command line program.  Bad input makes the program exit with a
+    message.  With -vv, the program prints the traceback instead."""
     argv = sys.argv[1:] if argv is None else list(argv)
-    if "--help-all" in argv:                    # the full help: every option shown, printed by argparse's -h
+    if "--help-all" in argv:                    # argparse's -h prints the full help with every option
         build_parser(show_all=True).parse_args([a if a != "--help-all" else "-h" for a in argv])
     args = build_parser().parse_args(argv)
     level = logging.WARNING if args.quiet else (logging.DEBUG if args.verbose >= 2 else logging.INFO)
@@ -725,7 +734,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         log.error("interrupted")
         return 130
-    except Exception as e:          # input and resource errors become one line; anything else is a bug and tracebacks
+    except Exception as e:          # Input and resource errors print one line.  Other errors print a traceback.
         if level <= logging.DEBUG:
             raise
         if _is_device_out_of_memory(e):

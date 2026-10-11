@@ -1,11 +1,11 @@
-"""Interactive viewer for 4D volumes, built on the slice viewer.
+"""This module provides an interactive viewer for 4D volumes.  The viewer extends the slice
+viewer in ``slice_figure``.
 
-The slice viewer in ``slice_figure`` is not changed.  This module subclasses its two
-classes.  ``VolumeStack4D`` adds the time axis to the data model, and ``SliceViewer4D``
-adds a frame-row slider, playback and GIFs along either position slider, space-time
-planes, and a plot of the ROI mean against frame.  A 4D array is ``(t, x, y, z)``.
-Like ``slice_figure``, this module imports numpy and the matplotlib base package at
-most, so it loads without a GUI toolkit.
+The classes ``VolumeStack4D`` and ``SliceViewer4D`` subclass the two classes of
+``slice_figure`` and add a time axis.  A 4D array has axes ``(t, x, y, z)``.  The viewer has a
+second slider, called the frame slider.  In a spatial plane, the frame slider sets the frame.
+In a space-time plane, it sets the position along the second hidden spatial axis.  At import,
+the module loads only numpy and the base matplotlib package.
 """
 
 import copy
@@ -21,58 +21,50 @@ from .slice_figure import Mode, SliceViewer, VolumeStack
 
 __all__ = ['SliceViewer4D', 'VolumeStack4D', 'slice_viewer4d']
 
-# Names of the axes of a 4D volume, in axis order.
+# AXIS_NAMES holds the names of the axes of a 4D volume, in axis order.
 AXIS_NAMES = ('t', 'x', 'y', 'z')
 
-# The planes a panel can show, as pairs of axes in (t, x, y, z) order, with the labels
-# of their radio buttons.  The first three are spatial planes, the last three are
-# space-time planes.
+# PLANES lists the planes a panel can show, as pairs of axes in (t, x, y, z) order.
+# PLANE_LABELS holds the labels of their radio buttons.  The first three planes are spatial
+# planes.  The last three are space-time planes.
 PLANES = ((1, 2), (1, 3), (2, 3), (0, 1), (0, 2), (0, 3))
 PLANE_LABELS = tuple('{}-{}'.format(AXIS_NAMES[a], AXIS_NAMES[b]) for a, b in PLANES)
 
 ROI_PLOT_FONT_SIZE = 8
 ROI_PLOT_HINT = 'Draw an ROI on an image to plot its mean against frame'
 
-# The two position rows of the slider block.  The slice row holds the slice slider, and
-# the frame row holds the frame-row slider.  Each has a Play button and a GIF button.
+# ROWS names the two slider rows that set positions.  The slice row holds the slice slider.  The frame
+# row holds the frame slider.  Each row has a Play button and a GIF button.
 ROWS = ('slice', 'frame')
 
-# The inherited in-figure dialogs place their parts at fixed fractions of the figure
-# height, laid out for the slice viewer's figure, which is 8 inches tall.
+# The inherited in-figure dialogs place their parts at fixed fractions of the figure height.
+# These fractions assume the slice viewer's figure height of 8 inches.
 DIALOG_LAYOUT_HEIGHT = 8.0
 
 
 class VolumeStack4D(VolumeStack):
-    """Pure-numpy data model for the 4D viewer.
+    """This class is used to hold the data of the 4D viewer.  It uses numpy only.
 
-    Holds 2D, 3D, and 4D arrays.  A 4D array is ``(t, x, y, z)``, and a 2D or 3D array
-    has one frame, so it stays fixed in time.  Each volume shows a plane of two axes:
-    a spatial plane (x-y, x-z, y-z) or a space-time plane (t-x, t-y, t-z).  Each of the
-    two hidden axes has a position.  The slice slider sets the position along the
-    slice axis, and the frame-row slider sets the position along the second axis.
-
-    In a spatial plane the second axis is t, with one shared frame index, and a 4D
-    volume with fewer frames than the longest one holds its last frame.  In a
-    space-time plane a 3D volume is shown constant in time, and a shorter 4D volume
-    shows only its own frames.  Everything the 3D model does, such as ROI statistics,
-    acts on the displayed image.
+    The class holds 2D, 3D, and 4D arrays.  A 4D array has axes ``(t, x, y, z)``.  A 2D or 3D
+    array is fixed in time.  Each volume shows a spatial plane (x-y, x-z, y-z) or a
+    space-time plane (t-x, t-y, t-z).  The slice slider and the frame slider set the
+    positions along the two hidden axes.
 
     Args:
-        datasets (sequence of ndarray or None): One or more 2D, 3D, or 4D arrays.  2D
-            arrays gain a trailing singleton axis, and None becomes a placeholder zero
-            volume.
-        data_dicts (None, dict, or list of dict/None, optional): String-valued dict(s)
-            associated with the volumes.
-        vmin (float, optional): Display minimum.  Defaults to the minimum over every
+        datasets (sequence of ndarray or None): One or more 2D, 3D, or 4D arrays.  A 2D
+            array gets a trailing axis of length 1.  None is replaced by a volume of zeros.
+        data_dicts (None, dict, or list of dict/None, optional): Dicts of strings that
+            describe the volumes.
+        vmin (float, optional): The display minimum.  Defaults to the minimum over every
             voxel of every volume.
-        vmax (float, optional): Display maximum.  Defaults to the maximum over every
+        vmax (float, optional): The display maximum.  Defaults to the maximum over every
             voxel of every volume.
-        slice_label (str or list of str, optional): Label(s) at the start of each panel
+        slice_label (str or list of str, optional): The label at the start of each panel
             title.  Defaults to no label.
-        slice_axis (int or list of int, optional): Axis to slice along, counted in each
-            array's own axes: 1, 2, or 3 for a 4D array and 0, 1, or 2 for a 3D array.
-            Defaults to z.  With 3D and 4D arrays together, give a list with one entry
-            per volume.
+        slice_axis (int or list of int, optional): The axis to slice along.  Each array
+            counts its own axes, so the value is 1, 2, or 3 for a 4D array and 0, 1, or 2
+            for a 3D array.  Defaults to z.  If the arrays mix 3D and 4D, give a list with
+            one entry per volume.
     """
 
     def __init__(self, datasets, data_dicts=None, vmin=None, vmax=None,
@@ -84,13 +76,10 @@ class VolumeStack4D(VolumeStack):
         self.labels = self._normalize_labels(slice_label)
         self.data_dicts = self._normalize_data_dicts(data_dicts)
 
-        # original_data holds each array as it was passed in, and Save writes it.
-        # frames holds every volume as a 4D array (t, x, y, z), with one frame for a
-        # 2D or 3D input, and a difference image replaces it.  display_axes holds each
-        # volume's axes in the order rows, columns, slice axis, second axis.  data
-        # holds the displayed 3D view (rows, columns, slice axis) at the current
-        # position along the second axis, so the inherited slicing and ROI methods
-        # act on it.
+        # original_data holds each array as passed in, and Save writes it.  frames holds
+        # each volume as (t, x, y, z), with one frame for 2D or 3D input.  display_axes
+        # holds the axes of each volume in the order rows, columns, slice axis, second axis.
+        # data holds the displayed 3D view, which the inherited slicing and ROI methods use.
         self.original_data = []
         self.frames = []
         for dataset in datasets:
@@ -107,9 +96,9 @@ class VolumeStack4D(VolumeStack):
         self.display_axes = self._initial_display_axes(slice_axis)
         self._difference_info = [None] * self.n_volumes
 
-        # The frame index is shared by all volumes.  Each spatial axis keeps its
-        # position on the frame-row slider as a fraction of its length, so volumes of
-        # different length follow it in proportion, as they follow the slice slider.
+        # All volumes share the frame index.  Each spatial axis stores its frame slider
+        # position as a fraction of its length.  So volumes of different lengths move in
+        # proportion, as they do with the slice slider.
         self.master_frame = 0
         self._second_fractions = {1: 0.5, 2: 0.5, 3: 0.5}
         self.cur_seconds = [0] * self.n_volumes
@@ -117,8 +106,8 @@ class VolumeStack4D(VolumeStack):
         for i in range(self.n_volumes):
             self._refresh_view(i)
 
-        # Each volume opens at its own middle slice, and the shared slider starts
-        # at volume 0's middle slice, as in the 3D model.
+        # Each volume opens at its own middle slice.  The shared slider starts at the
+        # middle slice of volume 0, as in the 3D viewer.
         self.cur_slices = [d.shape[2] // 2 for d in self.data]
         self.master_index = self.cur_slices[0]
 
@@ -128,16 +117,16 @@ class VolumeStack4D(VolumeStack):
 
     @staticmethod
     def _as_frames(array):
-        """Return ``array`` as a 4D view; a 3D array becomes one frame."""
+        """This method returns ``array`` as a 4D view.  A 3D array becomes a single frame."""
         return array if array.ndim == 4 else array[np.newaxis]
 
     def _normalize_labels(self, slice_label):
-        # A 4D panel title names its position, so no label is needed by default.
+        # A 4D panel title gives its position, so the default label is empty.
         return super()._normalize_labels('' if slice_label is None else slice_label)
 
     def _initial_display_axes(self, slice_axis):
         # Each array counts its own axes, so axis 3 of a 4D array and axis 2 of a 3D
-        # array both mean z.  A volume opens on the spatial plane across its slice axis.
+        # array both mean z.  A volume opens on the spatial plane normal to its slice axis.
         if slice_axis is None:
             slice_axis = [None] * self.n_volumes
         elif isinstance(slice_axis, (int, np.integer)):
@@ -166,36 +155,38 @@ class VolumeStack4D(VolumeStack):
     # --- Planes and the two hidden axes ---
 
     def plane(self, i):
-        """Return the plane volume ``i`` shows, as a sorted pair of axes."""
+        """This method returns the plane of volume ``i`` as a sorted pair of axes."""
         return tuple(sorted(self.display_axes[i][:2]))
 
     def shows_time(self, i):
-        """Return True if volume ``i`` shows a space-time plane."""
+        """This method returns True if volume ``i`` shows a space-time plane."""
         return 0 in self.display_axes[i][:2]
 
     @property
     def slice_axes(self):
-        """Per-volume slice axis, in (t, x, y, z) numbering."""
+        """This property is the list of the slice axes of the volumes, in (t, x, y, z)
+        numbering."""
         return [axes[2] for axes in self.display_axes]
 
     @property
     def second_axis(self):
-        """Axis of the frame-row slider, in (t, x, y, z) numbering.
-
-        It is the same for every volume: t in a spatial plane, and the second hidden
-        spatial axis in a space-time plane.
+        """This property is the axis of the frame slider, in (t, x, y, z) numbering.  The
+        axis is the same for every volume.  In a spatial plane it is t.  In a space-time
+        plane it is the second hidden spatial axis.
         """
         return self.display_axes[0][3]
 
     @property
     def second_count(self):
-        """Number of positions of the frame-row slider."""
+        """This property is the number of positions of the frame slider."""
         axis = self.second_axis
         return max(frames.shape[axis] for frames in self.frames)
 
     @property
     def second_position(self):
-        """Position of the frame-row slider: a frame index, or an index along a spatial axis."""
+        """This property is the position of the frame slider.  The position is a frame
+        index or an index along a spatial axis.
+        """
         axis = self.second_axis
         if axis == 0:
             return self.master_frame
@@ -208,8 +199,8 @@ class VolumeStack4D(VolumeStack):
         return int(round(self._second_fractions[axis] * (self.frames[i].shape[axis] - 1)))
 
     def _source(self, i):
-        # A one-frame volume in a space-time plane is repeated over every frame of the
-        # longest volume, without a copy, so it appears constant in time.
+        # In a space-time plane, a one-frame volume is repeated over every frame of the
+        # longest volume without a copy.  So it appears constant in time.
         frames = self.frames[i]
         if frames.shape[0] == 1 and self.shows_time(i):
             frames = np.broadcast_to(frames, (self.max_frames,) + frames.shape[1:])
@@ -232,11 +223,10 @@ class VolumeStack4D(VolumeStack):
         return changed
 
     def set_plane(self, indices, plane):
-        """Show ``plane``, a pair of axes in (t, x, y, z) numbering, in the given volumes.
-
-        Returns True if any volume changed.  t goes to the frame-row slider whenever it
-        is hidden.  The slice slider keeps its axis when the new plane leaves that axis
-        hidden, and the fractional slice position is kept, as in the 3D viewer.
+        """This method shows ``plane`` in the given volumes.  The plane is a pair of axes
+        in (t, x, y, z) numbering.  The method returns True if any volume changed.  If t is
+        hidden, the frame slider controls t.  The slice position keeps its fraction of the
+        axis length.
         """
         plane = tuple(sorted(int(a) for a in plane))
         hidden = [a for a in range(4) if a not in plane]
@@ -260,53 +250,51 @@ class VolumeStack4D(VolumeStack):
         return True
 
     def transpose(self, i):
-        """Swap the two displayed axes of volume ``i``."""
+        """This method swaps the two displayed axes of volume ``i``."""
         axes = self.display_axes[i]
         axes[0], axes[1] = axes[1], axes[0]
         self._refresh_view(i)
 
-    # --- Frames and the frame-row slider ---
+    # --- Frames and the frame slider ---
 
     @property
     def frame_counts(self):
-        """Per-volume number of frames; 1 for a 2D or 3D volume."""
+        """This property is the list of the frame counts of the volumes.  The count is 1
+        for a 2D or 3D volume."""
         return [frames.shape[0] for frames in self.frames]
 
     @property
     def max_frames(self):
-        """Number of frames of the longest volume."""
+        """This property is the number of frames of the longest volume."""
         return max(self.frame_counts)
 
     @property
     def cur_frames(self):
-        """Per-volume displayed frame in a spatial plane."""
+        """This property is the list of the frames that the volumes show in a spatial plane."""
         return [min(self.master_frame, count - 1) for count in self.frame_counts]
 
     def has_time(self, i):
-        """Return True if volume ``i`` changes with the frame index."""
+        """This method returns True if volume ``i`` changes with the frame index."""
         return self.original_data[i].ndim == 4 or self.frames[i].shape[0] > 1
 
     def holds_last_frame(self, i):
-        """Return True if volume ``i`` has fewer frames than the frame index needs."""
+        """This method returns True if volume ``i`` has fewer frames than the frame index
+        needs."""
         return self.has_time(i) and self.master_frame > self.frames[i].shape[0] - 1
 
     def set_frame(self, index):
-        """Set the shared frame index; return the volumes whose displayed image changed.
-
-        The index runs from 0 to the last frame of the longest volume, and values
-        outside that range are clipped.  In a spatial plane a shorter volume holds its
-        last frame, and a 2D or 3D volume keeps its only frame.  In a space-time plane
-        the index is kept for the next spatial plane and no image changes.
+        """This method sets the shared frame index and returns the volumes whose image
+        changed.  The index is clipped to the length of the longest volume.  In a spatial
+        plane, a shorter volume shows its last frame.  In a space-time plane, no image
+        changes.
         """
         self.master_frame = int(np.clip(int(np.round(index)), 0, self.max_frames - 1))
         return self._update_second_positions()
 
     def set_second(self, index):
-        """Move the frame-row slider to ``index``; return the volumes whose image changed.
-
-        In a spatial plane this sets the frame index, as :meth:`set_frame` does.  In a
-        space-time plane it sets the position along the second hidden spatial axis,
-        which volumes of different length follow in proportion.
+        """This method moves the frame slider to ``index`` and returns the volumes whose
+        image changed.  In a spatial plane, the method sets the frame.  In a space-time
+        plane, it sets the position along the second hidden spatial axis.
         """
         axis = self.second_axis
         if axis == 0:
@@ -319,7 +307,7 @@ class VolumeStack4D(VolumeStack):
     # --- Intensity range ---
 
     def data_range(self):
-        """Return (min, max) over every frame of every volume."""
+        """This method returns (min, max) over every frame of every volume."""
         lo = min(float(np.min(frames)) for frames in self.frames)
         hi = max(float(np.max(frames)) for frames in self.frames)
         return lo, hi
@@ -327,9 +315,9 @@ class VolumeStack4D(VolumeStack):
     # --- Difference images ---
 
     def can_difference(self, baseline_index, comparison_index):
-        """Return True if the pair is a valid difference: distinct volumes with the
-        same x, y, z shape, and either the same number of frames or one frame in one
-        of them."""
+        """This method returns True if the two volumes can be subtracted.  The volumes
+        must be distinct and have the same x, y, z shape.  They must also have the same
+        number of frames, or one of them must have one frame."""
         if baseline_index == comparison_index:
             return False
         base_shape = self.frames[baseline_index].shape
@@ -339,19 +327,16 @@ class VolumeStack4D(VolumeStack):
                      or 1 in (base_shape[0], comparison_shape[0])))
 
     def apply_difference(self, baseline_index, comparison_index, use_abs=False):
-        """Replace volume ``baseline_index`` with (comparison - baseline) for every frame.
-
-        The difference is computed for the whole volume at once.  It uses the volumes'
-        current data, so a difference against an already-differenced volume compares
-        against what is displayed.  A 3D volume is subtracted from every frame of a 4D
-        volume.  With ``use_abs`` the absolute difference is shown.  The previous label
-        is saved and restored by :meth:`restore`.
+        """This method replaces volume ``baseline_index`` by (comparison - baseline) in
+        every frame.  If ``use_abs`` is True, it uses the absolute value.  A 3D volume is
+        subtracted from every frame of a 4D volume.  :meth:`restore` brings back the
+        original data and label.
         """
         if not self.can_difference(baseline_index, comparison_index):
             raise ValueError(
                 "Difference requires two distinct volumes with the same x, y, z shape")
         # The frames are stored in their original axis order, so the two volumes need
-        # no reorienting, and a one-frame volume broadcasts over the frames.
+        # no reordering.  A one-frame volume broadcasts over the frames.
         difference = self.frames[comparison_index] - self.frames[baseline_index]
         if use_abs:
             difference = np.abs(difference)
@@ -369,7 +354,7 @@ class VolumeStack4D(VolumeStack):
         self.labels[baseline_index] = label_prepend + self.labels[baseline_index]
 
     def restore(self, i):
-        """Restore volume ``i`` from its original data, ending any difference."""
+        """This method resets volume ``i`` to its original data and ends any difference."""
         self.frames[i] = self._as_frames(self.original_data[i])
         self.set_frame(self.master_frame)
         self._refresh_views()
@@ -381,14 +366,15 @@ class VolumeStack4D(VolumeStack):
     # --- ROI mean against frame ---
 
     def roi_frame_means(self, i, x, y, radius):
-        """Mean of volume ``i`` inside a circle, for every frame, at the current slice.
+        """This method returns the mean of volume ``i`` in a circle at the current slice
+        for each frame.
 
-        The volume must show a spatial plane.  ``x`` and ``y`` are data coordinates
-        (column, row) of the circle center, as in :meth:`roi_stats`.  Returns an array
-        with one value per frame, or None when no pixel center falls inside the circle.
+        The volume must show a spatial plane.  The values ``x`` and ``y`` are the data
+        coordinates (column, row) of the circle center.  The method returns an array with
+        one value per frame.  It returns None if no pixel center falls inside the circle.
         """
         rows, columns, slice_axis, _second_axis = self.display_axes[i]
-        # The displayed plane of every frame, as one (frame, row, column) view.
+        # This view holds the displayed plane of every frame, with axes (frame, row, column).
         planes = np.transpose(self.frames[i], [0, rows, columns, slice_axis])[
             ..., self.cur_slices[i]]
         ny, nx = planes.shape[1:]
@@ -401,17 +387,19 @@ class VolumeStack4D(VolumeStack):
     # --- Movies ---
 
     def movie_frame_count(self, i, axis):
-        """Number of frames of volume ``i``'s movie along ``axis``, one of its hidden axes."""
+        """This method returns the number of frames in the movie of volume ``i`` along the
+        hidden axis ``axis``.
+        """
         return self._source(i).shape[axis]
 
     def movie_view(self, i, axis):
-        """Arguments of ``save_volume_as_gif`` that write volume ``i``'s view as a movie.
+        """This method returns the ``save_volume_as_gif`` arguments for a movie of the
+        view of volume ``i``.
 
-        ``axis`` is one of the volume's two hidden axes, in (t, x, y, z) numbering.  The
-        movie plays along it, and the other hidden axis stays at its current position.
-        Returns ``(volume, frame_axis, slice_axis, slice_index)``.  When the panel shows
-        its two axes transposed, they are swapped in ``volume``, so each movie frame
-        matches the panel.
+        The argument ``axis`` is one of the two hidden axes of the volume, in (t, x, y, z)
+        numbering.  The movie plays along this axis.  The method returns
+        ``(volume, frame_axis, slice_axis, slice_index)``.  Each movie frame matches the
+        panel, even if the panel is transposed.
         """
         rows, columns, slice_axis, second_axis = self.display_axes[i]
         volume = self._source(i)
@@ -424,13 +412,10 @@ class VolumeStack4D(VolumeStack):
     # --- File load ---
 
     def load_array(self, image_index, new_array, data_dict=None):
-        """Replace volume ``image_index`` with a loaded array; return [image_index].
-
-        A 2D array gains a trailing singleton axis, and a 3D or 4D array becomes one
-        volume.  Anything else raises ValueError.  The volume leaves any difference
-        state and keeps its plane in the standard display order.  The frame index is
-        kept where the new longest volume allows, and the slice position moves to the
-        loaded volume's middle slice.
+        """This method replaces volume ``image_index`` by a loaded 2D, 3D, or 4D array and
+        returns [image_index].  For an array of any other dimension, it raises ValueError.
+        The method ends any difference in this volume.  It moves the slice position to the
+        middle slice of the volume.
         """
         new_array = np.asarray(new_array)
         if new_array.ndim == 2:
@@ -456,45 +441,42 @@ class VolumeStack4D(VolumeStack):
 
 
 class SliceViewer4D(SliceViewer):
-    """Interactive viewer for 4D volumes, with every feature of the slice viewer (matplotlib).
+    """This class is used to view 4D volumes interactively in matplotlib.  It has every
+    feature of the slice viewer.
 
-    The window of :class:`SliceViewer` gains radio buttons for six planes, a frame-row
-    slider, and a plot of the ROI mean against frame.  In a spatial plane (x-y, x-z,
-    y-z) the frame-row slider sets the frame.  In a space-time plane (t-x, t-y, t-z)
-    each row is one frame, and the two sliders set the line of the volume that is
-    shown.  The slice slider and the frame-row slider each have a Play button, which
-    steps through that slider's axis, and a GIF button, which saves that movie for
-    every panel.  Space plays and pauses the frame row, and comma and period step it
-    back and forward.  Construction builds the figure but does not display it; call
-    :meth:`show` to display.  All data logic lives in :class:`VolumeStack4D`
-    (``self.stack``).
+    The class adds a choice of six planes, the frame slider, Play and GIF buttons for both
+    sliders, and a plot of the ROI mean against frame.  In a spatial plane, the frame slider
+    sets the frame.  In a space-time plane, each image row is one frame.  The space key plays
+    and pauses.  The comma and period keys step the frame slider.  :meth:`show` displays the
+    figure.
 
     Args:
         *datasets (ndarray or None): One or more 2D, 3D, or 4D arrays to display.  A 4D
-            array is ``(t, x, y, z)``.  A 2D or 3D array stays fixed in time.
-        data_dicts (None, dict, or list of dict/None, optional): String-valued dict(s)
-            associated with the volumes, viewable in the viewer.
-        title (str, optional): Figure title.  Defaults to ''.
-        vmin (float, optional): Minimum display intensity.  Defaults to the minimum
+            array has axes ``(t, x, y, z)``.  A 2D or 3D array stays fixed in time.
+        data_dicts (None, dict, or list of dict/None, optional): Dicts of strings that
+            describe the volumes.  The viewer can display them.
+        title (str, optional): The figure title.  Defaults to ''.
+        vmin (float, optional): The minimum display intensity.  Defaults to the minimum
             over every voxel of every volume.
-        vmax (float, optional): Maximum display intensity.  Defaults to the maximum
+        vmax (float, optional): The maximum display intensity.  Defaults to the maximum
             over every voxel of every volume.
-        slice_label (str or list of str, optional): Label(s) at the start of each
+        slice_label (str or list of str, optional): The label at the start of each
             panel title.  Defaults to no label.
-        slice_axis (int or list of int, optional): Axis to slice along, counted in each
-            array's own axes: 1, 2, or 3 for a 4D array and 0, 1, or 2 for a 3D array.
-            Defaults to z.  With 3D and 4D arrays together, give a list.
-        cmap (str, optional): Colormap.  Defaults to 'gray'.
-        show_instructions (bool, optional): Show the "Press h for help" hint.
-            Defaults to True.
-        save_fn (callable, optional): Replacement for the built-in HDF5 writer, called
-            as ``save_fn(file_path, array, array_name, attributes_dict)``.
-        fps (float, optional): Playback speed in frames per second, also used for
-            GIFs.  Defaults to 5.
-        movie_fn (callable, optional): Writer for the GIF buttons, called as mbirtorch's
-            ``save_volume_as_gif`` is: ``movie_fn(volume, filename, frame_axis=...,
-            slice_axis=..., slice_index=..., vmin=..., vmax=..., fps=...)``.  Defaults
-            to None, which leaves the GIF buttons out.
+        slice_axis (int or list of int, optional): The axis to slice along.  Each array
+            counts its own axes, so the value is 1, 2, or 3 for a 4D array and 0, 1, or 2
+            for a 3D array.  Defaults to z.  If the arrays mix 3D and 4D, give a list.
+        cmap (str, optional): The colormap.  Defaults to 'gray'.
+        show_instructions (bool, optional): If True, the viewer shows the "Press h for
+            help" hint.  Defaults to True.
+        save_fn (callable, optional): A replacement for the built-in HDF5 writer.  The
+            viewer calls ``save_fn(file_path, array, array_name, attributes_dict)``.
+        fps (float, optional): The playback speed in frames per second.  The GIFs use
+            the same speed.  Defaults to 5.
+        movie_fn (callable, optional): The writer for the GIF buttons.  The viewer calls
+            it with the arguments of mbirtorch's ``save_volume_as_gif``, as in
+            ``movie_fn(volume, filename, frame_axis=..., slice_axis=..., slice_index=...,
+            vmin=..., vmax=..., fps=...)``.  None leaves out the GIF buttons.  Defaults to
+            None.
     """
 
     def __init__(self, *datasets, data_dicts=None, title='', vmin=None, vmax=None,
@@ -522,13 +504,13 @@ class SliceViewer4D(SliceViewer):
     def _init_interaction_state(self):
         super()._init_interaction_state()
         self.playing = False
-        # The row that plays, 'slice' or 'frame', while playing is True.
+        # The row that plays while playing is True.  It is 'slice' or 'frame'.
         self._play_row = None
         self._play_timer = None
         self._play_regions = None
         self.frame_slider = None
-        # Per row: its Play button, its buttons, and the label that playback shows in
-        # place of the slider's value.
+        # These dicts hold, for each row, the Play button, all buttons, and the label that
+        # playback shows in place of the slider value.
         self.play_buttons = {}
         self._row_buttons = {}
         self._play_labels = {}
@@ -541,11 +523,8 @@ class SliceViewer4D(SliceViewer):
         n = self.stack.n_volumes
         self.fig = sf.plt.figure(figsize=(6 * n, 10.5))
         self.fig.suptitle(self.title)
-        # The rows are the panels, the plane radios, a block of sliders, and the plot
-        # of the ROI mean against frame.  The block holds the slice slider, the frame
-        # row, and the intensity slider, close together.  The slice slider and the
-        # frame-row slider come first, because together they set the position along
-        # the two hidden axes.
+        # The grid rows are the panels, the plane radio buttons, the sliders, and the ROI
+        # plot.  The slider area holds the slice slider, the frame row, and the intensity slider.
         self.gs = sf.gridspec.GridSpec(nrows=4, ncols=n, height_ratios=[14, 3, 3.5, 4],
                                        left=0.12, right=0.95, top=0.92,
                                        bottom=0.05, hspace=0.3, figure=self.fig)
@@ -565,10 +544,8 @@ class SliceViewer4D(SliceViewer):
         self._create_roi_plot()
         self._label_slice_slider()
 
-        # This opaque rectangle is drawn under partial redraws.  Marking it
-        # animated keeps it out of ordinary full draws.  Its bounds are in screen
-        # pixels, so it is also kept out of the layout: a figure saved with a tight
-        # bounding box at another resolution would otherwise grow to include it.
+        # This opaque rectangle is drawn under partial redraws.  It is animated and kept
+        # out of the layout, so full draws and saves with a tight bounding box omit it.
         self._clear_rect = sf.Rectangle((0, 0), 1, 1,
                                         facecolor=self.fig.get_facecolor(),
                                         edgecolor='none', animated=True,
@@ -582,16 +559,14 @@ class SliceViewer4D(SliceViewer):
 
     @staticmethod
     def _slider_cells(spec):
-        # A slider row splits into a cell for its buttons and label, the slider, and a
-        # value cell.  Every slider row and the ROI plot use these proportions, so they
-        # line up.
+        # A slider row has three parts: the buttons and label, the slider, and the value.
+        # Every slider row and the ROI plot use these proportions.
         return sf.gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=spec,
                                                    width_ratios=[2.5, 8.0, 2.0])
 
     def _slider_slot(self, row):
         # The inherited sliders ask for row 2 (slice) and row 3 (intensity).  Here they
-        # are the first and the last row of the slider block, with the frame row
-        # between them.
+        # are the first and last rows of the slider area, and the frame row is between them.
         block_row = {2: 0, 3: 2}[row]
         return self._slider_cells(self._slider_rows[block_row, 0])[0, 1]
 
@@ -601,8 +576,8 @@ class SliceViewer4D(SliceViewer):
         if head and not head.endswith(':'):
             head += ':'
         rows, columns, slice_axis, second_axis = stack.display_axes[i]
-        # The title gives the position along each hidden axis.  A volume that does
-        # not change in time has no frame to give.
+        # The title gives the position along each hidden axis.  The title omits the frame
+        # of a volume that does not change in time.
         positions = {slice_axis: stack.cur_slices[i]}
         if second_axis != 0 or stack.has_time(i):
             positions[second_axis] = stack.cur_seconds[i]
@@ -618,7 +593,7 @@ class SliceViewer4D(SliceViewer):
                                             AXIS_NAMES[rows], AXIS_NAMES[columns]))
 
     def _rebuild_axis_radios(self):
-        # This follows the inherited method, with one radio button per plane.
+        # This method follows the inherited method, with one radio button per plane.
         for ax in self._radio_axes:
             ax.remove()
         self._radio_axes = []
@@ -648,7 +623,7 @@ class SliceViewer4D(SliceViewer):
                         i, PLANES[PLANE_LABELS.index(label)]))
 
     def _label_slice_slider(self):
-        # The slice slider is named by its axis when every panel slices the same axis.
+        # The slice slider is labeled with its axis when every panel slices the same axis.
         if self.slice_slider is None:
             return
         axes = set(self.stack.slice_axes)
@@ -656,12 +631,8 @@ class SliceViewer4D(SliceViewer):
             AXIS_NAMES[axes.pop()] if len(axes) == 1 else 'Slice')
 
     def _create_row_controls(self, row):
-        """Add the Play and GIF buttons of a position row, and its playback label.
-
-        ``row`` is 'slice' (the first row of the slider block) or 'frame' (the second).
-        The buttons sit in the row's left cell, beside the slider's label, and the label
-        that playback shows in place of the slider's value sits in the right cell.
-        Returns the row's cells.
+        """This method adds the Play and GIF buttons and the playback label of row ``row``.
+        The row is 'slice' or 'frame'.  The method returns the gridspec of the row.
         """
         cells = self._slider_cells(self._slider_rows[ROWS.index(row), 0])
         left = sf.gridspec.GridSpecFromSubplotSpec(
@@ -688,7 +659,7 @@ class SliceViewer4D(SliceViewer):
             button.ax.set_visible(visible)
 
     def _create_frame_row(self):
-        # The frame row is the middle row of the slider block.
+        # The frame row is the middle row of the slider area.
         cells = self._create_row_controls('frame')
         self._frame_slider_ax = self.fig.add_subplot(cells[0, 1])
         self._update_second_slider()
@@ -704,14 +675,15 @@ class SliceViewer4D(SliceViewer):
         self.frame_slider.on_changed(self._on_frame_slider)
 
     def _update_second_slider(self):
-        """Track the frame-row slider's axis: label, bounds, value, and visibility."""
+        """This method updates the label, bounds, value, and visibility of the frame slider
+        to match its current axis."""
         stack = self.stack
         count = stack.second_count
         visible = count > 1
         self._frame_slider_ax.set_visible(visible)
         self._set_row_visible('frame', visible)
         if self.roi_plot_ax is not None:
-            # The ROI plot follows the frames, so it appears in a spatial plane only.
+            # The ROI plot shows values against frame, so it appears in a spatial plane only.
             roi_visible = visible and stack.second_axis == 0
             self.roi_plot_ax.set_visible(roi_visible)
             if roi_visible:
@@ -727,8 +699,7 @@ class SliceViewer4D(SliceViewer):
         self.frame_slider.set_val(stack.second_position)
 
     def _create_roi_plot(self):
-        # The plot spans the sliders' columns, so its frame axis lines up with the
-        # frame-row slider.
+        # The plot spans the slider columns, so its frame axis lines up with the frame slider.
         self.roi_plot_ax = self.fig.add_subplot(self._slider_cells(self.gs[3, :])[0, 1])
         ax = self.roi_plot_ax
         ax.set_xlabel('t', fontsize=ROI_PLOT_FONT_SIZE)
@@ -744,7 +715,7 @@ class SliceViewer4D(SliceViewer):
     # --- The plot of the ROI mean against frame ---
 
     def _update_roi_plot(self):
-        """Recompute the ROI mean against frame for every volume."""
+        """This method recomputes the ROI mean against frame for every volume."""
         ax = self.roi_plot_ax
         for line in self._roi_lines:
             line.remove()
@@ -753,9 +724,9 @@ class SliceViewer4D(SliceViewer):
         if legend is not None:
             legend.remove()
         circle = self.circles[0] if self.circles else None
-        # The plot follows the frames, so it is computed in a spatial plane only.  The
-        # stack's plane is checked because a plane change moves the slice slider, and
-        # so calls this method, before the plot is hidden.
+        # The plot is computed in a spatial plane only.  The code checks the plane of the
+        # stack, because a plane change moves the slice slider and calls this method before
+        # the plot is hidden.
         if circle is not None and self.stack.second_axis == 0 and ax.get_visible():
             x, y = circle.center
             radius = circle.get_radius()
@@ -765,12 +736,12 @@ class SliceViewer4D(SliceViewer):
                 if means is None:
                     continue
                 if means.size == 1:
-                    # A volume with one frame is fixed in time: a flat line.
+                    # A volume with one frame is fixed in time, so its plot is a flat line.
                     frames, means = [0, last_frame], [means[0], means[0]]
                 else:
                     frames = np.arange(means.size)
                 label = self.stack.labels[i].strip() or 'Image {}'.format(i)
-                # Each volume keeps one color, however often the plot is recomputed.
+                # Each volume keeps the same color when the plot is recomputed.
                 (line,) = ax.plot(frames, means, lw=1.2, label=label,
                                   color='C{}'.format(i))
                 self._roi_lines.append(line)
@@ -795,8 +766,8 @@ class SliceViewer4D(SliceViewer):
     def _on_axis_selected(self, volume_index, plane):
         self._pause_if_playing()
         if volume_index is not None and 0 in plane and not self.sync_axes:
-            # One frame-row slider serves every panel, so a space-time plane is shown
-            # in all panels, and the radios become one set.
+            # All panels share one frame slider.  So a space-time plane is shown in all
+            # panels, and the panels share one set of radio buttons.
             self.sync_axes = True
             self._rebuild_axis_radios()
             volume_index = None
@@ -822,22 +793,22 @@ class SliceViewer4D(SliceViewer):
         self.sync_axes = not self.sync_axes
         self._rebuild_axis_radios()
         if self.sync_axes:
-            # Every volume takes volume 0's plane.
+            # Every volume takes the plane of volume 0.
             self._on_axis_selected(None, self.stack.plane(0))
         self.fig.canvas.draw_idle()
 
     def _menu_items(self, i):
         items = super()._menu_items(i)
         if self.stack.second_axis != 0:
-            # A space-time plane is shown in every panel, so the panels stay coupled.
+            # A space-time plane is shown in every panel, so the panels must stay coupled.
             items = [item for item in items if item[0] != 'Decouple slice axes']
         return items
 
     def _reset_view(self, volume_index=None):
         super()._reset_view(volume_index)
-        # In a space-time plane every panel spans the frames of the longest volume,
-        # so the frames of all panels line up.  The sync latch is held, as in the
-        # inherited method.
+        # In a space-time plane, every panel spans the frames of the longest volume.  So the
+        # frames of all panels line up.  The code sets _in_sync_callback, as the inherited
+        # method does.
         indices = (range(self.stack.n_volumes) if volume_index is None
                    else [volume_index])
         span = (-0.5, self.stack.max_frames - 0.5)
@@ -853,33 +824,36 @@ class SliceViewer4D(SliceViewer):
         finally:
             self._in_sync_callback = already_syncing
 
-    # --- The two position rows: their axes, and the panels that change along them ---
+    # --- The two slider rows, their axes, and the panels that change along them ---
 
     def _row_slider(self, row):
         return self.slice_slider if row == 'slice' else self.frame_slider
 
     def _row_axis(self, row, i):
-        """Axis of volume ``i`` that the row's slider moves, in (t, x, y, z) numbering."""
+        """This method returns the axis of volume ``i`` that the slider of the row moves.
+        The axis is in (t, x, y, z) numbering.
+        """
         slice_axis, second_axis = self.stack.display_axes[i][2:]
         return slice_axis if row == 'slice' else second_axis
 
     def _row_position(self, row):
-        """Return (position, number of positions) of the row's slider."""
+        """This method returns the position and the number of positions of the slider of the
+        row."""
         stack = self.stack
         if row == 'slice':
             return stack.master_index, stack.max_slices
         return stack.second_position, stack.second_count
 
     def _moving_panels(self, row):
-        """Panels whose view changes along the row's axis."""
+        """This method returns the panels whose view changes along the axis of the row."""
         return [i for i in range(self.stack.n_volumes)
                 if self.stack.movie_frame_count(i, self._row_axis(row, i)) > 1]
 
     # --- GIF buttons ---
 
     def _gif_file_name(self, row, i):
-        # For example init_x-y_along-z_t3.gif: the label, the plane, the axis the movie
-        # plays along, and the position along the other hidden axis.
+        # An example name is init_x-y_along-z_t3.gif.  It gives the label, the plane, the
+        # axis of the movie, and the position along the other hidden axis.
         stack = self.stack
         slice_axis, second_axis = stack.display_axes[i][2:]
         axis = self._row_axis(row, i)
@@ -888,7 +862,7 @@ class SliceViewer4D(SliceViewer):
         label = re.sub(r'[^A-Za-z0-9_-]+', '_', stack.labels[i]).strip('_') or 'volume'
         plane = PLANE_LABELS[PLANES.index(stack.plane(i))]
         name = '{}_{}_along-{}'.format(label, plane, AXIS_NAMES[axis])
-        # A volume that does not change in time has no frame to name.
+        # The name omits the frame of a volume that does not change in time.
         if fixed_axis != 0 or stack.has_time(i):
             name += '_{}{}'.format(AXIS_NAMES[fixed_axis], fixed_index)
         return name + '.gif'
@@ -901,11 +875,8 @@ class SliceViewer4D(SliceViewer):
             self._write_gifs(row, chosen)
 
     def _native_choose_folder(self, directory):
-        """Return a folder chosen in the macOS folder panel, None if cancelled, or the
-        unavailable marker.
-
-        The panel runs in its own process, so it works under every backend.  On other
-        systems the in-figure dialog is used.
+        """This method returns a folder chosen in the macOS folder panel.  It returns None if
+        the user cancels.  On other systems it returns ``_NATIVE_UNAVAILABLE``.
         """
         if (sys.platform != 'darwin'
                 or matplotlib.get_backend().lower() in sf.NONINTERACTIVE_BACKENDS):
@@ -924,12 +895,13 @@ class SliceViewer4D(SliceViewer):
             return sf._NATIVE_UNAVAILABLE
         if result.returncode != 0:
             if 'canc' in (result.stderr or '').lower():
-                return None  # the user cancelled the panel
+                return None  # The user cancelled the panel.
             return sf._NATIVE_UNAVAILABLE
         return result.stdout.strip() or None
 
     def _open_gif_dialog(self, row):
-        """In-figure dialog with a path box for the folder of the GIFs."""
+        """This method opens a dialog in the figure.  The dialog has a text box for the folder
+        of the GIFs."""
         self._open_dialog('gif')
         x0, y0, w, h = self._dialog_panel(6.0, 1.9)
         self._dialog_text('title', (x0 + 0.02 * w, y0 + h - 0.05),
@@ -952,11 +924,9 @@ class SliceViewer4D(SliceViewer):
         self._write_gifs(row, folder)
 
     def _write_gifs(self, row, folder):
-        """Write one GIF per panel that changes along the row's axis into ``folder``.
-
-        Each GIF plays the panel's view along the axis, at the displayed intensity
-        range.  A file that exists already is kept, and the new GIF gets a numbered
-        name.
+        """This method writes one GIF into ``folder`` for each panel that changes along the
+        axis of the row.  The method does not overwrite an existing file.  Instead, the new
+        GIF gets a numbered name.
         """
         try:
             os.makedirs(folder, exist_ok=True)
@@ -985,7 +955,9 @@ class SliceViewer4D(SliceViewer):
 
     @staticmethod
     def _unused_path(path):
-        """Return ``path``, or ``path`` with a number before its extension if it exists."""
+        """This method returns ``path`` if no file exists there.  Otherwise it returns
+        ``path`` with a number before its extension.
+        """
         stem, extension = os.path.splitext(path)
         number = 2
         while os.path.exists(path):
@@ -993,7 +965,7 @@ class SliceViewer4D(SliceViewer):
             number += 1
         return path
 
-    # --- Frame-row slider, stepping, and playback ---
+    # --- Frame slider, stepping, and playback ---
 
     def _on_frame_slider(self, value):
         self._pause_if_playing()
@@ -1012,9 +984,8 @@ class SliceViewer4D(SliceViewer):
             int(np.clip(stack.second_position + step, 0, stack.second_count - 1)))
 
     def _toggle_play(self, row='frame'):
-        """Play the row's slider, or pause it if it is playing.
-
-        One row plays at a time, so a row that plays stops when the other row starts.
+        """This method plays the slider of the row, or pauses it if it is playing.  Starting
+        one row stops the other row.
         """
         playing_row = self._play_row
         if self.playing:
@@ -1027,7 +998,9 @@ class SliceViewer4D(SliceViewer):
             self._stop_playback()
 
     def _playback_regions(self, row):
-        """(bbox, artists) pairs that playback of the row redraws on every step."""
+        """This method returns the (bbox, artists) pairs that playback of the row redraws in
+        each step.
+        """
         regions = []
         for i in self._moving_panels(row):
             # The ROI circle and its statistics sit above the image, so they are
@@ -1044,7 +1017,7 @@ class SliceViewer4D(SliceViewer):
         return regions
 
     def _row_label_text(self, row):
-        # For example "t = 3": the slider's name and its position.
+        # The text gives the slider name and its position, as in "t = 3".
         return '{} = {}'.format(self._row_slider(row).label.get_text(),
                                 self._row_position(row)[0])
 
@@ -1056,13 +1029,10 @@ class SliceViewer4D(SliceViewer):
         self._play_row = row
         self._hide_tooltips()
         self.play_buttons[row].label.set_text('Pause')
-        # On a canvas that can blit, playback redraws only the images, the ROI
-        # graphics above them, the playback label, and the plot marker.  They are
-        # marked animated, so ordinary draws leave them out, and their backgrounds are
-        # saved after one full draw.  Nothing else changes while the viewer plays,
-        # which is what keeps the macosx backend from redrawing the whole figure on each
-        # step.  A canvas that cannot blit, such as the WebAgg and notebook canvases,
-        # redraws the whole figure on each step, so the artists stay in ordinary draws.
+        # On a canvas that can blit, playback redraws only the images, the ROI graphics,
+        # the playback label, and the plot marker.  The code marks these artists as animated.
+        # This keeps the macosx backend from redrawing the whole figure on each step.  A canvas that
+        # cannot blit, such as WebAgg, redraws the whole figure.
         canvas = self.fig.canvas
         blit = getattr(canvas, 'supports_blit', False)
         regions = self._playback_regions(row)
@@ -1086,7 +1056,8 @@ class SliceViewer4D(SliceViewer):
         self._play_timer.start()
 
     def _play_step(self):
-        """Advance playback by one position, looping at the end."""
+        """This method advances playback by one position.  At the end, it returns to the
+        start."""
         if not self.playing:
             return
         row = self._play_row
@@ -1134,9 +1105,9 @@ class SliceViewer4D(SliceViewer):
         slider = self._row_slider(row)
         slider.valtext.set_visible(True)
         self.play_buttons[row].label.set_text('Play')
-        # The slider, the titles, and the ROI plot were left alone during playback, so
-        # they catch up here.  Setting the slider moves the ROI plot's marker or
-        # recomputes its curves.
+        # Playback does not update the slider, the titles, or the ROI plot, so they are
+        # updated here.  Setting the slider moves the marker of the ROI plot or recomputes
+        # its curves.
         slider.set_val(self._row_position(row)[0])
         self.refresh()
         self._display_roi_stats(force=True)
@@ -1179,8 +1150,8 @@ class SliceViewer4D(SliceViewer):
             self.fig.canvas.draw_idle()
 
     def _on_key(self, event):
-        # Space pauses any playback, or plays the frame row.  Comma and period step the
-        # frame row.
+        # The space key pauses any playback, or plays the frame row.  The comma and period
+        # keys step the frame row.
         if self._dialog is None:
             if event.key == ' ' and (self.playing or self.frame_slider is not None):
                 if self.playing:
@@ -1210,19 +1181,17 @@ class SliceViewer4D(SliceViewer):
         super()._show_message(show, message_type=message_type, message=message)
 
     def _open_menu_dialog(self, items, event):
-        # The inherited method divides the click position by the canvas size in
-        # logical pixels, and mouse events give the position in physical pixels.
-        # The position is converted to logical pixels here, so the menu opens at the
-        # cursor on a screen whose device pixel ratio is above 1, such as Retina.
+        # Mouse events give physical pixels, but the inherited method expects logical
+        # pixels.  So the position is converted here for screens such as Retina.
         ratio = self.fig.canvas.device_pixel_ratio
         if ratio != 1:
             event = copy.copy(event)
             event.x, event.y = event.x / ratio, event.y / ratio
         super()._open_menu_dialog(items, event)
 
-    # A dialog is laid out as if the figure were DIALOG_LAYOUT_HEIGHT inches tall and
-    # centered on it, and each part is mapped onto this figure.  The dialog then has the
-    # size and spacing, in inches, that it has in the slice viewer.
+    # A dialog is laid out as if the figure were DIALOG_LAYOUT_HEIGHT inches tall.  Each
+    # part is then mapped onto this figure, centered vertically.  So the dialog has the
+    # same size and spacing in inches as in the slice viewer.
 
     def _dialog_panel(self, width_in, height_in):
         fig_w, fig_h = self.fig.get_size_inches()
@@ -1240,7 +1209,7 @@ class SliceViewer4D(SliceViewer):
         return x0, y0, w, h
 
     def _to_figure(self, rect):
-        """Map a rect of the dialog layout to figure fractions."""
+        """This method maps a rectangle from the dialog coordinates to figure fractions."""
         scale = self._dialog.get('vertical_scale', 1.0)
         x, y, w, h = rect
         return (x, 0.5 + (y - 0.5) * scale, w, h * scale)
@@ -1311,46 +1280,44 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
                    slice_label=None, slice_axis=None, cmap='gray',
                    show_instructions=True, block=True, save_fn=None, fps=5,
                    movie_fn=None):
-    """Launch an interactive viewer for one or more 4D volumes.
+    """This function opens an interactive viewer for one or more 4D volumes.
 
-    This function builds a :class:`SliceViewer4D`, shows it, and returns it.  The
-    viewer has every feature of :func:`slice_viewer`.  It adds a frame slider,
-    space-time planes (t-x, t-y, t-z) that show one line of the volume in every frame,
-    and a plot of the ROI mean against frame.  The slice slider and the frame slider
-    each have a Play button, which steps through that slider's axis in every panel, and,
-    with ``movie_fn``, a GIF button, which saves that movie for every panel.
+    The function builds a :class:`SliceViewer4D`, shows it, and returns it.  The viewer has
+    every feature of :func:`slice_viewer`.  It adds a frame slider, space-time planes, Play
+    and GIF buttons, and a plot of the ROI mean against frame.
 
     Args:
         *datasets (ndarray or None): One or more 2D, 3D, or 4D arrays to display.  A 4D
-            array is ``(t, x, y, z)``.  A 2D or 3D array stays fixed in time.
-        data_dicts (None, dict, or list of dict/None, optional): String-valued dict(s)
-            associated with the volumes, viewable in the viewer.
-        title (str, optional): Figure title.  Defaults to ''.
-        vmin (float, optional): Minimum display intensity.  Defaults to the minimum
+            array has axes ``(t, x, y, z)``.  A 2D or 3D array stays fixed in time.
+        data_dicts (None, dict, or list of dict/None, optional): Dicts of strings that
+            describe the volumes.  The viewer can display them.
+        title (str, optional): The figure title.  Defaults to ''.
+        vmin (float, optional): The minimum display intensity.  Defaults to the minimum
             over every voxel of every volume.
-        vmax (float, optional): Maximum display intensity.  Defaults to the maximum
+        vmax (float, optional): The maximum display intensity.  Defaults to the maximum
             over every voxel of every volume.
-        slice_label (str or list of str, optional): Label(s) at the start of each
+        slice_label (str or list of str, optional): The label at the start of each
             panel title.  Defaults to no label.
-        slice_axis (int or list of int, optional): Axis to slice along, counted in each
-            array's own axes: 1, 2, or 3 for a 4D array and 0, 1, or 2 for a 3D array.
-            Defaults to z.  With 3D and 4D arrays together, give a list.
-        cmap (str, optional): Colormap.  Defaults to 'gray'.
-        show_instructions (bool, optional): Show the "Press h for help" hint.
-            Defaults to True.
-        block (bool, optional): If True (default), block until the window is closed.
-            If False, leave the window open and return immediately, as in
-            :func:`slice_viewer`.
-        save_fn (callable, optional): Replacement for the built-in HDF5 writer, called
-            as ``save_fn(file_path, array, array_name, attributes_dict)``.
-        fps (float, optional): Playback speed in frames per second, also used for
-            GIFs.  Defaults to 5.
-        movie_fn (callable, optional): Writer for the GIF buttons, called as
-            mbirtorch's ``save_volume_as_gif`` is.  Defaults to None, which leaves the
-            GIF buttons out.  ``mbirtorch.slice_viewer4d`` passes ``save_volume_as_gif``.
+        slice_axis (int or list of int, optional): The axis to slice along.  Each array
+            counts its own axes, so the value is 1, 2, or 3 for a 4D array and 0, 1, or 2
+            for a 3D array.  Defaults to z.  If the arrays mix 3D and 4D, give a list.
+        cmap (str, optional): The colormap.  Defaults to 'gray'.
+        show_instructions (bool, optional): If True, the viewer shows the "Press h for
+            help" hint.  Defaults to True.
+        block (bool, optional): If True, the function waits until the window is closed.
+            If False, it leaves the window open and returns at once, as in
+            :func:`slice_viewer`.  Defaults to True.
+        save_fn (callable, optional): A replacement for the built-in HDF5 writer.  The
+            viewer calls ``save_fn(file_path, array, array_name, attributes_dict)``.
+        fps (float, optional): The playback speed in frames per second.  The GIFs use
+            the same speed.  Defaults to 5.
+        movie_fn (callable, optional): The writer for the GIF buttons.  The viewer calls
+            it with the arguments of mbirtorch's ``save_volume_as_gif``.  None leaves out
+            the GIF buttons.  ``mbirtorch.slice_viewer4d`` passes ``save_volume_as_gif``.
+            Defaults to None.
 
     Returns:
-        SliceViewer4D: the viewer object.
+        SliceViewer4D: The viewer object.
     """
     viewer = SliceViewer4D(*datasets, data_dicts=data_dicts, title=title,
                            vmin=vmin, vmax=vmax, slice_label=slice_label,
@@ -1358,8 +1325,8 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
                            show_instructions=show_instructions, save_fn=save_fn,
                            fps=fps, movie_fn=movie_fn)
     viewer.show(block=block)
-    # Nonblocking viewers join the slice viewer's registry, so a later blocking call
-    # of either viewer adopts and closes them.
+    # A nonblocking viewer is added to the list of open slice viewers.  A later blocking
+    # call of either viewer closes the viewers in this list.
     if not block:
         sf._NONBLOCKING_VIEWERS.append(viewer)
         return viewer

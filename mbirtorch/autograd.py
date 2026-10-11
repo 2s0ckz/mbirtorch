@@ -1,11 +1,9 @@
-"""Differentiable projectors, for coupling to deep-learning pipelines.
+"""This module provides differentiable projectors for use in deep-learning pipelines.
 
-The forward and back projectors are exact adjoint pairs by construction
-(tests/test_adjoint.py verifies <Ax, y> == <x, A'y>), so each is the correct
-autograd backward of the other -- no autodiff through the kernel internals is
-needed.  ``forward_project_differentiable`` exposes gradient flow through the
-volume; ``TorchProjector`` wraps it as an ``nn.Module`` in the LEAP style so a
-learned-prior pipeline can insert the physics operator like any layer.
+The forward projector and the back projector are exact adjoints of each other.  For this
+reason, the autograd backward pass of each projector is the other projector.  The function
+``forward_project_differentiable`` lets gradients flow back to the volume.  The class
+``TorchProjector`` wraps this function as an ``nn.Module``.
 """
 
 import torch
@@ -15,7 +13,8 @@ from . import _sharding
 
 
 class _ForwardProjectFunction(torch.autograd.Function):
-    """A: voxel cylinders at fixed indices -> sinogram; backward is A'."""
+    """This class is used to apply the forward projector A to the voxel values at fixed pixel
+    indices.  Its backward pass applies the back projector A'."""
 
     @staticmethod
     def forward(ctx, voxel_values, model, pixel_indices):
@@ -31,7 +30,8 @@ class _ForwardProjectFunction(torch.autograd.Function):
 
 
 class _BackProjectFunction(torch.autograd.Function):
-    """A': sinogram -> voxel cylinders at fixed indices; backward is A."""
+    """This class is used to apply the back projector A' to a sinogram.  It returns the voxel
+    values at fixed pixel indices.  Its backward pass applies the forward projector A."""
 
     @staticmethod
     def forward(ctx, sinogram, model, pixel_indices):
@@ -56,26 +56,23 @@ def _require_single_device(model):
 
 
 def forward_project_differentiable(model, volume):
-    """Differentiable full-volume forward projection.
+    """This function computes a differentiable forward projection of a full volume.
 
-    The input may live on any device and dtype: it is moved to the model's
-    device as float32 through a DIFFERENTIABLE ``.to`` (autograd then returns
-    the gradient on the input's own device and dtype -- without this, a CPU or
-    float64 leaf against a CUDA/MPS model would fail at forward or, worse, only
-    at backward).  The ROR indices come from the model's per-shape
-    cache rather than being rebuilt and re-uploaded per call.
+    The volume may have any device and any dtype.  The function copies the volume to the
+    model device as float32.  The gradient with respect to the volume has the device and
+    dtype of the input volume.  The function works only when the model uses one device.
 
     Args:
-        model: a TomographyModel (e.g. ParallelBeamModel).
-        volume: (num_rows, num_cols, num_slices) tensor; may require grad.
+        model: (TomographyModel) The model, for example a ParallelBeamModel.
+        volume: (tensor) The volume, with shape (num_rows, num_cols, num_slices).  The volume
+            may require grad.
 
     Returns:
-        (num_views, num_det_rows, num_det_channels) tensor with gradient flow
-        back to ``volume`` (the gather into cylinders is differentiable, and
-        the projector pair supplies the operator's gradient).
+        A tensor with shape (num_views, num_det_rows, num_det_channels).  Gradients flow
+        from this tensor back to ``volume``.
     """
     _require_single_device(model)
-    # The check above does not cover a sharded array built by another model.
+    # The check above does not detect a sharded array that another model built.
     _sharding.reject_shards('forward_project_differentiable', volume=volume)
     volume = volume.to(device=model.torch_device, dtype=torch.float32)
     indices = model.full_indices_device()
@@ -84,8 +81,9 @@ def forward_project_differentiable(model, volume):
 
 
 def back_project_differentiable(model, sinogram):
-    """Differentiable full-volume back projection (adjoint of the above; the
-    same device/dtype normalization and index caching apply)."""
+    """This function computes a differentiable back projection that returns a full volume.
+    It is the adjoint of :func:`forward_project_differentiable`, and it handles device and
+    dtype in the same way."""
     _require_single_device(model)
     _sharding.reject_shards('back_project_differentiable', sinogram=sinogram)
     recon_shape = model.get_params('recon_shape')
@@ -99,10 +97,9 @@ def back_project_differentiable(model, sinogram):
 
 
 class TorchProjector(torch.nn.Module):
-    """The forward operator as an ``nn.Module`` (LEAP-style).
-
-    forward(volume) -> sinogram, differentiable in ``volume``.  The adjoint is
-    exposed as ``.adjoint(sinogram)``.
+    """This class is used to wrap the forward projector as an ``nn.Module``.  The method
+    ``forward(volume)`` returns the sinogram, and the sinogram is differentiable with respect
+    to ``volume``.  The method ``adjoint(sinogram)`` returns the back projection.
     """
 
     def __init__(self, model):

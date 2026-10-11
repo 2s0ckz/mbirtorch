@@ -5,24 +5,24 @@ import h5py
 
 def get_sino_and_model(filename, *, bh_correction=True, auto_crop=False, subsample_view_factor=1):
     """
-    Load an ORNL HDF5 scan, compute its sinogram, and return a cone beam model ready to reconstruct.
-
-    The file holds the sinogram, already converted to negative log transmission, together with the
-    geometry and the beam hardening parameters.  The detector rotation stored in the file is removed
-    from the sinogram.  Lengths in the model are in detector pixels.
+    This function loads an ORNL HDF5 scan and returns its sinogram and a cone beam model.
+    The file holds the -log sinogram, the geometry, and the beam hardening parameters.  The
+    function removes the detector rotation stored in the file.  The model measures lengths in
+    detector pixels.
 
     Args:
-        filename (str): Path to the HDF5 file.
-        bh_correction (bool, optional): If True, apply the beam hardening correction whose parameters
-            are stored in the file.  Defaults to True.
-        auto_crop (bool, optional): If True, remove the blank margins of the sinogram and shrink the
-            reconstruction to match.  Defaults to False.
-        subsample_view_factor (int, optional): Keep every n-th view.  Defaults to 1.
+        filename (str): The path to the HDF5 file.
+        bh_correction (bool, optional): If True, the function applies the beam hardening
+            correction with the parameters stored in the file.  Defaults to True.
+        auto_crop (bool, optional): If True, the function removes the blank margins of the
+            sinogram and shrinks the reconstruction to match.  Defaults to False.
+        subsample_view_factor (int, optional): The function keeps every n-th view, where n is
+            this value.  Defaults to 1.
 
     Returns:
-        tuple: ``(sino, model)``: the sinogram, shape (num_views, num_det_rows, num_det_channels), and
-        a ConeBeamModel with its parameters set.  Weights are not returned; make them with
-        ``mbirtorch.gen_weights``.
+        tuple: ``(sino, model)``.  sino is the sinogram, with shape (num_views, num_det_rows,
+        num_det_channels).  model is a ConeBeamModel with its parameters set.  Use
+        ``mbirtorch.gen_weights`` to compute the weights.
 
     Example:
         .. code-block:: python
@@ -41,10 +41,9 @@ def get_sino_and_model(filename, *, bh_correction=True, auto_crop=False, subsamp
 
 
 def _compute_sino_and_params(filename, bh_correction=True):
-    """Read an ORNL HDF5 scan and return ``(sino, required_params, optional_params)``.
-
-    The two parameter dicts are the ConeBeamModel constructor arguments and the
-    ``set_params()`` settings.
+    """This function reads an ORNL HDF5 scan and returns ``(sino, required_params,
+    optional_params)``.  required_params holds the ConeBeamModel constructor arguments, and
+    optional_params holds the settings for ``set_params()``.
     """
     import mbirtorch
     import mbirtorch.preprocess as mtp
@@ -67,14 +66,12 @@ def _compute_sino_and_params(filename, bh_correction=True):
 
 def create_proj_params_dict_ornl(h5_file):
     """
-    Build cone‐beam geometry dictionaries from an open ORNL HDF5 file.
-
-    This function reads the HDF5 attributes and computes all distances and offsets
-    normalized to detector‐pixel units, and converts angles to radians.
+    This function builds the cone beam geometry dictionaries from an open ORNL HDF5 file.
+    The dictionaries give distances in detector pixels and angles in radians.
 
     Args:
         h5_file (h5py.File):
-            Opened NSI HDF5 file with required attributes:
+            An open NSI HDF5 file with these required attributes:
             - 'distance unit', 'det_pixel_size', 'iso_det_dist', 'src_iso_dist'
             - 'voxel_size', 'det_column_offset', 'det_row_offset'
             - 'angle unit', 'angles', 'det_angle'
@@ -83,11 +80,11 @@ def create_proj_params_dict_ornl(h5_file):
     Returns:
         tuple:
             cone_beam_params (dict):
-                Required parameters for ConeBeamModel constructor:
-                  - "sinogram_shape" (tuple): shape of the raw projection array.
-                  - "angles" (ndarray): projection angles in radians.
-                  - "source_detector_dist" (float): source to detector distance (in pixel units).
-                  - "source_iso_dist" (float): source to isocenter distance (in pixel units).
+                The required parameters for the ConeBeamModel constructor:
+                  - "sinogram_shape" (tuple): The shape of the raw projection array.
+                  - "angles" (ndarray): The projection angles in radians.
+                  - "source_detector_dist" (float): The source to detector distance in pixels.
+                  - "source_iso_dist" (float): The source to isocenter distance in pixels.
             optional_params (dict):
                 Additional reconstruction settings for `set_params()`:
                   - "delta_det_channel" (float)
@@ -96,7 +93,7 @@ def create_proj_params_dict_ornl(h5_file):
                   - "det_channel_offset" (float)
                   - "det_row_offset" (float)
     """
-    # Unit conversion to 'ALU' pixel units if necessary
+    # This code converts lengths to detector pixels.
     det_pixel_size = h5_file.attrs['det_pixel_size']
     iso_det_dist = h5_file.attrs['iso_det_dist'] / det_pixel_size
     source_iso_dist = h5_file.attrs['src_iso_dist'] / det_pixel_size
@@ -107,7 +104,7 @@ def create_proj_params_dict_ornl(h5_file):
     delta_det_channel = 1.0
     delta_det_row = 1.0
 
-    # Angle conversion to radians
+    # This code converts angles to radians.
     if h5_file.attrs['angle unit'] == 'radian':
         angles = h5_file.attrs['angles']
         det_rotation = h5_file.attrs['det_angle']
@@ -135,18 +132,16 @@ def create_proj_params_dict_ornl(h5_file):
 
 def load_projection_data_ornl(h5_file):
     """
-    Read and return the raw sinogram array from an ORNL HDF5 file.
-
-    This function assumes the first entry in the 'projection' group
-    is the object scan used to build –log(I/I0) sinogram data.
+    This function reads the -log(I/I0) sinogram from the first entry of the 'projection' group
+    of an ORNL HDF5 file.
 
     Args:
         h5_file (h5py.File):
-            Open NSI HDF5 file containing a 'projection' group.
+            An open NSI HDF5 file that contains a 'projection' group.
 
     Returns:
         numpy.ndarray:
-            Raw sinogram data as a float32 array.
+            The raw sinogram as a float32 array.
     """
     sinogram = h5_file['projection']['NegativeLogNorm_Proj'][()].astype(np.float32)
     return sinogram
@@ -154,19 +149,19 @@ def load_projection_data_ornl(h5_file):
 
 def apply_bh_correction(sinogram, BHCN_params):
     """
-    Perform beam hardening correction on a sinogram.
-
-    Uses a polynomial fit derived from ORNL‐stored beam hardening parameters.
+    This function corrects the beam hardening in a sinogram.  The function fits a polynomial
+    from the beam hardening parameters stored by ORNL, and it applies the polynomial to each
+    sinogram value.
 
     Args:
         sinogram (numpy.ndarray):
-            Uncorrected sinogram data.
+            The uncorrected sinogram.
         BHCN_params (array-like of length 4):
-            Beam hardening parameters [alpha, mu1, mu2, max_thickness].
+            The beam hardening parameters [alpha, mu1, mu2, max_thickness].
 
     Returns:
         numpy.ndarray:
-            Sinogram after beam hardening linearization.
+            The sinogram after beam hardening correction.
     """
     alpha, mu1, mu2, max_thickness = BHCN_params
     poly_coefs = find_linearization_fit(alpha, mu1, mu2, max_thick=max_thickness)
@@ -177,26 +172,26 @@ def apply_bh_correction(sinogram, BHCN_params):
 
 def find_linearization_fit(alpha, density1, density2, poly_order=8, max_thick=30.25, step_size=0.25):
     """
-    Fit a polynomial that linearizes the beam‐hardened transmission curve.
-
+    This function fits a polynomial that linearizes the beam-hardened transmission curve.
 
     Args:
         alpha (float):
-            Ratio parameter for two‐material model.
+            The ratio parameter of the two-material model.
         density1 (float):
-            Linear attenuation coefficient of material 1.
+            The linear attenuation coefficient of material 1.
         density2 (float):
-            Linear attenuation coefficient of material 2.
+            The linear attenuation coefficient of material 2.
         poly_order (int, optional):
-            Order of the polynomial fit. Defaults to 8.
+            The order of the polynomial.  Defaults to 8.
         max_thick (float, optional):
-            Maximum thickness to sample (in same units as sinogram). Defaults to 30.25.
+            The largest thickness sampled, in the same units as the sinogram.  Defaults to 30.25.
         step_size (float, optional):
-            Sampling interval for thickness. Defaults to 0.25.
+            The spacing between sampled thicknesses.  Defaults to 0.25.
 
     Returns:
         numpy.ndarray:
-            Coefficients for a polynomial that correct BH effect in measured attenuation (–log I/I0).
+            The coefficients of a polynomial that corrects the beam hardening in the measured
+            attenuation, -log(I/I0).
     """
     uavg0 = (alpha * density1 + density2) / (1 + alpha)
     t_l = np.arange(0, max_thick, step_size)

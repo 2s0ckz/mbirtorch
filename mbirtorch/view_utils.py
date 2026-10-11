@@ -1,19 +1,6 @@
-"""mbirtorch-side wrapper for the slice viewer.
-
-The viewer module itself (mbirtorch/viewers/slice_figure.py) is
-package-independent: it imports only numpy, matplotlib, and (lazily) h5py.  This wrapper supplies the
-mbirtorch-specific conversions on the way in: torch tensors (including CUDA and MPS tensors)
-become numpy arrays, and rich data dicts -- e.g. the recon_dict returned by
-:meth:`TomographyModel.recon` -- are serialized to dicts of display strings.
-
-The geometry viewer needs no conversion on the way in, because its scene reads
-the model directly and its figure converts a tensor overlay itself, so the
-function is re-exported as it is.
-
-The 4D viewer (mbirtorch/viewers/slice_figure4d.py) gets the same conversions
-through :func:`slice_viewer4d`.  That function also passes
-:func:`~mbirtorch.utilities.save_volume_as_gif` as the writer of the viewer's
-GIF buttons.
+"""This module provides the slice viewers to mbirtorch users.  The functions in this module
+convert torch tensors to numpy arrays.  They also convert data dicts, such as a recon_dict, to
+strings that the viewers display.
 """
 
 import pprint
@@ -34,23 +21,19 @@ __all__ = ['SliceViewer', 'VolumeStack', 'convert_subdicts_to_strings',
 
 
 def _to_numpy(dataset):
-    """Convert one dataset to a numpy array; None passes through."""
+    """This function converts one dataset to a numpy array.  If the dataset is None, the
+    function returns None."""
     if dataset is None:
         return None
     if hasattr(dataset, 'detach'):
-        # This is a torch tensor.  np.asarray cannot convert a device tensor,
-        # and this path avoids importing torch.
+        # This is a torch tensor.  np.asarray cannot convert a tensor on a GPU.
         return dataset.detach().cpu().numpy()
     return np.asarray(dataset)
 
 
 def convert_subdicts_to_strings(data_dict):
-    """Serialize the entries of a data dict to strings for display.
-
-    Dict-valued entries (e.g. 'recon_params' and 'model_params' from
-    :meth:`TomographyModel.recon`) are rendered as readable multi-line
-    strings; other non-string values are converted with str.  Non-dict
-    inputs are returned unchanged.
+    """This function converts the entries of a data dict to strings for display.  If the
+    input is not a dict, the function returns the input unchanged.
     """
     if not isinstance(data_dict, dict):
         return data_dict
@@ -70,67 +53,50 @@ def slice_viewer(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
                  slice_label=None, slice_axis=None, cmap='gray',
                  show_instructions=True, block=True, save_fn=None):
     """
-    Launch an interactive viewer for inspecting one or more 2D or 3D arrays.
-
-    This function provides a graphical interface for exploring one or more 3D
-    volumes or 2D slices.  Features include synchronized slice navigation
-    with proportional mapping across volumes of unequal depth, ROI statistics,
-    difference images, axis transposition, file loading and saving, dynamic
-    intensity range adjustment, and a right-click context menu of per-image
-    actions.
-
-    Each image can have an associated data dict, typically the recon_dict
-    from :meth:`TomographyModel.recon <mbirtorch.TomographyModel.recon>`,
-    which can be viewed as text within the viewer.
-
-    Designed primarily for inspecting CT or other volumetric reconstructions
-    in research workflows.
+    This function opens an interactive viewer for one or more 2D or 3D arrays.  The viewer
+    moves through the slices of all arrays together.  It also shows ROI statistics and
+    difference images, transposes axes, loads and saves files, and sets the intensity range.
+    Each image may have a data dict, such as a recon_dict, which the viewer shows as text.
 
     Args:
         *datasets (ndarray, tensor, or None): One or more 2D or 3D arrays to
-            display.  Torch tensors (including CUDA and MPS tensors) are
-            converted to numpy automatically.
-            - 2D arrays are promoted to 3D via a trailing singleton axis.
-            - None values are replaced with placeholder zero arrays.
+            display.  The function converts torch tensors to numpy arrays.
+            The viewer adds a last axis of length 1 to each 2D array.
+            The viewer replaces each None with an array of zeros.
 
         data_dicts (None or dict or list of None or dicts, optional):
-            Dictionary of entries associated with the data (e.g., the
-            recon_dict from :meth:`TomographyModel.recon <mbirtorch.TomographyModel.recon>`).
-            Nested dicts are serialized to display strings automatically.
-        title (str, optional): Figure title.  Defaults to an empty string.
-        vmin (float, optional): Minimum intensity value for display.
-            Defaults to the global minimum across all datasets.
-        vmax (float, optional): Maximum intensity value for display.
-            Defaults to the global maximum across all datasets.
-        slice_label (str or list of str, optional): Label(s) for the current
+            A dictionary of entries that describe the data, such as the
+            recon_dict from :meth:`TomographyModel.recon <mbirtorch.TomographyModel.recon>`.
+        title (str, optional): The figure title.  Defaults to an empty string.
+        vmin (float, optional): The minimum intensity value for display.
+            Defaults to the minimum over all datasets.
+        vmax (float, optional): The maximum intensity value for display.
+            Defaults to the maximum over all datasets.
+        slice_label (str or list of str, optional): The label for the current
             slice.  Defaults to "Slice".
-        slice_axis (int or list of int, optional): Axis along which to slice
-            (0, 1, or 2).  Defaults to the last axis (2).
-        cmap (str, optional): Colormap to use.  Defaults to "gray".
-        show_instructions (bool, optional): Whether to display the help hint
-            in the figure.  Defaults to True.
-        block (bool, optional): If True (default), block until the window is
-            closed.  If False, leave the window open and return immediately
-            -- useful for showing, e.g., a sinogram next to a reconstruction.
-            A nonblocking window becomes fully interactive when the next
-            blocking slice_viewer runs, and that blocking call returns when
-            ALL open windows are closed.
-        save_fn (callable, optional): Replacement for the built-in HDF5
-            writer used by the viewer's Save action, called as
+        slice_axis (int or list of int, optional): The axis along which to slice:
+            0, 1, or 2.  Defaults to the last axis, 2.
+        cmap (str, optional): The colormap.  Defaults to "gray".
+        show_instructions (bool, optional): If True, the figure shows a short help
+            message.  Defaults to True.
+        block (bool, optional): If True, the function returns only after the window
+            is closed.  If False, the function returns at once and leaves the window
+            open.  The window responds to input when the next call with block=True
+            runs, and that call returns when all open windows are closed.
+            Defaults to True.
+        save_fn (callable, optional): A function that replaces the built-in HDF5
+            writer for the viewer's Save action.  The viewer calls ``save_fn`` as
             ``save_fn(file_path, array, array_name, attributes_dict)``.
 
     Returns:
-        SliceViewer: the viewer object.  Nonblocking callers may keep it to
-        interact programmatically; a module-level registry also keeps the
-        window alive if the return value is dropped.
+        SliceViewer: The viewer object.
 
     Notes:
-        - Right-click an image for a menu with options such as difference
-          images, axis transposition, and file load/save.
-        - Right-click the intensity slider (or press Set range) to enter
-          exact display bounds.
-        - Press 'h' for a help overlay.  Press Esc to clear overlays or
-          remove the ROI.
+        - Right-click an image for a menu of actions on that image.
+        - Right-click the intensity slider, or press Set range, to enter
+          exact display limits.
+        - Press 'h' to show help.  Press Esc to clear the help and other
+          displayed items, or to remove the ROI.
 
     Example:
         >>> import mbirtorch
@@ -154,50 +120,44 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
                    slice_label=None, slice_axis=None, cmap='gray',
                    show_instructions=True, block=True, save_fn=None, fps=5):
     """
-    Launch an interactive viewer for one or more 4D volumes, such as the output of
-    :meth:`MACE4DModel.recon <mbirtorch.MACE4DModel.recon>`.
-
-    The viewer has every feature of :func:`slice_viewer`.  It adds a frame slider,
-    space-time planes (t-x, t-y, t-z) that show one line of the volume in every
-    frame, and a plot of the mean inside the ROI circle against frame.  The slice
-    slider and the frame slider each have a Play button and a GIF button.  Play steps
-    through that slider's axis in every panel, in spatial and space-time planes.  GIF
-    saves that movie for every panel that changes along the axis, one file per panel,
-    with :func:`~mbirtorch.utilities.save_volume_as_gif`.  Space plays and pauses the
-    frame slider, and comma and period step it back and forward.
+    This function opens an interactive viewer for one or more 4D volumes, such as
+    the output of :meth:`MACE4DModel.recon <mbirtorch.MACE4DModel.recon>`.  The viewer has
+    the features of :func:`slice_viewer`.  It also has a time frame slider, images in planes
+    that include the time axis, and a plot of the ROI mean against time frame.  Each slider
+    has Play and GIF buttons.
 
     Args:
         *datasets (ndarray, tensor, or None): One or more 2D, 3D, or 4D arrays to
-            display.  A 4D array is ``(t, x, y, z)``.  A 2D or 3D array stays fixed in
-            time.  Torch tensors (including CUDA and MPS tensors) are converted to
-            numpy automatically.
-        data_dicts (None or dict or list of None or dicts, optional): Dictionary of
-            entries associated with the data (e.g., the recon_dict from
-            :meth:`MACE4DModel.recon <mbirtorch.MACE4DModel.recon>`).  Nested dicts
-            are serialized to display strings automatically.
-        title (str, optional): Figure title.  Defaults to an empty string.
-        vmin (float, optional): Minimum intensity value for display.  Defaults to the
+            display.  A 4D array has axes ``(t, x, y, z)``.  The viewer shows a 2D or 3D
+            array as the same image at every time.  The function converts torch tensors
+            to numpy arrays.
+        data_dicts (None or dict or list of None or dicts, optional): A dictionary of
+            entries that describe the data, such as the recon_dict from
+            :meth:`MACE4DModel.recon <mbirtorch.MACE4DModel.recon>`.
+        title (str, optional): The figure title.  Defaults to an empty string.
+        vmin (float, optional): The minimum intensity value for display.  Defaults to the
             minimum over every voxel of every volume.
-        vmax (float, optional): Maximum intensity value for display.  Defaults to the
+        vmax (float, optional): The maximum intensity value for display.  Defaults to the
             maximum over every voxel of every volume.
-        slice_label (str or list of str, optional): Label(s) at the start of each
+        slice_label (str or list of str, optional): The label at the start of each
             panel title.  Defaults to no label.
-        slice_axis (int or list of int, optional): Axis along which to slice, counted
-            in each array's own axes: 1, 2, or 3 for a 4D array, and 0, 1, or 2 for a
-            3D array.  Defaults to z.  With 3D and 4D arrays together, give a list.
-        cmap (str, optional): Colormap to use.  Defaults to "gray".
-        show_instructions (bool, optional): Whether to display the help hint in the
-            figure.  Defaults to True.
-        block (bool, optional): If True (default), block until the window is closed.
-            If False, leave the window open and return immediately, as in
-            :func:`slice_viewer`.
-        save_fn (callable, optional): Replacement for the built-in HDF5 writer used by
-            the viewer's Save action, called as
+        slice_axis (int or list of int, optional): The axis along which to slice, counted
+            in the axes of each array.  The axis is 1, 2, or 3 for a 4D array, and 0, 1, or 2
+            for a 3D array.  Defaults to the z axis.  If you display 3D and 4D arrays
+            together, give a list.
+        cmap (str, optional): The colormap.  Defaults to "gray".
+        show_instructions (bool, optional): If True, the figure shows a short help
+            message.  Defaults to True.
+        block (bool, optional): If True, the function returns only after the window is
+            closed.  If False, the function returns at once, as in :func:`slice_viewer`.
+            Defaults to True.
+        save_fn (callable, optional): A function that replaces the built-in HDF5 writer
+            for the viewer's Save action.  The viewer calls ``save_fn`` as
             ``save_fn(file_path, array, array_name, attributes_dict)``.
-        fps (float, optional): Playback speed in frames per second.  Defaults to 5.
+        fps (float, optional): The playback speed in frames per second.  Defaults to 5.
 
     Returns:
-        SliceViewer4D: the viewer object.
+        SliceViewer4D: The viewer object.
 
     Example:
         >>> import mbirtorch

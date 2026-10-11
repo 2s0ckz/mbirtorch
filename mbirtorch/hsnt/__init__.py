@@ -1,16 +1,12 @@
-"""Hyperspectral neutron data: maximum-likelihood dehydration and the hsnt HDF5 format.
+"""This module reads, writes, simulates, and compresses hyperspectral neutron data.
 
-Modules:
-
-    denoise         dehydrate, rehydrate, hyper_denoise: the maximum-likelihood factorization in the package's
-                    dehydrated form, with the spectra estimators and streaming behind dehydrate
-    rank            estimate_rank: the number of components by likelihood-ratio tests
-    io              the hsnt HDF5 format: import_hsnt_data_hdf5, create_hsnt_metadata, export_hsnt_data_hdf5
-    simulate        generate_hyper_sinogram, gen_material_phantom, synthetic_material_basis, generate_hyper_data
-    cli             the mbirtorch-hsnt command line (with loading, outputs and plots)
-    _fit, factorization, spectra, _streaming, _newton, _linalg, _loss, _device   the solver internals
-
-matplotlib is imported only by the functions that use it.
+The function ``dehydrate`` factors the data into a few nonnegative spectra and their maps by
+maximum likelihood.  The function ``rehydrate`` multiplies the maps by the spectra to rebuild the
+data.  The function ``hyper_denoise`` denoises data by calling both, and ``estimate_rank``
+estimates the number of spectra.  The functions ``import_hsnt_data_hdf5``,
+``create_hsnt_metadata``, and ``export_hsnt_data_hdf5`` read and write the hsnt HDF5 format.  The
+functions ``generate_hyper_sinogram``, ``gen_material_phantom``, ``synthetic_material_basis``, and
+``generate_hyper_data`` simulate data.  The ``cli`` module provides the mbirtorch-hsnt command.
 """
 from .denoise import hyper_denoise, dehydrate, rehydrate
 from .rank import estimate_rank

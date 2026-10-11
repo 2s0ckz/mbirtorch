@@ -1,20 +1,10 @@
-"""The geometry-agnostic projection driver and the torch.compile plumbing.
+"""This module holds the projection loop that all geometries share, and the torch.compile code.
 
-The division of labor (panel-reviewed design, plans repo
-projector_layer_design.md): this module owns ITERATION and MEMORY -- the
-view-batch loops, the transient budget, per-device compiled-instance
-management, and the compile lock.  The shared horizontal-fan math and the
-hfan data contract live in horizontal_fan.py; each geometry model owns its
-geometry chains and its per-view-batch bodies.  No sorted channel
-reduction, no stacked gather, no tile policy here (the jax perf layer;
-their torch analogs belong with the future Triton kernel work).
-
-The drivers batch over VIEWS with a plain python loop.  For the torch
-bodies the eager transient is (view_batch, num_pixels, cols) floats and
-``view_batch_size`` is the single memory/speed knob; a hand-written kernel
-body declares its own, much smaller, per-view cost through its
-``_view_batch_cost`` attribute (see _effective_view_batch).  The torch
-bodies are torch.compiled (see maybe_compile below).
+The class ``Projectors`` loops over batches of views.  It limits the size of the temporary
+arrays of each batch, and it keeps one compiled copy of each projection function per device.
+Each geometry model supplies its own projection functions, which project one batch of views.
+For a torch function, ``view_batch_size`` sets the number of views in a batch.  A hand-written
+kernel states its own memory cost per view in its ``_view_batch_cost`` attribute.
 """
 
 import logging
@@ -27,12 +17,14 @@ from . import _sharding
 
 _F32 = torch.float32
 
-# ── torch.compile plumbing ────────────────────────────────────────────────────
-# A compile failure falls back to eager and is recorded in _COMPILE_ERRORS.
+# ── torch.compile support ─────────────────────────────────────────────────────
+# When a compile fails, the function runs in eager mode, and the error is recorded in
+# _COMPILE_ERRORS.
 
 
 class _DropAutotuneNotice(logging.Filter):
-    """Drops the notice that a GPU is too small for one optional tuning mode of the compiler."""
+    """This class is used to suppress the compiler message that a GPU is too small for one
+    optional tuning mode."""
 
     def filter(self, record):
         return 'Not enough SMs' not in record.getMessage()
@@ -42,30 +34,22 @@ logging.getLogger('torch._inductor.utils').addFilter(_DropAutotuneNotice())
 
 _COMPILE_CACHE = {}
 _COMPILE_ERRORS = {}
-# Triton and inductor compilation is not thread safe, so this lock serializes compiles.
-# Two threads compiling at once crash in static_triton_launcher on an A100 with torch 2.13.
+# Triton and inductor compilation is not thread safe, so this lock lets one thread
+# compile at a time.
 _GLOBAL_COMPILE_LOCK = threading.Lock()
 
-#: The per-function recompile budget this module raises before it compiles anything.  Torch's
-#: cap sits on the code object, so every per-device instance of one body shares one budget, and
-#: a run on n devices needs about n times the one-device variant count.  When the budget fills,
-#: the remaining calls run eagerly, which measured 5 to 11 times slower on two H100s.
+#: The smallest recompile limit for each function.  mbirtorch sets this limit before it
+#: compiles.  Torch counts recompiles for each code object, so the copies of one function on
+#: different devices share the limit.  After the limit is reached, calls run slowly in eager mode.
 _RECOMPILE_LIMIT_FLOOR = 64
 
 
 def _raise_recompile_budget():
-    """Raise torch's per-function recompile budget to at least
-    ``_RECOMPILE_LIMIT_FLOOR`` on the calling thread.
+    """This function raises the torch recompile limit for each function on the calling thread.
 
-    Dynamo consults a per-thread view of this config, so the budget must be
-    raised on every thread that can trigger a compilation.  The per-device
-    fan-outs run the compiled bodies on pool threads, so each of those
-    threads raises the budget itself.
-
-    ``MBIRTORCH_RECOMPILE_LIMIT`` overrides the floor exactly, including
-    downward, which is useful for debugging.  Both config names are set
-    together, because ``recompile_limit`` is the current name and
-    ``cache_size_limit`` is its older spelling.
+    If the environment variable ``MBIRTORCH_RECOMPILE_LIMIT`` is set, the function sets the
+    limit to its value.  Otherwise, the function sets the limit to at least
+    ``_RECOMPILE_LIMIT_FLOOR``.
     """
     import torch._dynamo.config as dynamo_config
 
@@ -94,37 +78,14 @@ def _shape_key(args, kwargs):
 
 
 def maybe_compile(fn, enabled, instance_key=None):
-    """Return a compiled form of ``fn`` (cached per (function, instance_key))
-    when enabled, else ``fn`` itself.
+    """This function returns a compiled form of ``fn`` when ``enabled`` is True.  Otherwise, it
+    returns ``fn`` itself.
 
-    A function carrying ``_mbirtorch_no_compile`` is returned as it is,
-    whatever ``enabled`` says: that marker is how a HAND-WRITTEN kernel body
-    (triton_cone.py) declares that it launches its own kernel and must stay
-    eager.  The marker is needed because ``torch.compiler.disable`` alone does
-    not survive an explicit compile -- ``torch.compile`` unwraps the disable
-    decorator (``innermost_fn``) and traces the original function, launch and
-    all -- so the opt-out has to be honored at the call site that compiles.
-
-    ``instance_key`` names a distinct
-    compiled instance -- the per-device threads of the VCD loop pass their
-    device index, because compiled artifacts carry triton-launcher state
-    that must not be shared across concurrently executing threads (a shared
-    instance crashed under concurrent cold compiles; the process-wide lock
-    below serializes the COMPILE events, the per-instance split isolates the
-    launcher state).  Instances are cached at module level, so rebuilding a
-    model's projectors reuses them instead of re-tracing devices 1..n-1.
-
-    torch.compile is LAZY: the wrapper it returns compiles at the first
-    invocation, so a broken backend (no C++ toolchain, a broken triton) would
-    surface there, not at torch.compile() time.  The returned
-    callable therefore guards the FIRST call: on any exception it retries the
-    call EAGERLY -- the kernels here are pure, so the retry is safe -- and, if
-    eager succeeds, records the compile error in ``_COMPILE_ERRORS`` and
-    permanently rebinds to eager (the compile failure was environmental).  If
-    eager also raises, that error is the real one and propagates.  After one
-    successful compiled call the guard collapses to a direct dispatch.
-    (A LATER per-shape recompile could still fail on a broken toolchain; in
-    practice the first call exercises the backend end to end.)
+    The function caches one compiled form for each pair (``fn``, ``instance_key``).  The thread
+    of each device passes its device index as ``instance_key``.  If ``fn`` has the attribute
+    ``_mbirtorch_no_compile``, the function returns ``fn`` unchanged.  If the first call raises
+    an error and an eager call then succeeds, the function records the error in
+    ``_COMPILE_ERRORS`` and runs ``fn`` in eager mode from then on.
     """
     if not enabled or getattr(fn, '_mbirtorch_no_compile', False):
         return fn
@@ -140,15 +101,15 @@ def maybe_compile(fn, enabled, instance_key=None):
         key = _shape_key(args, kwargs)
         if key in seen_keys:
             return state["impl"](*args, **kwargs)
-        # This is the first call at this shape, so it may compile.  The lock keeps it
-        # from compiling at the same time as another thread.
+        # This is the first call at this shape, so it may compile.  The lock prevents two
+        # threads from compiling at the same time.
         with _GLOBAL_COMPILE_LOCK:
             _raise_recompile_budget()
             try:
                 out = state["impl"](*args, **kwargs)
             except Exception as e:                            # noqa: BLE001
-                # A compile backend failure succeeds on this eager retry and
-                # falls back for good.  A real input error raises again.
+                # If the compiler failed, this eager call succeeds, and fn stays eager from
+                # then on.  If the input is invalid, this call raises the error again.
                 out = fn(*args, **kwargs)
                 _COMPILE_ERRORS[f"{fn.__module__}.{fn.__name__}"] = \
                     f"{type(e).__name__}: {e}"[:400]
@@ -161,26 +122,21 @@ def maybe_compile(fn, enabled, instance_key=None):
     return guarded
 
 
-# The wrappers below pad a call narrower than ``min_compiled_pixel_width`` and undo the padding.
-# Inductor miscompiles the one-pixel specialization of both fused parallel-beam bodies, with a
-# relative error of about 5e-02.  Eager is correct at one pixel, and every width of two or more
-# is correct compiled.  The cone bodies do not have the defect.
+# The wrappers below pad a call with fewer pixels than ``min_compiled_pixel_width``.  Inductor
+# compiles the fused parallel-beam projection functions incorrectly for a single pixel.
 
 
 def _callable_name(fn, fallback):
-    """Return a readable name for a wrapped callable."""
+    """This function returns a readable name for a wrapped callable."""
     return getattr(fn, '__name__', fallback)
 
 
 def forward_at_min_pixel_width(compiled, min_width):
-    """The forward body with narrow pixel batches padded to ``min_width``.
+    """This function wraps a forward projection function so that it pads a batch with fewer
+    than ``min_width`` pixels to ``min_width`` pixels.
 
-    The padded pixels carry zero values at a repeated -- hence in-range --
-    pixel index.  The forward output has no pixel axis: the fan bins each
-    pixel's weighted row into the detector channels with index_add_, so a
-    zero-valued pixel adds exactly 0.0 wherever it lands and the padded call
-    returns bit-identical values with nothing to slice off (verified against
-    the eager body).
+    The padded pixels repeat the last pixel index and have the value zero.  They add exactly
+    0.0, so the result is identical to that of the unpadded call.
     """
     def forward_padded(values, pixel_indices, *args, **kwargs):
         width = int(pixel_indices.shape[0])
@@ -198,14 +154,11 @@ def forward_at_min_pixel_width(compiled, min_width):
 
 
 def back_at_min_pixel_width(compiled, min_width):
-    """The back body with narrow pixel batches padded to ``min_width``.
+    """This function wraps a back projection function so that it pads a batch with fewer than
+    ``min_width`` pixels to ``min_width`` pixels.
 
-    The back output DOES carry the pixel axis, so here the padding repeats the
-    last real pixel index and the extra rows are sliced off again.  Every
-    output row is computed from its own pixel alone (the fan gathers per pixel
-    and sums over views), so the rows that stay are the rows the narrow call
-    would have produced -- exactly, not to a tolerance (verified against the
-    eager body, at coeff_power 1 and 2).
+    The padded pixels repeat the last pixel index.  The wrapper removes the extra output rows.
+    The remaining rows are exactly those of the unpadded call.
     """
     def back_padded(sino_batch, pixel_indices, *args, **kwargs):
         width = int(pixel_indices.shape[0])
@@ -215,8 +168,7 @@ def back_at_min_pixel_width(compiled, min_width):
         wide_indices = torch.cat([pixel_indices,
                                   pixel_indices[-1:].repeat(pad)])
         block = compiled(sino_batch, wide_indices, *args, **kwargs)
-        # Cloned rather than returned as a view, so the caller's output owns
-        # its memory and does not keep the padded block alive.
+        # The clone gives the output its own memory, so the padded block can be freed.
         return block[:width].clone()
 
     back_padded.__name__ = f'padded_{_callable_name(compiled, "back")}'
@@ -224,22 +176,15 @@ def back_at_min_pixel_width(compiled, min_width):
 
 
 def compile_serialized():
-    """The process-wide compile lock, as a context manager -- for HAND-WRITTEN
-    kernel paths only::
+    """This function returns the compile lock as a context manager.  All threads of the process
+    share this lock.  The lock is meant for hand-written kernels::
 
         with compile_serialized():
-            my_triton_kernel[grid](...)     # first launch: jit / autotune
+            my_triton_kernel[grid](...)     # The first launch compiles and autotunes.
 
-    torch.compile paths need this nowhere: ``maybe_compile``'s wrapper already
-    takes the same lock around every call that can trigger a compile.  A
-    triton.jit or triton.autotune path compiles OUTSIDE torch.compile, at its
-    first launch (and again per autotune configuration), and races the same
-    launcher/compiler state the lock exists for, so it must borrow the lock
-    rather than introduce a second one.
-
-    Wrap only the compiling launches: as a decorator on the launching function
-    this would take the lock on EVERY call and serialize execution, not just
-    compilation.
+    ``maybe_compile`` already takes this lock for torch.compile.  The lock should surround
+    only the launches that compile.  If the lock were used as a decorator, every call would wait
+    for the lock.
     """
     return _GLOBAL_COMPILE_LOCK
 
@@ -247,38 +192,33 @@ def compile_serialized():
 
 
 class Projectors:
-    """The batched sparse projection driver for one model: geometry-agnostic
-    iteration and memory.
+    """This class is used to run the sparse forward and back projections of one model in
+    batches of views.  It handles the loop over views and the memory limits, which do not
+    depend on the geometry.
 
-    The geometry enters ONLY through the model's per-view-batch bodies
-    (``_view_batch_bodies`` / ``_view_batch_args``): the driver slices view
-    parameters, applies the transient budget, calls the compiled body, and
-    assembles outputs sized lazily from the first block.  One geometry class
-    therefore never subclasses this driver.
-
-    Center-consistency contract: forward and back consume the SAME
-    deterministic center computation for each (view, pixel), so the pair stays
-    exactly adjoint even at rounding ties.  The centers are recomputed by that
-    same chain on every call rather than cached, which preserves the property.
+    The geometry enters only through the projection functions of the model, which
+    ``_view_batch_bodies`` and ``_view_batch_args`` supply.  The forward and back projections
+    compute the same centers for each (view, pixel) pair.  As a result, the two projections
+    are exact adjoints.
     """
 
-    # Cap on the per-batch transient bytes for the fan kernels' (Vb, P, cols) arrays, since the
-    # back fan's gather is materialized.  The accounting charges one nominal slab per view while
-    # the kernels hold two to five at once, so any retuning must measure the real per-view
-    # transient.  Past about 1400 cubed one view's slab alone exceeds the cap.
+    # The limit on the bytes of the (Vb, P, cols) temporary arrays of a torch projection
+    # function in one batch.  The estimate counts one such array per view, although the
+    # functions hold two to five at once.
     VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
     VIEW_BATCH_TRANSIENT_FLOOR_BYTES = 256 * 2**20
     VIEW_BATCH_SINO_MULTIPLE = 8
-    # The torch bodies' nominal view batch when model.view_batch_size is None.
-    # A kernel body's nominal is its own swept view chunk instead.
+    # The default view batch size of a torch projection function when model.view_batch_size
+    # is None.  A hand-written kernel supplies its own default instead.
     VIEW_BATCH_BODY_DEFAULT = 64
 
     def _transient_budget_bytes(self, n_devices=None):
         if self.model.torch_device.type == 'cpu':
             return self.VIEW_BATCH_TRANSIENT_BUDGET_BYTES
         num_views, num_rows, num_channels = self.model.get_params('sinogram_shape')
-        # Under view sharding each device projects only its share of the views, so the budget
-        # scales with the per-device shard.  ``n_devices`` prices a candidate layout.
+        # When the views are divided among devices, each device projects only its own views.
+        # The limit therefore scales with the number of views on one device.  ``n_devices``
+        # is a device count that the caller wants to test.
         n_dev = (self.model.sino_placement.n_devices if n_devices is None
                  else int(n_devices))
         local_views = -(-int(num_views) // n_dev)
@@ -288,8 +228,8 @@ class Projectors:
                        self.VIEW_BATCH_SINO_MULTIPLE * sino_bytes))
 
     def __init__(self, model):
-        # The geometry supplies its per-view-batch bodies as module-level functions.  A bound
-        # method would pin the model in the module-level compile cache.
+        # The geometry supplies its projection functions as module-level functions.  A bound
+        # method would keep the model alive in the module-level compile cache.
         self.model = model
         fwd_body, back_body = model._view_batch_bodies()
         use_compile = model.compile_enabled
@@ -297,13 +237,11 @@ class Projectors:
         min_width = int(getattr(model, 'min_compiled_pixel_width', 1))
 
         def bind(body, pad_narrow, i):
-            """Return one device's bound body.  It is compiled, then wrapped
-            when the model declares a minimum pixel width and the binding
-            really did compile.
+            """This function returns the compiled projection function for one device.
 
-            maybe_compile hands back the function itself when compilation is
-            off and when the body is a hand-written kernel.  Neither can be
-            miscompiled, so neither is wrapped."""
+            If the model sets a minimum pixel width and the projection function was compiled,
+            ``bind`` also wraps the projection function to pad narrow batches.
+            """
             bound = maybe_compile(body, use_compile, instance_key=i)
             if min_width > 1 and bound is not body:
                 bound = pad_narrow(bound, min_width)
@@ -315,8 +253,8 @@ class Projectors:
         self._back_body_per_dev = [
             bind(back_body, back_at_min_pixel_width, i)
             for i in range(n_dev)]
-        # The view parameters are read from the current params at every projector build.
-        # Each device gets its copy through the probed transfer primitive.
+        # The view parameters are read from the current params each time the projectors are
+        # built.  move_shard copies them to each device.
         view_params_name = model.get_params('view_params_name')
         view_params = torch.as_tensor(model.get_params(view_params_name),
                                       dtype=_F32, device=model.torch_device)
@@ -326,44 +264,32 @@ class Projectors:
         self.view_params_array = self._view_params_per_dev[0]
 
     def _effective_view_batch(self, body, num_pixels, band_cols, args):
-        """Return the view batch for one call of ``body``.  It is the nominal
-        batch, capped so that one batch's transient stays within the budget.
+        """This method returns the number of views in a batch for one call of ``body``.
 
-        The batching rule follows the body that is bound, not the geometry.
-        A hand-written kernel body carries a ``_view_batch_cost`` attribute
-        giving its own per-view bytes and its swept view chunk.  The forward
-        and back bodies are consulted separately, so a model that binds a
-        kernel one way and a torch body the other batches each direction by
-        its own rule."""
+        The number is the default batch size, reduced if needed so that the temporary arrays
+        of one batch fit within the memory limit.
+        """
         return self.view_batch_charge(body, num_pixels, band_cols, args)[0]
 
     def view_batch_charge(self, body, num_pixels, band_cols, args,
                           n_devices=None):
-        """``(view_batch, bytes_per_view)`` for one call of ``body``: the
-        single per-view cost model, with TWO consumers.
+        """This method returns ``(view_batch, bytes_per_view)`` for one call of ``body``.
 
-        The driver consumes the batch (through :meth:`_effective_view_batch`)
-        to decide how many views one body call takes.  The memory ledger
-        (``_memory_ledger``) consumes both numbers, because the batch alone
-        does not say how many bytes that batch holds.  Keeping one function
-        means the batch chooser and the ledger cannot drift apart.
-
-        The charge EXCLUDES the call-fixed tensors -- the assembled output
-        and the accumulated partial -- exactly as each body's own
-        ``_view_batch_cost`` docstring states.  Those exist at any batch
-        size, so the batch choice cannot control them.  The ledger adds them
-        itself, per phase.
+        ``view_batch`` is the number of views that one call of ``body`` projects.  The memory
+        estimate in ``_memory_ledger`` uses both numbers.  ``bytes_per_view`` does not include
+        the output array or the array that accumulates partial results.  The memory estimate
+        adds those arrays itself.
 
         Args:
-            body: the projection body actually bound (kernel or torch).
-            num_pixels (int): P, the pixel subset this call projects.
-            band_cols (int): the call's column count -- the forward's slice
-                extent, or the back's local sinogram row count.
-            args (dict): the geometry's per-call argument dict.
-            n_devices (int, optional): price the budget for a HYPOTHETICAL
-                device count instead of the model's current placement.  Used
-                only by the ledger when it evaluates a candidate layout;
-                None (the default) is every production call site.
+            body: The projection function in use, either a kernel or a torch function.
+            num_pixels (int): The number P of pixels that this call projects.
+            band_cols (int): The number of columns in the call.  For the forward projection,
+                this is the number of slices.  For the back projection, it is the number of
+                rows in the local sinogram.
+            args (dict): The arguments that the geometry passes to each call.
+            n_devices (int, optional): A device count to use for the memory limit in place of
+                the current device count of the model.  Only the memory estimate uses this
+                argument.  Defaults to None.
         """
         nominal = self.model.view_batch_size
         cost = getattr(body, '_view_batch_cost', None)
@@ -384,42 +310,32 @@ class Projectors:
                                           view_range, slice_start=0,
                                           dev_index=0, plan=None,
                                           accumulate_into=None):
-        """Forward-project voxel values into ONE view-owner's sinogram block:
-        the single forward loop -- the single-device full-range form is the
-        adapter below over (0, num_views).  The geometry body owns all geometry,
-        layout, and output orientation; this loop owns view slicing, the
-        transient budget, and assembly (output sized lazily from the first
-        block, so the driver never derives geometry-specific shapes).
+        """This method forward projects voxel values into the sinogram block of one range of
+        views.
 
-        ``accumulate_into`` lets a caller that runs this loop repeatedly --
-        the cylinder-transfer forward, once per pixel batch -- add straight
-        into the block it is building instead of receiving a fresh one to add
-        itself.  That merges two full-block passes into one and drops one
-        full-block allocation per call; see the accumulation comment in
-        ``TomographyModel._sparse_forward_project_cylinders`` for why it is
-        worth doing and why the values do not move.  The parameter is added
-        HERE, on a plain python method, and not to the geometry body: the
-        bodies are torch.compile'd per device with shape-keyed caches, so a
-        new argument there would recompile every one of them.
+        Each device holds one contiguous range of views.  The projection function of the
+        geometry computes the projection and sets the order of the output axes.  This method
+        loops over batches of views, applies the memory limit, and assembles the output.  The
+        single-device projection calls this method with the range (0, num_views).
 
         Args:
-            band_values: (P, cols) voxel cylinders (or a slice band), on this
-                owner's device.
-            pixel_indices: (P,) int64 on the same device.
-            view_range: (v0, v1) half-open GLOBAL view range this owner owns
-                (the banded drivers' contract: one contiguous real-view span
-                per owner).
-            slice_start (int): global slice anchor of a slice BAND (two-fan
-                geometries); a row-aligned geometry's body asserts 0.
-            dev_index (int): which per-device compiled instance to use.
-            plan: the memoization slot for a future sorted/CSR stream variant
-                (per pixel-subset x view-range); unused today.
-            accumulate_into: an existing block of the shape this call returns.
-                Given one, the loop ADDS into it and returns it; given None
-                (every other caller), it allocates the block and writes.
+            band_values: A (P, cols) tensor on the device of this view range.  Each row holds
+                the voxels of one pixel across all slices, or across a range of slices.
+            pixel_indices: A (P,) int64 tensor on the same device.
+            view_range: The half-open range (v0, v1) of global view indices.
+            slice_start (int): The global index of the first slice in ``band_values``.  This
+                argument is used by geometries such as cone beam, in which a detector row does
+                not correspond to one slice.  For other geometries it must be 0.
+            dev_index (int): The index of the compiled copy of the projection function to use.
+            plan: This argument is not used.
+            accumulate_into: An existing block with the shape of the output, or None.  If a
+                block is given, the method adds the projection to it and returns it.  If None,
+                the method allocates a new block.
 
         Returns:
-            (v1 - v0, rows_or_band, num_channels) on the input's device.
+            A tensor of shape (v1 - v0, rows, num_channels) on the device of the input.  For
+            geometries such as cone beam, rows is the number of detector rows.  For other
+            geometries, rows equals the number of slices in ``band_values``.
         """
         m = self.model
         v0, v1 = view_range
@@ -429,8 +345,8 @@ class Projectors:
                                              band_values.shape[-1], args)
         view_params = self._view_params_per_dev[dev_index]
         out = accumulate_into
-        # An accumulating call adds every batch, including the first, because
-        # the block it was handed already holds earlier calls' work.
+        # With accumulate_into, every batch is added, including the first, because the block
+        # already holds the results of earlier calls.
         adding = out is not None
         for v in range(v0, v1, vb_size):
             view_params_batch = view_params[v:min(v + vb_size, v1)]
@@ -441,8 +357,8 @@ class Projectors:
                 out = torch.empty((v1 - v0,) + tuple(block.shape[1:]),
                                   dtype=block.dtype, device=block.device)
             rows = slice(v - v0, v - v0 + block.shape[0])
-            # View batches cover disjoint rows of the block, so each row is
-            # touched exactly once whichever branch runs.
+            # The view batches cover disjoint rows of the block, so each row is written
+            # exactly once.
             if adding:
                 out[rows].add_(block)
             else:
@@ -453,27 +369,25 @@ class Projectors:
                                        view_range, coeff_power=1,
                                        slice_start=0, band_slices=None,
                                        dev_index=0, plan=None):
-        """Back-project ONE view-owner's local sinogram onto voxel cylinders
-        (the adjoint of :meth:`sparse_forward_project_view_range`): the
-        single back loop, accumulating lazily from the first block so the
-        output shape comes from the geometry body, not the driver.
+        """This method back projects the sinogram of one range of views onto the voxels at the
+        given pixels.  It is the adjoint of :meth:`sparse_forward_project_view_range`.
 
         Args:
-            local_sino: this owner's views -- (v1 - v0, rows, channels) (a
-                row band for a row-aligned geometry; the full local block for
-                a two-fan geometry).
-            pixel_indices: (P,) int64 on the same device.
-            view_range: (v0, v1) half-open GLOBAL view range.
-            coeff_power (int): 1, or 2 for the Hessian diagonal.
-            slice_start (int) / band_slices (int or None): the slice-band
-                request for two-fan geometries; a row-aligned geometry's body
-                asserts the defaults.
-            dev_index (int): which per-device compiled instance to use.
-            plan: the memoization slot for a future sorted/CSR stream variant
-                (per pixel-subset x view-range); unused today.
+            local_sino: A (v1 - v0, rows, channels) tensor that holds the views of this range.
+                For geometries in which each detector row corresponds to one slice, it can hold
+                a range of rows.  For geometries such as cone beam, it holds all rows.
+            pixel_indices: A (P,) int64 tensor on the same device.
+            view_range: The half-open range (v0, v1) of global view indices.
+            coeff_power (int): The value 1, or the value 2 for the Hessian diagonal.
+            slice_start (int) / band_slices (int or None): The first slice and the number of
+                slices to compute.  Geometries such as cone beam use these arguments.  For
+                other geometries they must keep their default values.
+            dev_index (int): The index of the compiled copy of the projection function to use.
+            plan: This argument is not used.
 
         Returns:
-            (P, slices_or_band) on the input's device.
+            A tensor of shape (P, slices) on the device of the input.  The number of slices is
+            ``band_slices`` when it is given.
         """
         m = self.model
         v0, v1 = view_range
@@ -494,17 +408,14 @@ class Projectors:
                 out = block
             else:
                 out.add_(block)
-            # Releasing the block here keeps the loop to two cylinder shards instead of
-            # three.  The summation order is unchanged.
+            # Releasing the block here means the loop holds two output-sized arrays instead of
+            # three.
             block = None
         return out
 
     def _sparse_forward_project_single_device(self, voxel_values, pixel_indices):
-        """Forward project voxel cylinders into a full sinogram on one device.
-
-        This runs the view-range loop at (0, num_views) on device 0.  Every
-        external call goes through TomographyModel.sparse_forward_project.
-        """
+        """This method forward projects the voxels at the given pixels into a full sinogram on
+        device 0.  ``TomographyModel.sparse_forward_project`` calls this method."""
         m = self.model
         num_views = int(m.get_params('sinogram_shape')[0])
         voxel_values = torch.as_tensor(voxel_values, dtype=_F32,
@@ -516,20 +427,17 @@ class Projectors:
 
     def _sparse_back_project_single_device(self, sinogram, pixel_indices,
                                            coeff_power=1):
-        """Back project a full sinogram onto the voxel cylinders at
-        ``pixel_indices`` on one device.
-
-        This runs the view-range loop at (0, num_views) on device 0.  Every
-        external call goes through TomographyModel.sparse_back_project.
+        """This method back projects a full sinogram onto the voxels at ``pixel_indices`` on
+        device 0.  ``TomographyModel.sparse_back_project`` calls this method.
 
         Args:
-            sinogram: (num_views, num_det_rows, num_det_channels).
-            pixel_indices: (P,) indices into the flattened (rows, cols) grid.
-            coeff_power (int): backproject (A_ij ** coeff_power); 2 for the
-                Hessian diagonal.
+            sinogram: A tensor of shape (num_views, num_det_rows, num_det_channels).
+            pixel_indices: A (P,) tensor of indices into the flattened (rows, cols) grid.
+            coeff_power (int): The method back projects with the entries A_ij ** coeff_power.
+                The value 2 gives the Hessian diagonal.
 
         Returns:
-            (P, num_slices) tensor of per-pixel cylinders.
+            A (P, num_slices) tensor.  Each row holds the voxels of one pixel across all slices.
         """
         m = self.model
         num_views = int(m.get_params('sinogram_shape')[0])

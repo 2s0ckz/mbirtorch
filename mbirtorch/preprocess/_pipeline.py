@@ -1,17 +1,9 @@
-"""Shared driver for the scan -> sinogram preprocessing pipeline.
+"""This module runs the per-view steps that convert scan data into a sinogram.
 
-The per-stage transforms in :mod:`mbirtorch.preprocess.sinogram` are pure device-tensor *kernels* (the
-math only).  This module owns the **single** copy of the batching + host<->device transfer +
-in-place-fill scaffolding used by ``compute_sino_transmission`` / ``downsample_view_data`` /
-``correct_det_rotation`` and the fused ``scan_to_sino``.
-
-The driver supports two modes: a single-device sequential view-batch loop, and a multi-device
-view-sharded mode where contiguous view shards run concurrently, one per device.  The mode follows
-the device list the caller passes in.  A public preprocessing function gets that list from
-``permitted_devices`` below, which by default names every visible CUDA device.  In both modes the
-host output is pre-allocated once and each batch's result is written directly into its view-slice,
-so the host footprint is the input + the single output (~2x) rather than input + per-batch gather +
-concatenate destination (~3x).
+The module moves the views to the devices in batches.  It applies a kernel from
+:mod:`mbirtorch.preprocess.sinogram` to each batch.  It writes each result into one host array
+that it allocates once.  With several devices, each device processes one contiguous block of
+views in its own thread.
 """
 import numpy as np
 import torch
@@ -22,25 +14,16 @@ from ..tomography_model import _resolve_device
 
 
 def permitted_devices(devices=None):
-    """The devices a preprocessing function spreads its views over.
-
-    The default is every visible CUDA device, capped by ``MBIRTORCH_NUM_DEVICES`` when that variable
-    is set.  A machine with no visible CUDA device gets its default device instead, so the returned
-    list always names at least one device.  The size of the data does not affect the choice.  One
-    view batch is bounded work at any problem size, so no memory estimate is needed here.
-
-    The environment variable is process-wide.  It is how a test suite or a nightly run fixes the
-    device count, so that results and memory use do not depend on the host.  Preprocessing chooses
-    its own default count, but a variable the caller set is still the caller's, so it caps that
-    default here.
+    """This function returns the devices that a preprocessing function divides its views
+    among.  By default it returns every visible CUDA device, up to the number set by
+    ``MBIRTORCH_NUM_DEVICES``.  If there is no CUDA device, it returns the default device.
 
     Args:
-        devices (sequence or None): an explicit list of devices, or None for the default described
-            above.  An explicit list is returned unchanged, and the environment variable does not
-            cap it.
+        devices (sequence or None): A list of devices, or None for the default.  The function
+            returns a given list unchanged.
 
     Returns:
-        list: the devices to pass to :func:`map_view_batches`.
+        list: The devices to pass to :func:`map_view_batches`.
     """
     if devices is not None:
         return list(devices)
@@ -53,15 +36,13 @@ def permitted_devices(devices=None):
     return [f'cuda:{i}' for i in range(num_visible)]
 
 
-# The preprocessing functions take whole host arrays and never take an array
-# that is already sharded across devices.  Each entry point refuses one here.
+# The preprocessing functions accept CPU arrays only, not arrays split across devices.
 reject_shards = _sharding.reject_shards
 
 
 def _stage_batch(batch, device):
-    """Move one batch of views onto ``device`` as a contiguous floating point tensor.
-
-    An integer batch is promoted to float32.  A tensor already on the device is not copied.
+    """This function copies one batch of views to ``device`` as a contiguous floating point
+    tensor.  It converts integer data to float32.
     """
     if torch.is_tensor(batch):
         batch = batch.detach()
@@ -75,9 +56,8 @@ def _stage_batch(batch, device):
 
 
 def _fill_view_batches(array, kernel, output, batch_size, device, lo, hi, desc=None):
-    """Run ``kernel`` over views ``[lo, hi)`` of ``array`` in ``batch_size`` chunks on ``device``.
-
-    Each batch result is written in place into the pre-allocated host array ``output``.
+    """This function applies ``kernel`` to views ``[lo, hi)`` of ``array`` on ``device``,
+    ``batch_size`` views at a time.  It writes each result into the CPU array ``output``.
     """
     import tqdm
     steps = range(lo, hi, batch_size)
@@ -91,35 +71,23 @@ def _fill_view_batches(array, kernel, output, batch_size, device, lo, hi, desc=N
 
 
 def map_view_batches(array, kernel, batch_size, desc=None, devices=None):
-    """Apply a per-batch device kernel across the leading (view) axis.
-
-    Single device (``devices`` is None or length 1): a sequential view-batch loop -- each contiguous
-    batch of ``batch_size`` views is moved to the device, passed through ``kernel`` (a pure
-    device-tensor -> device-tensor transform), and written back into the host output.  This bounds
-    device memory to ``batch_size`` views.
-
-    Multiple devices: the views are split into contiguous, in-order shards (one per device) and each
-    shard is processed in its own thread on its own device.  Per-view kernels (no cross-view
-    reduction) make this embarrassingly parallel with no cross-device communication.  Each worker
-    writes its disjoint view-slice of the shared host output.
-
-    ``kernel`` should close over HOST constants (NumPy) and move them to each batch's device
-    (``torch.as_tensor(const, device=batch.device)``), NOT tensors already committed to one device.
-
-    The host output is pre-allocated once (its shape/dtype probed from the first batch, since a kernel
-    may change the trailing detector dims, e.g. downsampling) and filled in place, so the host footprint
-    is input + output (~2x) regardless of device count.
+    """This function applies a kernel to the views in batches on the devices and returns the
+    results as one CPU array.  With several devices, each device processes one contiguous block
+    of views in its own thread.  The kernel must move any constants it uses to the device of
+    each batch.
 
     Args:
-        array (numpy array or tensor): data batched along axis 0 (views).
-        kernel (callable): ``device_batch -> device_batch``; per-view, no host transfer inside.
-        batch_size (int): number of views per on-device batch.
-        desc (str or None, optional): tqdm label (single-device path only).
-        devices (sequence or None): devices to spread the views over.  None means a single device
-            (the default device) -- sharding is opt-in by passing several devices.
+        array (numpy array or tensor): The data, with views along axis 0.
+        kernel (callable): A function that maps a batch on a device to a batch on the same
+            device.  It must act on each view separately and must not copy data to the CPU.
+        batch_size (int): The number of views in each batch.
+        desc (str or None, optional): The tqdm progress bar label.  The function shows the
+            progress bar only when it uses one device.
+        devices (sequence or None): The devices to divide the views among.  None means the
+            default device.
 
     Returns:
-        numpy.ndarray: the per-batch kernel outputs assembled along axis 0 (view order).
+        numpy.ndarray: The kernel outputs, stacked along axis 0 in view order.
     """
     if devices is None or len(list(devices)) == 0:
         devices = [_resolve_device('auto')]
@@ -127,8 +95,7 @@ def map_view_batches(array, kernel, batch_size, desc=None, devices=None):
         devices = [torch.device(d) for d in devices]
     num_views = array.shape[0]
 
-    # The first batch gives the kernel's output shape and dtype, so the whole host
-    # output array can be allocated once and every batch can write into it in place.
+    # The first batch determines the output shape and dtype.
     probe_hi = min(batch_size, num_views)
     with torch.no_grad():
         probe = kernel(_stage_batch(array[0:probe_hi], devices[0])).cpu().numpy()
@@ -141,8 +108,6 @@ def map_view_batches(array, kernel, batch_size, desc=None, devices=None):
                            desc=desc)
         return output
 
-    # With several devices, each device takes one contiguous shard of views in its
-    # own thread.  The workers write disjoint view slices of the shared host output.
     view_ranges = np.array_split(np.arange(num_views), len(devices))
 
     def worker(i, device):

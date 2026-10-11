@@ -1,4 +1,8 @@
-"""Rank (number of components) estimation by sequential likelihood-ratio tests on the NNAL factorization."""
+"""This module estimates the rank of hyperspectral data, which is the number of spectral
+components.  It fits the data with ranks 1, 2, 3, and so on, and it uses likelihood-ratio tests
+to decide when an added component fits only noise.  Each fit minimizes the non-negative
+attenuation loss (NNAL) defined in ``_loss.py``.
+"""
 import math
 import warnings
 
@@ -9,8 +13,8 @@ from ._device import _default_device
 
 
 def _loss_and_residual(T, W, H):
-    """The float64 loss of W @ H against T and the mean of (T - e^-X)^2 / e^-X, in blocks of outputs._CHUNK_ELEMENTS
-    entries, so that no P x K float64 array is formed."""
+    """This function returns two float64 values: the loss of X = W @ H against T, and the mean
+    of (T - e^-X)^2 / e^-X.  It computes both values in blocks of pixels to limit memory."""
     from ._loss import stable_nnal
     from .outputs import _CHUNK_ELEMENTS
     Hd = H.double()
@@ -26,19 +30,20 @@ def _loss_and_residual(T, W, H):
 
 
 def _lrt_rank(T, max_rank, label, verbose=0):
-    """Sequential likelihood-ratio rank test on the pixels of T, a tensor on the device. Returns (rank, detail)."""
+    """This function runs the likelihood-ratio rank test on the transmission T.  It returns the
+    tuple (rank, detail), where detail is a dict of the losses, gains, and threshold."""
     from .factorization import _nnal_factorization
     P, K = T.shape
     losses, resid = [], []
     for r in range(1, max_rank + 1):
-        # uncompiled: the search solves small problems at six ranks, and each new shape would recompile
+        # The fit is not compiled, because each rank has a new shape that would force a recompile.
         W, H, _ = _nnal_factorization(T, r, max_steps=200, rel_tol=1e-6, compile_mode="off")
         loss, res = _loss_and_residual(T, W, H)
         losses.append(loss)
         resid.append(res)
     dose_eff = 1.0 / max(resid[-1], np.finfo(np.float64).tiny)
-    gains = [dose_eff * (losses[i - 1] - losses[i]) for i in range(1, len(losses))]     # gains[i - 1]: component i + 1
-    edge = 0.5 * (math.sqrt(P) + math.sqrt(K)) ** 2          # the gain of a component fitted to noise alone
+    gains = [dose_eff * (losses[i - 1] - losses[i]) for i in range(1, len(losses))]     # gains[i - 1] is for component i + 1.
+    edge = 0.5 * (math.sqrt(P) + math.sqrt(K)) ** 2          # This is the gain of a component fitted to noise alone.
     quiet = [g for g in gains[-3:] if g < 2.0 * edge]
     floor = max(0.5 * (P + K), float(np.median(quiet))) if quiet else edge
     threshold = 2.0 * floor
@@ -57,24 +62,25 @@ def _lrt_rank(T, max_rank, label, verbose=0):
 
 
 def _pool_pixels(T, spatial_shape, block):
-    """Block-average a (pixels, bins) array over block x block detector pixels within each view.
-
-    Rows and columns are cropped to multiples of the block. The averaged transmission is the summed count over the
-    block divided by the block's summed dose, so it is a valid transmission ratio at block^2 times the dose.
+    """This function averages the transmission over square blocks of detector pixels within
+    each view.  Each block is block x block pixels.  The function first crops the rows and the
+    columns to multiples of the block size.
 
     Args:
-        T (numpy.ndarray): Transmission ratio, shape (pixels, bins), pixels in (views, rows, cols) order.
-        spatial_shape (tuple): (views, rows, cols).
-        block (int): Block size in pixels along rows and columns.
+        T (numpy.ndarray): The transmission ratio, with shape (pixels, bins).  The pixels are in
+            (views, rows, cols) order.
+        spatial_shape (tuple): The shape (views, rows, cols).
+        block (int): The block size in pixels along the rows and the columns.
 
     Returns:
-        numpy.ndarray: The pooled transmission, shape (views * (rows // block) * (cols // block), bins).
+        numpy.ndarray: The pooled transmission, with shape
+            (views * (rows // block) * (cols // block), bins).
     """
     V, rows, cols = spatial_shape
     r, c = rows // block * block, cols // block * block
     X = np.asarray(T).reshape(V, rows, cols, -1)
     out = np.empty((V, r // block, c // block, X.shape[-1]), dtype=X.dtype)
-    for v in range(V):                                  # one band of block rows at a time: no copy of the whole array
+    for v in range(V):                                  # This loop never copies the whole array.
         for i in range(r // block):
             band = X[v, i * block:(i + 1) * block, :c]
             out[v, i] = band.reshape(block, c // block, block, -1).mean(axis=(0, 2))
@@ -82,32 +88,37 @@ def _pool_pixels(T, spatial_shape, block):
 
 
 def _subsample(T, n):
-    """At most n rows of T, a seeded random subset in their original order, as contiguous float32."""
+    """This function returns at most n rows of T as a float32 array.  It chooses the rows at
+    random with a fixed seed, and it keeps them in their original order."""
     rows = np.sort(np.random.default_rng(0).choice(T.shape[0], n, replace=False)) if T.shape[0] > n else slice(None)
     return np.ascontiguousarray(T[rows], dtype=np.float32)
 
 
 def estimate_rank(data, dataset_type="attenuation", max_rank=6, device=None, pool="auto", verbose=0):
-    """Estimate the number of components of a hyperspectral dataset by likelihood-ratio tests.
+    """This function estimates the number of spectral components in a hyperspectral dataset.
 
-    Ranks 1 to max_rank are fitted in turn, and a component is kept while its gain in log-likelihood stands well
-    above the gain a component that fits only noise would give. When the leading axes are (views, rows, cols) or
-    (rows, cols), the test is also run on blocks of pooled pixels, which is more sensitive to faint materials at low
-    dose, and the larger of the two ranks is returned. This is the rank dehydrate uses when num_materials is not
-    given.
+    The function fits the data with ranks 1 to ``max_rank`` in turn.  It keeps adding components
+    while the gain in log-likelihood of each new component is well above the gain expected from
+    noise.  The data may have the image axes (views, rows, cols) or (rows, cols) before the
+    spectral axis.  In that case, the function also runs the test on blocks of averaged pixels,
+    and it returns the larger of the two ranks.
 
     Args:
-        data (numpy.ndarray or torch.Tensor): Hyperspectral data with any leading axes and the spectral axis last.
-        dataset_type (str, optional): 'attenuation' or 'transmission'. Defaults to 'attenuation'.
-        max_rank (int, optional): Largest rank considered. Defaults to 6.
-        device (str, optional): Torch device. Defaults to None: CUDA if available, else CPU.
-        pool (str or int, optional): Pooling block size in pixels; 'auto' chooses it from the dose, 0 disables
-            pooling. Defaults to 'auto'.
-        verbose (int, optional): 1 prints each search's gains and decision. Defaults to 0.
+        data (numpy.ndarray or torch.Tensor): The data, with the spectral axis last.
+        dataset_type (str, optional): Either 'attenuation' or 'transmission'.  Defaults to
+            'attenuation'.
+        max_rank (int, optional): The largest rank tested.  Defaults to 6.
+        device (str, optional): The torch device.  Defaults to None, which selects CUDA if it is
+            available and the CPU otherwise.
+        pool (str or int, optional): The width in pixels of the blocks that are averaged.  The
+            value 'auto' chooses the width from the estimated counts per bin, and 0 turns
+            averaging off.  Defaults to 'auto'.
+        verbose (int, optional): If 1, the function prints the gains and the chosen rank of each
+            test.  Defaults to 0.
 
     Returns:
-        (rank, note, detail): the rank, a one-line account of how it was chosen, and a dict with the searches'
-        gains, effective doses and thresholds.
+        (rank, note, detail): The estimated rank, a one-line note that says how the rank was
+            chosen, and a dict with the details of each test.
     """
     from .denoise import _spatial_shape, _to_transmission
     T, shape = _to_transmission(data, dataset_type)
@@ -115,8 +126,8 @@ def estimate_rank(data, dataset_type="attenuation", max_rank=6, device=None, poo
 
 
 def _estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=16384, pool="auto", verbose=0):
-    """estimate_rank on a (pixels, bins) transmission ratio whose pixels are in (views, rows, cols) order when
-    spatial_shape is given; subsample caps the pixels each test uses (a seeded random subset)."""
+    """This function performs :func:`estimate_rank` on a transmission ratio with shape
+    (pixels, bins).  The argument ``subsample`` is the most pixels that each test uses."""
     device = _default_device(device)
     T_np = T.detach().cpu().numpy() if torch.is_tensor(T) else np.asarray(T)
     pixels, K = T_np.shape
@@ -137,9 +148,8 @@ def _estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=163
     rank = rank_full
     parts = [f"full resolution gave {rank_full}"]
     if spatial_shape is None and pool == "auto" and d_full["effective_dose"] < 64.0:
-        # Below 64 counts per bin 'auto' pools, and the full-resolution test alone misses components: on the
-        # three-material sphere phantom (65,536 pixels) it gave rank 1 at up to 3 counts per bin and 2 at 10, where
-        # pooling gave 3.
+        # With pool='auto', averaging is used below 64 counts per bin.  At such low counts the
+        # full-resolution test can miss faint components.
         parts.append("no pooling: the data have no image axes")
         dose = d_full["effective_dose"]
         warnings.warn(f"the rank was estimated at full resolution only ({dose:.3g} counts per bin): the data have no "

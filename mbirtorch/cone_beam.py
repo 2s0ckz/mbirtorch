@@ -1,25 +1,11 @@
-"""ConeBeamModel: flat and curved detectors, circular and helical scans, the
-multi-device banding seams, and DC damping.
+"""This module defines ConeBeamModel.  The model supports flat and curved detectors, and it
+supports circular and helical scans.
 
-Structure: cone projection is two separable fans.  The HORIZONTAL fan maps a
-voxel to detector channels exactly as in parallel beam, except the projected
-coordinate, width, and weight are magnification-dependent PER PIXEL.  The
-VERTICAL fan maps each slice of a voxel cylinder to a RANGE of detector rows
-(the cone angle); both directions derive that row map from the single affine
-pair (m0, W_p_r) of :func:`_cone_vertical_affine`.  The forward vertical fan
-is formulated from the DETECTOR side (for each detector row, which voxels
-project onto it), matching the back projector by construction so the pair
-stays exactly adjoint; the back vertical fan gathers each pixel's detector
-column onto the recon slices with the weight rule
-
-    A = clip((W_p_r + 1) / 2 - |m_p - m|, 0, min(1, W_p_r)) / cos_phi
-
-(validity-masked, then raised to coeff_power).  The order of the arithmetic in
-the gather is deliberate, so do not rearrange it.
-
-The drivers batch over views like the parallel drivers; the dominant
-transients are (view_batch, P, S) and (view_batch, P, R), so the effective
-view batch shrinks under the same transient budget.
+The cone-beam projection is computed in two separable steps.  The horizontal step maps a voxel
+to detector channels as in parallel beam, with a magnification for each pixel.  The vertical
+step maps each slice of a column of voxels to a range of detector rows.  This step uses the
+affine map of :func:`_cone_vertical_affine`.  The forward and back projectors are exact
+adjoints.  The order of the arithmetic in them must not be changed.
 """
 
 import os
@@ -36,16 +22,14 @@ from .vcd_utils import get_support_radius
 
 _F32 = torch.float32
 
-# These are (a, b, p, c) for the slice damping s_k = (c t^p + a b^p)/(t^p + b^p)
-# with t_k = L |z_k| / (R dz).  Set ct_model._dc_damping to four values or to
-# None to change it.  The convergence tests depend on these defaults.
+# The parameters (a, b, p, c) of the slice damping s_k = (c t^p + a b^p)/(t^p + b^p), where
+# t_k = L |z_k| / (R dz).  None turns damping off.  The convergence tests depend on these values.
 _DC_DAMPING_DEFAULT = (0.25, 100.0, 0.7, 0.5)
 
 
 def _dc_damped_update_direction(forward_grad, prior_grad, forward_hess,
                                 prior_hess, s_row):
-    # The direction is d = -(g - (1 - s_k) gbar_k) / H, where gbar_k is the
-    # H^-1 weighted slice mean of g over the subset's pixels.
+    # d = -(g - (1 - s_k) gbar_k) / H.  gbar_k is the mean of g over the slice, weighted by H^-1.
     g = forward_grad + prior_grad
     h_inv = 1.0 / (forward_hess + prior_hess)
     gbar = torch.sum(h_inv * g, dim=0) / torch.sum(h_inv, dim=0)
@@ -54,9 +38,11 @@ def _dc_damped_update_direction(forward_grad, prior_grad, forward_hess,
 
 def _cone_pixel_xy_mag(pixel_indices, angles, num_rows, num_cols, delta_voxel,
                        delta_voxel_row, magnification, source_detector_dist):
-    """Return the rotated in-plane coordinates x and y and the per-pixel
-    magnification, each of shape (Vb, P).  The magnification expression
-    1 / (1/M - y/SDD) is valid even at SDD = inf.
+    """This function returns the rotated in-plane coordinates x and y and the magnification of
+    each pixel.
+
+    Each output has shape (Vb, P).  The function is also correct when source_detector_dist is
+    infinite.
     """
     x_tilde, y_tilde = pixel_xy(pixel_indices, num_rows, num_cols, delta_voxel,
                                 delta_voxel_row)
@@ -65,9 +51,8 @@ def _cone_pixel_xy_mag(pixel_indices, angles, num_rows, num_cols, delta_voxel,
 
 
 def _cone_xy_mag(x_tilde, y_tilde, angles, magnification, source_detector_dist):
-    """Return the rotated in-plane coordinates and the per-point
-    magnification for positions rather than pixel indices.  Each output has
-    shape (Vb, P)."""
+    """This function returns the rotated in-plane coordinates and the magnification of each
+    position.  Each output has shape (Vb, P)."""
     cosine = torch.cos(angles)[:, None]
     sine = torch.sin(angles)[:, None]
     x, y = rotate_about_z(x_tilde, y_tilde, cosine, sine)
@@ -77,10 +62,10 @@ def _cone_xy_mag(x_tilde, y_tilde, angles, magnification, source_detector_dist):
 
 def _cone_channel_coordinate(x, y, pixel_mag, magnification,
                              source_detector_dist, use_curved_detector):
-    """Return the detector coordinate u along the channels of rotated points.
-    A flat panel scales x by the point's magnification.  A curved panel is a
-    cylinder of radius source_detector_dist about an axis through the source,
-    and u is arc length along it, positive toward +x."""
+    """This function returns the detector coordinate u along the channels for rotated points.
+
+    For a curved detector, u is the arc length along the cylinder, and u is positive toward +x.
+    """
     if not use_curved_detector:
         return pixel_mag * x
     source_iso_dist = source_detector_dist / magnification
@@ -88,10 +73,11 @@ def _cone_channel_coordinate(x, y, pixel_mag, magnification,
 
 
 def _cone_row_coordinate(pixel_mag, z):
-    """Return the detector coordinate v along the rows.  It is the height z
-    of a point in the projector's frame, scaled by the point's magnification.
-    A curved panel uses this too, because its rows are spaced on the plane
-    tangent to the cylinder at the central ray rather than at equal angles."""
+    """This function returns the detector coordinate v along the rows.
+
+    The coordinate v is the height z of a point multiplied by its magnification.  This formula
+    holds for both flat and curved detectors.
+    """
     return pixel_mag * z
 
 
@@ -99,10 +85,11 @@ def _cone_horizontal_data(pixel_indices, angles, num_rows, num_cols, num_channel
                           delta_voxel, delta_voxel_row, delta_det_channel,
                           det_channel_offset, magnification, source_detector_dist,
                           use_curved_detector):
-    """Return the horizontal fan's inputs for a view batch.  The values n_p,
-    centers, W_p_c, and weight_scale each have shape (Vb, P), which is the
-    contract in horizontal_fan.py.  The per-pixel magnification is returned
-    as well for use by the vertical fan.
+    """This function computes the inputs of the horizontal projection step for one batch of
+    views.
+
+    It returns (n_p, centers, W_p_c, weight_scale, pixel_mag).  Each output has shape (Vb, P).
+    ``pixel_mag`` is the magnification of each pixel.
     """
     x, y, pixel_mag = _cone_pixel_xy_mag(pixel_indices, angles, num_rows, num_cols,
                                          delta_voxel, delta_voxel_row,
@@ -119,8 +106,7 @@ def _cone_horizontal_data(pixel_indices, angles, num_rows, num_cols, num_channel
     footprint_xy = torch.maximum((angles[:, None] - theta).cos().abs() * delta_voxel,
                                  (angles[:, None] - theta).sin().abs() * delta_voxel_row)
     if not use_curved_detector:
-        # On a flat detector the footprint widens at oblique angles, so a
-        # foreshortening correction is applied.  The curved arc form includes it.
+        # A flat detector needs this 1/cos(theta) factor for oblique rays.  A curved detector does not.
         W_p_c = pixel_mag * (footprint_xy / delta_det_channel) / torch.cos(theta)
     else:
         W_p_c = pixel_mag * (footprint_xy / delta_det_channel)
@@ -132,31 +118,24 @@ def _cone_horizontal_data(pixel_indices, angles, num_rows, num_cols, num_channel
 def _cone_vertical_affine(pixel_mag, z_shifts, num_slices, delta_voxel_slice,
                           delta_det_row, det_row_offset, recon_slice_offset,
                           num_rows_r):
-    """Return the vertical fan's affine map from global slice index to
-    detector row.
+    """This function returns the affine map m = m0 + W_p_r * l from slice index l to detector
+    row m.
 
-    Each (view, pixel) cylinder projects onto the detector rows through the
-    affine map m(v, p, l) = m0 + W_p_r * l, where l is the global slice
-    index.  m0 is anchored at global slice 0, so a slice band only restricts
-    the range of l.  The back projector evaluates this map directly and the
-    forward projector inverts it as k_m = (m - m0) / W_p_r.
-
-    A fused kernel consumes this pair together with the horizontal fan data
-    contract of horizontal_fan.py, and needs nothing else of the cone
-    vertical geometry.
+    The slice index l counts slices in the whole volume.
 
     Args:
-        pixel_mag: per-(view, pixel) magnification, (Vb, P).
-        z_shifts: per-view helical z shift, (Vb,).
-        num_slices (int): the full recon slice count.  The z anchor stays on
-            it whatever band is requested.
-        delta_voxel_slice, delta_det_row, det_row_offset, recon_slice_offset:
-            the vertical geometry scalars.
-        num_rows_r (int): detector row count.
+        pixel_mag: (torch.Tensor) The magnification of each view and pixel, shape (Vb, P).
+        z_shifts: (torch.Tensor) The helical z shift of each view, shape (Vb,).
+        num_slices (int): The number of slices in the whole reconstruction.  This value does not
+            depend on the range of slices being projected.
+        delta_voxel_slice, delta_det_row, det_row_offset, recon_slice_offset: The scalar
+            parameters of the vertical geometry.
+        num_rows_r (int): The number of detector rows.
 
     Returns:
-        (m0, W_p_r, z_offset): the row-center anchor at global slice 0 (Vb, P),
-        the rows-per-slice slope (Vb, P), and the per-view z offset (Vb,).
+        (m0, W_p_r, z_offset): ``m0`` is the detector row of slice 0, with shape (Vb, P).
+        ``W_p_r`` is the number of rows per slice, with shape (Vb, P).  ``z_offset`` is the z
+        offset of each view, with shape (Vb,).
     """
     z_offset = recon_slice_offset - z_shifts
     W_p_r = pixel_mag * delta_voxel_slice / delta_det_row
@@ -175,18 +154,13 @@ def _cone_forward_view_batch(values, pixel_indices, view_params_batch,
                              magnification, source_detector_dist,
                              use_curved_detector, psf_radius, bp_psf_radius,
                              slice_start=0, plan=None):
-    """Cone forward projection for one view batch.  It runs the detector-side
-    vertical fan and then the per-pixel horizontal fan scatter.  Returns an
-    array of shape (Vb, R, C).
+    """This function computes the cone-beam forward projection of one batch of views.
 
-    ``slice_start`` supports a call over a band of slices.  ``values`` may be
-    a band (P, L) whose global slice indices are [slice_start, slice_start +
-    L).  The z geometry stays anchored on the full num_slices center, gathers
-    use band-local storage indices, and taps outside the band contribute
-    zero.  Summing the per-band outputs over a tiling of the slice axis
-    therefore reproduces the unbanded projection exactly.
-
-    ``plan`` is unused."""
+    The output has shape (Vb, R, C).  ``values`` can hold only some of the slices.  In that case
+    ``values`` has shape (P, L) and holds the L slices that start at ``slice_start``.  The sum of
+    the outputs over a set of slice ranges that covers all slices equals the full projection.
+    The function ignores ``plan``.
+    """
     angles = view_params_batch[:, 0]
     z_shifts = view_params_batch[:, 1]
     n_p, centers, W_p_c, weight_scale, pixel_mag = _cone_horizontal_data(
@@ -200,8 +174,7 @@ def _cone_forward_view_batch(values, pixel_indices, view_params_batch,
         pixel_mag, z_shifts, num_slices, delta_voxel_slice, delta_det_row,
         det_row_offset, recon_slice_offset, num_rows_r)
 
-    # The cylinder values are scaled by 1/cos(phi), where phi is the vertical
-    # cone angle of each (pixel, slice) voxel.
+    # The values are scaled by 1/cos(phi), where phi is the vertical cone angle of each voxel.
     band_len = values.shape[1]
     k = torch.arange(slice_start, slice_start + band_len, dtype=_F32, device=dev)
     z = (delta_voxel_slice * (k - (num_slices - 1) / 2.0))[None, None, :] \
@@ -211,8 +184,7 @@ def _cone_forward_view_batch(values, pixel_indices, view_params_batch,
         source_detector_dist, dtype=_F32, device=dev)))
     scaled_values = values[None, :, :] / cos_phi
 
-    # Detector rows are mapped to fractional voxel indices by inverting the
-    # shared affine map, so k_m is affine in the row index with slope 1/W_p_r.
+    # Detector row m maps to the fractional slice index k_m = (m - m0) / W_p_r.
     m = torch.arange(num_rows_r, dtype=_F32, device=dev)
     k_m = (m[None, None, :] - m0.unsqueeze(-1)) / W_p_r.unsqueeze(-1)
     k_center = torch.round(k_m).to(torch.int64)
@@ -246,14 +218,12 @@ def _cone_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                           source_detector_dist, use_curved_detector, psf_radius,
                           bp_psf_radius, coeff_power=1, slice_start=0,
                           band_slices=None, plan=None):
-    """Cone back projection for one view batch, summed over the batch's
-    views.  It runs the horizontal fan gather to form per-pixel detector
-    columns and then the vertical fan gather onto the slices.  Returns an
-    array of shape (P, S), or (P, band_slices) when a band of slices
-    [slice_start, slice_start + band_slices) is requested.  The z geometry
-    stays anchored on the full num_slices center.
+    """This function computes the cone-beam back projection of one batch of views.
 
-    ``plan`` is unused."""
+    The function sums the result over the views in the batch.  The output has shape (P, S).  If
+    ``band_slices`` is given, the output has shape (P, band_slices) and holds the slices that
+    start at ``slice_start``.  The function ignores ``plan``.
+    """
     angles = view_params_batch[:, 0]
     z_shifts = view_params_batch[:, 1]
     n_p, centers, W_p_c, weight_scale, pixel_mag = _cone_horizontal_data(
@@ -279,8 +249,6 @@ def _cone_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     v_slices = pixel_mag.unsqueeze(-1) * z
     sdd_t = torch.as_tensor(source_detector_dist, dtype=_F32, device=dev)
     cos_phi = torch.cos(torch.atan2(v_slices, sdd_t))
-    # Slices are mapped to detector rows by the direct form of the shared
-    # affine map.
     slope = W_p_r.unsqueeze(-1)
     m_p = m0.unsqueeze(-1) + slope * k[None, None, :]
     m_center = torch.round(m_p).to(torch.int64)
@@ -301,36 +269,34 @@ def _cone_back_view_batch(sino_batch, pixel_indices, view_params_batch,
 
 class ConeBeamModel(TomographyModel):
     """
-    A class designed for handling forward and backward projections in a cone
-    beam geometry, extending :class:`TomographyModel`.
+    This class is used to compute forward and back projections in a cone-beam geometry.  It
+    extends :class:`TomographyModel`.
 
     Args:
         sinogram_shape (tuple): (num_views, num_det_rows, num_det_channels).
-        angles (ndarray): 1D array of projection angles in radians.
-        source_detector_dist (float): Distance from source to detector in ALU.
-        source_iso_dist (float): Distance from source to iso (rotation center).
-        helical_z_shifts (ndarray, optional): per-view z shift for helical
-            scans; None (default) is a circular scan.
-        use_curved_detector (bool): False (default) = flat panel; True = a
-            cylindrical detector of radius source_detector_dist.
-        view_batch_size, compile_mode: as in ParallelBeamModel.
+        angles (ndarray): A 1D array of projection angles in radians.
+        source_detector_dist (float): The distance from the source to the detector in ALU.
+        source_iso_dist (float): The distance from the source to iso, the center of rotation,
+            in ALU.
+        helical_z_shifts (ndarray, optional): The z shift of each view for a helical scan.  If
+            None, the scan is circular.  Defaults to None.
+        use_curved_detector (bool): If False, the detector is flat.  If True, the detector is a
+            cylinder with radius source_detector_dist.  Defaults to False.
+        view_batch_size, compile_mode: The same as in ParallelBeamModel.
 
     Note:
-        Two parameters are not constructor arguments.  Set them with ``set_params`` after the
-        model is built.
+        Two parameters are set with ``set_params`` after the model is built.
 
         **recon_slice_offset** (float, default 0.0): The position of the center of the
-        reconstruction along the rotation axis, in ALU.  ``auto_set_recon_geometry`` sets it so
-        that the reconstruction is centered on the band of the object the detector sees, which is
-        ``-det_row_offset / magnification`` plus the center of any helical travel.  Set it after
-        that to shift the reconstruction up or down.  A positive value moves it down relative to
-        the detector, toward the higher detector row indices.
+        reconstruction along the rotation axis, in ALU.  ``auto_set_recon_geometry`` centers
+        the reconstruction on the part of the object that the detector sees.  A positive value
+        moves the reconstruction toward higher detector row indices.
 
-        **axial_pad_fraction** (float or (top, bottom) pair, default 0.0): How far
-        ``auto_set_recon_geometry`` extends the reconstruction at each end of the rotation axis,
-        as a fraction of the distance the outermost rays reach past the band at iso: 0 adds
-        nothing, 1 pads to the deepest point any measured ray reaches.  A pair gives the top and
-        bottom fractions separately; the top is the low slice and detector row indices.
+        **axial_pad_fraction** (float or (top, bottom) pair, default 0.0): This parameter sets
+        how far ``auto_set_recon_geometry`` extends the reconstruction at each end of the
+        rotation axis.  A value of 0 adds no slices.  A value of 1 extends the reconstruction to
+        the farthest point that any measured ray reaches.  The top end has the low slice and
+        detector row indices.
     """
 
     def __init__(self, sinogram_shape, angles, source_detector_dist, source_iso_dist,
@@ -356,19 +322,18 @@ class ConeBeamModel(TomographyModel):
 
     _dc_damping = _DC_DAMPING_DEFAULT
 
-    # This name selects the measured speed floors that set the automatic
-    # device count.  See _widening_floors.
+    # This selects the cone-beam table in ``_widening_floors``.  That table gives the
+    # minimum sinogram size for each number of GPUs.
     _floor_family = 'cone'
 
     def create_projectors(self):
         super().create_projectors()
-        # The damping profile is built here rather than on first use, because
-        # lazy building races the per-device worker threads on the first subset.
+        # The damping profile is built here.  If it were built on first use, the worker threads
+        # of the different devices would race to build it.
         self._dc_damping_slice_profile()
 
     def _view_batch_bodies(self):
-        # Each Triton kernel is used where the Triton probe and the first-use
-        # value check both pass.  Set MBIRTORCH_DISABLE_TRITON=1 to turn them off.
+        # The environment variable MBIRTORCH_DISABLE_TRITON=1 turns off the Triton kernels.
         from .kernel_availability import (cone_back_kernel_usable,
                                           cone_forward_kernel_usable)
         if cone_back_kernel_usable(self)[0]:
@@ -403,22 +368,17 @@ class ConeBeamModel(TomographyModel):
                     psf_radius=psf_radius, bp_psf_radius=bp_psf_radius)
 
     def _transient_cols(self, band_cols):
-        # The cone bodies hold (Vb, P, S) and (Vb, P, R) temporaries whatever
-        # band is requested, so the budget width comes from the parameters.
+        # The cone-beam projection functions hold temporary arrays of shape (Vb, P, S) and
+        # (Vb, P, R), even when they project only some of the slices.
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
                                                        'recon_shape'])
         return max(int(recon_shape[2]), int(sinogram_shape[1]))
 
     def _dc_damping_slice_profile(self):
-        """Return the per-slice damping vectors s_k, split per device, or
-        None when damping is disabled.  For a circular scan s_k comes from
-        t_k = L |z_k| / (R dz).  For a helical scan it is averaged over
-        views.  The result is cached against the parameters and the device
-        layout, and _invalidate_device_caches drops the cache.
+        """This method returns the slice damping vectors and the compiled update functions, one of
+        each per device.
 
-        Returns:
-            (profiles, fns): per-device (local_slices,) tensors and compiled
-            direction helpers, in device order, or None when disabled.
+        The method caches the result.  It returns None if damping is disabled.
         """
         cfg = self._dc_damping
         if cfg is None:
@@ -451,8 +411,7 @@ class ConeBeamModel(TomographyModel):
             t = L * np.abs(z[:, None] - z_shifts[None, :]) / (R * dz)
             s_prof = profile(t).mean(axis=1)
         profiles, fns = [], []
-        # The slice count is passed explicitly because a single-device model
-        # that was never reconfigured carries no axis_len on its placement.
+        # The number of slices is passed, because a placement on one device can have no axis_len.
         for i, (dev, (s0, s1)) in enumerate(rp.shard_ranges(nz)):
             profiles.append(torch.as_tensor(
                 s_prof[s0:s1].astype(np.float32), device=dev))
@@ -463,8 +422,6 @@ class ConeBeamModel(TomographyModel):
 
     def _get_update_direction(self, forward_grad, prior_grad, forward_hess,
                               prior_hess, pixel_indices, dev_index=0):
-        # Each slice's update is damped, on the qGGMRF and prox paths alike.
-        # The slice means are shard-local, and every slice lives on one shard.
         prof = self._dc_damping_slice_profile()
         if prof is None:
             return super()._get_update_direction(forward_grad, prior_grad,
@@ -479,8 +436,8 @@ class ConeBeamModel(TomographyModel):
                               prior_hess_t, profiles[dev_index])
 
     def _project_points_batch(self, points, view_params):
-        # points is (N, 3) float64 on the CPU.  view_params is (V, 2) holding the
-        # angle and the helical z shift.  Returns (row, channel), each of shape (V, N).
+        # points has shape (N, 3), float64, on the CPU.  view_params has shape (V, 2).
+        # Its columns are the angle and the helical shift.
         (ddr, ddc, dro, dco, sdd, curved) = self.get_params(
             ['delta_det_row', 'delta_det_channel', 'det_row_offset',
              'det_channel_offset', 'source_detector_dist', 'use_curved_detector'])
@@ -491,14 +448,17 @@ class ConeBeamModel(TomographyModel):
         x, y, pixel_mag = _cone_xy_mag(points[:, 0], points[:, 1], angles,
                                        magnification, sdd)
         u = _cone_channel_coordinate(x, y, pixel_mag, magnification, sdd, curved)
-        # A helical view moves the object toward -z by its shift.
+        # In a helical view, the object moves toward -z by the helical shift.
         z = points[:, 2][None, :] - z_shifts[:, None]
         v = _cone_row_coordinate(pixel_mag, z)
         return (row_index(v, ddr, dro, num_rows_r),
                 channel_index(u, ddc, dco, num_channels))
 
     def get_magnification(self):
-        """magnification = source_detector_dist / source_iso_dist (1 at inf)."""
+        """This method returns the magnification source_detector_dist / source_iso_dist.
+
+        If source_detector_dist is infinite, the method returns 1.
+        """
         source_detector_dist, source_iso_dist = self.get_params(
             ['source_detector_dist', 'source_iso_dist'])
         if np.isinf(source_detector_dist):
@@ -506,7 +466,11 @@ class ConeBeamModel(TomographyModel):
         return source_detector_dist / source_iso_dist
 
     def verify_valid_params(self):
-        """Check that all parameters are compatible for a reconstruction."""
+        """This method checks that the parameters are valid for a reconstruction.
+
+        It raises a ValueError if a parameter is not valid.  It issues a warning if the cone angle
+        is more than 45 degrees.
+        """
         super().verify_valid_params()
         sinogram_shape, view_params_array = self.get_params(
             ['sinogram_shape', 'view_params_array'])
@@ -520,7 +484,6 @@ class ConeBeamModel(TomographyModel):
                              'equal the number of views.')
         if voxel_row_aspect <= 0 or voxel_slice_aspect <= 0:
             raise ValueError('Voxel aspect ratios must be positive.')
-        # Check for cone angle > 45 degrees.
         source_detector_dist, delta_det_row, det_row_offset = self.get_params(
             ['source_detector_dist', 'delta_det_row', 'det_row_offset'])
         half_detector_height = delta_det_row * num_det_rows / 2 + abs(det_row_offset)
@@ -529,16 +492,14 @@ class ConeBeamModel(TomographyModel):
                           'produce recon artifacts.')
 
     def get_psf_radii(self):
-        """The two integer psf radii, PURE (no attribute side effects): the
-        channel radius from the maximum magnification (the forward horizontal
-        tap radius and the back vertical tap radius) and the back/vertical
-        voxel-per-detector radius (the forward vertical tap radius).  The
-        directions deliberately use DIFFERENT vertical radii -- forward
-        gathers voxels per detector row (bp radius), back gathers rows per
-        voxel (psf radius).
+        """This method returns the two integer PSF radii.  It does not set any attributes.
+
+        ``psf_radius`` is the radius in detector pixels at the largest magnification.
+        ``bp_psf_radius`` is the radius in voxels of one detector pixel at the smallest
+        magnification.
 
         Returns:
-            (psf_radius, bp_psf_radius) ints.
+            tuple of int: (psf_radius, bp_psf_radius).
         """
         (delta_det_row, delta_det_channel, source_detector_dist, recon_shape,
          delta_voxel, voxel_row_aspect, voxel_slice_aspect) = self.get_params(
@@ -567,33 +528,21 @@ class ConeBeamModel(TomographyModel):
         return psf_radius, bp_psf_radius
 
     def get_psf_radius(self):
-        """Integer radius of the channel psf (see :meth:`get_psf_radii`)."""
+        """This method returns the integer radius of the PSF in detector channels."""
         return self.get_psf_radii()[0]
 
     def pixel_magnification_bounds(self, support_radius=None):
-        """The smallest and largest per-pixel magnification over the support.
+        """This method returns the smallest and largest pixel magnification over the support.
 
-        A voxel at in-plane depth ``y`` toward the detector projects with
-        magnification ``sdd / (sid - y)`` (``_cone_pixel_xy_mag``).  Over the
-        support radius ``r`` of :func:`get_support_radius` that runs from
-        ``sdd / (sid + r)`` at the far side to ``sdd / (sid - r)`` at the near
-        side.  The reciprocal of the smallest magnification is the axial reach
-        per unit of detector height at the far side, which
-        :meth:`auto_set_recon_geometry` uses to pad the volume axially.  A
-        parallel source (infinite ``source_detector_dist``) gives 1 and 1.
-        :meth:`get_psf_radii` computes its own bounds over the half width of
-        the grid rather than the masked support, and is left as it is, because
-        those bounds set the integer tap radii of the compiled bodies.
+        If ``source_detector_dist`` is infinite, both values are 1.
 
         Args:
-            support_radius (float, optional): the support radius in ALU.  None
-                (the default) computes it from the model's recon geometry.
-                ``auto_set_recon_geometry`` passes its own, because it calls
-                this before the recon geometry it is deriving has been set.
+            support_radius (float, optional): The support radius in ALU.  If None, the method
+                computes it from the recon geometry of the model.  Defaults to None.
 
         Returns:
-            tuple of float: ``(min_magnification, max_magnification)``.  The
-            largest is ``inf`` when the support reaches the source.
+            tuple of float: ``(min_magnification, max_magnification)``.  The largest value is
+            ``inf`` if the support reaches the source.
         """
         source_detector_dist, source_iso_dist = self.get_params(
             ['source_detector_dist', 'source_iso_dist'])
@@ -612,7 +561,8 @@ class ConeBeamModel(TomographyModel):
     @staticmethod
     def detector_mn_to_uv(m, n, delta_det_channel, delta_det_row, det_channel_offset,
                           det_row_offset, num_det_rows, num_det_channels):
-        """Fractional detector indices (m, n) -> physical coordinates (u, v)."""
+        """This method converts fractional detector indices (m, n) to physical detector
+        coordinates (u, v)."""
         det_center_row = (num_det_rows - 1) / 2.0
         det_center_channel = (num_det_channels - 1) / 2.0
         v = (m - det_center_row) * delta_det_row - det_row_offset
@@ -620,15 +570,12 @@ class ConeBeamModel(TomographyModel):
         return u, v
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
-        """Compute the automatic recon geometry for cone beam reconstruction.
+        """This method sets the recon shape, voxel size, and recon_slice_offset for a cone-beam
+        reconstruction.
 
-        The xy width is the detector field of view at iso; the axial height is
-        the detector height at iso swept over any helical travel, plus per-end
-        padding scaled by ``axial_pad_fraction`` (a fraction of 1 pads each end
-        to the deepest z reached by any measured ray).  The volume is centered
-        on the band the detector illuminates: the center of the helical travel,
-        shifted by ``-det_row_offset / magnification``, so a row offset moves
-        the volume with the detector.
+        The volume covers the field of view of the detector at iso.  For a helical scan, the volume
+        also covers the full helical travel.  The method extends the volume at each end by
+        ``axial_pad_fraction``.  The center of the volume moves with ``det_row_offset``.
         """
         delta_det_row, delta_det_channel = self.get_params(
             ['delta_det_row', 'delta_det_channel'])
@@ -652,13 +599,12 @@ class ConeBeamModel(TomographyModel):
         z_travel = z_max - z_min
         H_iso = num_det_rows * (delta_det_row / magnification)
         num_recon_slices = max(1, int(np.ceil((H_iso + z_travel) / delta_voxel_slice)))
-        # The rows sit at v = (m - center) * delta_det_row - det_row_offset, so the
-        # band they illuminate at iso is centered at -det_row_offset / magnification.
+        # At iso, the detector rows see a range of z centered at -det_row_offset / magnification.
         det_row_offset = self.get_params('det_row_offset')
         recon_slice_offset = 0.5 * (z_min + z_max) - det_row_offset / magnification
 
-        # An edge ray at height v diverges across the support to |z| = |v| (SID + R) / SDD.
-        # Each end is extended by that excess at iso, scaled by axial_pad_fraction.
+        # An edge ray at detector height v reaches |z| = |v| (SID + R) / SDD at the far side
+        # of the support, where R is the support radius.
         source_detector_dist, det_channel_offset, use_ror_mask = \
             self.get_params(['source_detector_dist', 'det_channel_offset', 'use_ror_mask'])
         support_radius = get_support_radius((num_recon_rows, num_recon_cols),
@@ -674,11 +620,7 @@ class ConeBeamModel(TomographyModel):
                                                num_det_rows, num_det_channels)
         v_bot = max(float(v_row_low), float(v_row_high))
         v_top = min(float(v_row_low), float(v_row_high))
-        # The far-side reach per unit of detector height is the reciprocal of
-        # the smallest magnification over the support.
         z_per_v_far_side = 1.0 / self.pixel_magnification_bounds(support_radius)[0]
-        # The excess is measured from the band's edge at iso, which is
-        # v / magnification.
         excess_bot = max(0.0, v_bot * (z_per_v_far_side - 1.0 / magnification))
         excess_top = max(0.0, -v_top * (z_per_v_far_side - 1.0 / magnification))
 
@@ -704,11 +646,13 @@ class ConeBeamModel(TomographyModel):
                         recon_slice_offset=recon_slice_offset)
 
     def fdk_filter(self, sinogram, filter_name="ramp", output_sharded=False):
-        """FDK filtering: the shared row filter with the FDK cosine pre-weight
-        per detector element and the voxel-size scale alpha."""
+        """This method applies the FDK filter to a sinogram.
+
+        The method multiplies each detector element by the FDK cosine weight.  It then applies
+        the row filter and scales the result by a factor that depends on the voxel size.
+        """
         sinogram = self._shard_sinogram(sinogram)
-        # The dimensions come from the parameters rather than the array,
-        # because the sinogram may be a Shards container.
+        # The sinogram can be a Shards container, so the shape comes from the parameters.
         _, num_rows, num_channels = (int(x) for x in
                                      self.get_params('sinogram_shape'))
         source_detector_dist = self.get_params('source_detector_dist')
@@ -722,8 +666,7 @@ class ConeBeamModel(TomographyModel):
             * (voxel_slice_aspect * delta_voxel)
         M_0 = self.get_magnification()
 
-        # The FDK cosine pre-weight is a (rows, channels) map that does not
-        # depend on the view.
+        # The FDK cosine weight is a (rows, channels) array, and it is the same for every view.
         m_grid, n_grid = np.meshgrid(np.arange(num_rows), np.arange(num_channels),
                                      indexing='ij')
         u_grid, v_grid = self.detector_mn_to_uv(m_grid, n_grid, delta_det_channel,
@@ -741,8 +684,11 @@ class ConeBeamModel(TomographyModel):
                                                row_weight=weight_t)
 
     def helical_fdk_z_weight(self, recon, sinogram):
-        """Scale each helical FDK slice by the inverse of the fraction of the
-        scan in which the slice is in view of the detector."""
+        """This method scales each slice of a helical FDK reconstruction.
+
+        The scale factor is the inverse of the fraction of views in which the detector sees the
+        slice.
+        """
         num_views, num_rows, num_channels = self.get_params('sinogram_shape')
         helical_z_shifts = np.asarray(self.get_params('view_params_array'))[:, 1]
         (delta_voxel, voxel_slice_aspect, recon_shape, recon_slice_offset,
@@ -754,8 +700,7 @@ class ConeBeamModel(TomographyModel):
 
         from . import _sharding
         if isinstance(recon, _sharding.Shards):
-            # The weight is indexed in global slice coordinates.  Each shard
-            # scales its own slices with its own range of the weight.
+            # The weight is indexed by slice in the whole volume, not in one shard.
             w_full = self._helical_z_weight_row(sinogram)
             rp = recon.placement
             tensors = []
@@ -773,8 +718,8 @@ class ConeBeamModel(TomographyModel):
         return recon * w[None, None, :]
 
     def _helical_z_weight_row(self, sinogram):
-        """Return the full (num_slices,) helical z weight row in global slice
-        coordinates, as a host numpy array."""
+        """This method returns the helical z weight of each slice as a numpy array of shape
+        (num_slices,)."""
         num_views, num_rows, _ = self.get_params('sinogram_shape')
         helical_z_shifts = np.asarray(self.get_params('view_params_array'))[:, 1]
         (delta_voxel, voxel_slice_aspect, recon_shape, recon_slice_offset,
@@ -792,32 +737,30 @@ class ConeBeamModel(TomographyModel):
 
     def recon_fdk(self, sinogram, filter_name="ramp", output_sharded=False):
         """
-        Perform FDK reconstruction: standard filtering, then the exact adjoint
-        of the forward projector as the backprojection.
+        This method reconstructs a volume from a sinogram by the FDK algorithm.
+
+        The method first filters the sinogram.  It then back projects the result with the exact
+        adjoint of the forward projector.
 
         Args:
-            sinogram (numpy or tensor): 3D sinogram data with shape
+            sinogram (numpy or tensor): The 3D sinogram, with shape
                 (num_views, num_det_rows, num_det_channels).
-            filter_name (string, optional): The name of the filter to use.
-                Defaults to 'ramp'.
-            output_sharded (bool, optional): If False (default), return a
-                numpy array.  If True, return the device form: a torch
-                tensor on a single device, or a Shards container (one
-                tensor per device) on a multi-device model.
+            filter_name (string, optional): The name of the filter.  Defaults to 'ramp'.
+            output_sharded (bool, optional): If False, the method returns a numpy array.  If
+                True, the method returns the result on the devices.  This result is a torch
+                tensor for a model on one device, or a Shards container with one tensor per
+                device for a model on several devices.  Defaults to False.
 
         Returns:
             recon (numpy or tensor): The reconstructed volume.
 
         Note:
-            FDK assumes equally spaced views over the full angular range and
-            applies no short-scan redundancy weighting; for helical scans it is
-            approximate regardless.  Best used as an initializer for ``recon()``.
+            FDK assumes equally spaced views over the full angular range.  It applies no
+            short-scan weighting.  For helical scans, FDK gives an approximate result.  The FDK
+            result is useful as an initial value for ``recon()``.
         """
-        # The device layout is settled before the first large allocation.  The workload
-        # name prices this direct reconstruction rather than a full iterative recon.
+        # This call chooses the GPUs and checks memory for a direct reconstruction before any allocation.
         self._apply_device_policy(workload='direct')
-        # The sinogram is placed on the devices here, so the filter and the
-        # back projection both run on the devices with no host transfer.
         sinogram = self._shard_sinogram(sinogram)
         filtered_sinogram = self.fdk_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
@@ -828,9 +771,11 @@ class ConeBeamModel(TomographyModel):
         return recon if output_sharded else self._gather_recon(recon)
 
     def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
-        """Direct reconstruction by the FDK algorithm; equivalent to
-        :meth:`recon_fdk`.  See :meth:`TomographyModel.recon_direct` for the
-        argument and return conventions."""
+        """This method reconstructs a volume by the FDK algorithm.
+
+        This method is the same as :meth:`recon_fdk`.  See :meth:`TomographyModel.recon_direct`
+        for the arguments and return value.
+        """
         return self.recon_fdk(sinogram, filter_name=filter_name,
                               output_sharded=output_sharded)
 
@@ -842,66 +787,58 @@ class ConeBeamModel(TomographyModel):
                          first_iteration=0, compute_prior_loss=False, logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
                          align_split_grid=False):
         """
-        This function reduces the memory needed for cone beam MBIR reconstruction by about a factor
-        of 2 by reconstructing the volume in two halves and joining the results.  It is for a
-        volume that does not fit on the GPUs as a whole.
+        This method reconstructs a cone-beam volume in two halves.  The split reduces the GPU
+        memory needed by about a factor of 2.  The method is meant for a volume that does not fit
+        on the GPUs as a whole.
 
-        The method works as follows.  The detector rows are cut at the row where the central ray
-        hits the detector, and each half keeps a few extra rows past the cut.  Each half is
-        reconstructed with ordinary MBIR as its own volume, with extra slices past the cut that are
-        computed from the geometry, so that the half covers every slice its rows see.  The two
-        halves are then joined with a linear blend across the overlap.  When each half fits on
-        half the GPUs, the two halves are reconstructed side by side on two equal groups of GPUs.
-        Otherwise all the GPUs reconstruct one half and then the other.
+        The method divides the detector rows at the row where the central ray hits the detector.
+        Each half includes a few extra rows beyond this row.  The method reconstructs each half
+        with ordinary MBIR.  It then joins the halves with a linear blend across the overlap.  If
+        each half fits on half of the GPUs, the two halves are reconstructed at the same time.
 
-        The function is used like :meth:`recon`, and its result is approximately equal to the
-        result of :meth:`recon`.  A device choice made with ``configure_devices`` limits the GPUs
-        the split may use, and the grouping stays automatic.  Two differences from :meth:`recon`
-        are that ``output_sharded`` is not accepted and ``compute_prior_loss`` is accepted but
-        unused.
+        This method is used like :meth:`recon`, and its result is approximately equal to the
+        result of :meth:`recon`.  This method does not accept ``output_sharded``.
 
         Args:
-            sino (numpy or tensor): Full sinogram of shape (num_views, num_rows, num_cols).  A
-                sharded array is not accepted.
-            weights (numpy or tensor, optional): Optional sinogram weights with the same shape as
-                `sino`.  Not accepted in sharded form, like `sino`.
-            half_overlap (int): Number of overlapping detector rows past the iso row per half (when
-                recon slices are coarser than the iso-mapped rows, the row overlap is scaled up so
-                it still spans ``half_overlap`` slices).  The reconstruction overlap is derived
-                from it, widened by the cone divergence so every slice the kept rows can see is
-                representable.
-            init_recon (optional): Same as in the recon method.  Not accepted
-                in sharded form, like `sino`.
-            max_iterations (int, optional): Same as in the recon method.
-            stop_threshold_change_pct (float, optional): Same as in the recon method.
-            first_iteration (int, optional): Same as in the TomographyModel.recon() method.
-            compute_prior_loss (bool, optional): Accepted for interface compatibility; not
-                currently used by the mbirtorch recon.
-            logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The two
-                halves' logs are merged into this single file, each under a section header.
-            print_logs (bool, optional): Same as in the TomographyModel.recon() method.
-            align_split_grid (bool, optional): If True, shift the recon slice grid by up to
-                half a slice to align the split with the sinogram cut, which removes seam
-                stripes.  Defaults to False.
+            sino (numpy or tensor): The full sinogram, with shape (num_views, num_rows, num_cols).
+                The method does not accept a sharded array.
+            weights (numpy or tensor, optional): The sinogram weights, with the same shape as
+                ``sino``.  The method does not accept a sharded array.
+            half_overlap (int): The number of extra detector rows that each half includes beyond
+                the iso row.  The method computes the overlap of the reconstructed halves from
+                this value.
+            init_recon (optional): The same as in the recon method.  The method does not accept a
+                sharded array.
+            max_iterations (int, optional): The same as in the recon method.
+            stop_threshold_change_pct (float, optional): The same as in the recon method.
+            first_iteration (int, optional): The same as in the TomographyModel.recon() method.
+            compute_prior_loss (bool, optional): This argument is accepted so that the interface
+                matches other methods.  The method does not use it.
+            logfile_path (str, optional): The same as in the TomographyModel.recon() method.  The
+                method merges the logs of the two halves into this one file, with a header for
+                each half.
+            print_logs (bool, optional): The same as in the TomographyModel.recon() method.
+            align_split_grid (bool, optional): If True, the method shifts the recon slice grid by
+                up to half a slice.  The shift aligns the boundary between the reconstructed
+                halves with the boundary between the detector halves.  This alignment removes
+                stripes at the boundary.  Defaults to False.
 
         Returns:
-            Tuple[np.ndarray, dict]: the reconstructed volume (numpy array), and a
-                metadata dictionary containing recon and model parameters for each
-                half, plus 'split_params' (the overlaps, any alignment shift used, and the
-                number of GPU groups and GPUs per group used).
-                If the split would leave either half too thin, the method warns,
-                performs a standard recon() instead, and returns that result's
-                dictionary (no per-half entries).
+            Tuple[np.ndarray, dict]: The reconstructed volume as a numpy array, and a metadata
+                dictionary.  The dictionary holds the recon parameters and model parameters of
+                each half.  Its entry 'split_params' holds the overlaps, the grid shift, the
+                number of GPU groups, and the number of GPUs in each group.  If either half
+                would have too few slices, the method issues a warning and calls recon()
+                instead.  In this case, the method returns the dictionary from recon(), which
+                has no entries for the halves.
 
         Raises:
-            ValueError: If inputs are missing or shapes are inconsistent, if half_overlap < 2,
-                if the geometry has nonzero helical z-shifts, or if `sino`, `weights`, or
-                `init_recon` is in the sharded form.
-            AssertionError: If array dimensions are invalid.
+            ValueError: If an input is missing, if the shapes do not agree, if half_overlap < 2,
+                if the geometry has nonzero helical z shifts, or if ``sino``, ``weights``, or
+                ``init_recon`` is a sharded array.
+            AssertionError: If an array has the wrong number of dimensions.
 
         Example:
-            >>> import numpy as np
-            >>> import mbirtorch
             >>> sino = np.ones((180, 64, 64), dtype=np.float32)  # (views, rows, cols)
             >>> model = mbirtorch.ConeBeamModel(sinogram_shape=sino.shape,
             ...                                 angles=np.linspace(0, np.pi, 180),
@@ -919,8 +856,7 @@ class ConeBeamModel(TomographyModel):
             raise ValueError('helical_z_shifts must be zero.')
         if sino is None:
             raise ValueError("sino must be provided.")
-        # An input already placed on the devices is refused.  Each half settles a
-        # device layout of its own, so this method works from host arrays.
+        # Each half chooses its own GPUs, so the method refuses an input that is already on the GPUs.
         if (isinstance(sino, _sharding.Shards)
                 or isinstance(weights, _sharding.Shards)
                 or isinstance(init_recon, _sharding.Shards)):
@@ -933,8 +869,7 @@ class ConeBeamModel(TomographyModel):
         if weights is not None and getattr(weights, "shape", None) != sino.shape:
             raise AssertionError("weights, if provided, must have the same shape as sino.")
 
-        # The split is done on the host, so the full sinogram is never on the devices
-        # at once.  The per-half slices below are host views.
+        # The method splits the sinogram in host memory, so the full sinogram is never on the GPUs.
         if isinstance(sino, torch.Tensor):
             sino = sino.detach().cpu().numpy()
         sino = np.asarray(sino)
@@ -959,25 +894,24 @@ class ConeBeamModel(TomographyModel):
 
         full_recon_rows, full_recon_cols, full_recon_slices = full_recon_shape
 
-        # The overlaps are the detector rows kept past the cut and the recon slices
-        # kept past the split.  Coarser recon slices scale the row overlap up to match.
+        # half_overlap_sino is the number of extra detector rows in each half.
+        # half_overlap_recon is the number of extra recon slices in each half.
         delta_detector_row_at_iso = max(delta_det_row / magnification, 1e-12)
         ratio_pixel_to_sino_pitch = delta_voxel_slice / delta_detector_row_at_iso
         if ratio_pixel_to_sino_pitch > 1:
             half_overlap_sino = int(round(half_overlap * ratio_pixel_to_sino_pitch))
         else:
             half_overlap_sino = half_overlap
-        # Every slice the kept rows can see must be representable, or each half is
-        # axially truncated at its extension end and a stripe appears at the seam.
-        # Here rho is the number of slices seen per kept row at the iso ray, and the
-        # factor (1 + R/SID) bounds the cone divergence at the far side of the support.
+        # Every slice that the rows of a half see must be in the half volume.  Otherwise a stripe
+        # appears at the boundary.  rho is the number of slices per detector row at iso, and
+        # (1 + R/SID) bounds the spread of the cone.
         rho = 1.0 / ratio_pixel_to_sino_pitch
         support_radius = get_support_radius(full_recon_shape, voxel_row_aspect * delta_voxel,
                                             delta_voxel, use_ror_mask=use_ror_mask)
         half_overlap_recon = int(np.ceil(
             half_overlap_sino * (1.0 + support_radius / float(source_iso_dist)) * rho)) + 2
 
-        # The cut row is the detector row nearest to iso.
+        # The detector halves divide at the detector row nearest to iso.
         det_iso_row_float = ((full_num_rows - 1) / 2.0) + (full_det_row_offset / delta_det_row)
         det_iso_row_index = int(round(det_iso_row_float))
 
@@ -986,10 +920,8 @@ class ConeBeamModel(TomographyModel):
                 f"Computed det_iso_row_index={det_iso_row_index} is out of valid range (0, {full_num_rows-1}). "
             )
 
-        # The seam stripe comes from the sub-slice misalignment
-        # eps = wrap(split_offset - cut_offset_rows * rho) between the cut row's
-        # iso-mapped plane and the split slice.  A sub-slice shift of the recon grid
-        # removes eps, but moves the output grid by half a slice, so it is off by default.
+        # A shift of the recon grid by a fraction of a slice removes the stripe at the boundary.
+        # The shift also moves the output grid, so the shift is off by default.
         grid_shift_alu = 0.0
         if align_split_grid:
             def _wrap_half(x):
@@ -1004,22 +936,18 @@ class ConeBeamModel(TomographyModel):
             grid_shift_alu = -float(eps_by_cut[det_iso_row_index]) * delta_voxel_slice
             full_recon_slice_offset = full_recon_slice_offset + grid_shift_alu
 
-        # The split slice is the recon slice nearest to iso.
+        # The recon halves divide at the recon slice nearest to iso.
         full_recon_iso_slice_index_float = (full_recon_slices - 1) / 2.0 - full_recon_slice_offset / delta_voxel_slice
         split_index = int(round(full_recon_iso_slice_index_float))
         top_num_slices = split_index + 1
 
-        # This offset of the split from iso shifts the slices slightly so
-        # that they align with a standard reconstruction.
         split_offset = split_index - full_recon_iso_slice_index_float
 
-        # This is the residual sub-slice misalignment between cut and split,
-        # reported in split_params.
+        # This is the misalignment, in slices, between the detector boundary and the recon boundary.
+        # It is reported in split_params.
         split_cut_mismatch = float((split_offset - (det_iso_row_index - det_iso_row_float) * rho
                                     + 0.5) % 1.0 - 0.5)
 
-        # If the split leaves either half too thin, the method warns and runs a normal
-        # MBIR recon instead.
         if (split_index < 1 or split_index > full_recon_slices - 2
                 or top_num_slices < half_overlap_recon
                 or full_recon_slices - top_num_slices < half_overlap_recon):
@@ -1039,8 +967,7 @@ class ConeBeamModel(TomographyModel):
                 print_logs=print_logs,
             )
 
-        # These are the per-half scalar parameters.  The arrays and models are built
-        # one half at a time below, so only one half's inputs are resident at once.
+        # These are the detector row ranges of the two halves.
         top_lo, top_hi = 0, min(det_iso_row_index + half_overlap_sino, full_num_rows)
         bot_lo, bot_hi = max(det_iso_row_index - half_overlap_sino, 0), full_num_rows
 
@@ -1051,19 +978,15 @@ class ConeBeamModel(TomographyModel):
 
         full_det_center = (full_num_rows - 1) / 2.0
 
-        # The regularization parameters come from the full sinogram and its weights, the same
-        # inputs recon uses, so the halves get the values recon would set.  The halves copy them
-        # and set auto_regularize_flag=False.
+        # This sets the regularization from the full sinogram, as recon would do.
         self.auto_set_regularization_params(sino, weights=weights)
 
         def _half_model(lo, hi, recon_shape, recon_slice_offset):
-            """Returns the model of one detector-row half."""
+            """This function returns the model for one half of the detector rows."""
             num_rows = hi - lo
             det_center = (num_rows - 1) / 2.0
             det_row_offset = full_det_row_offset + (full_det_center - (det_center + lo)) * delta_det_row
 
-            # The half model copies the parent's parameters, including its voxel
-            # pitch and any explicit device choice.
             model = copy_ct_model(self, new_num_det_rows=num_rows, no_warning=True)
             model.set_params(det_row_offset=det_row_offset)
             model.set_params(no_warning=True, auto_regularize_flag=False)
@@ -1072,26 +995,19 @@ class ConeBeamModel(TomographyModel):
             return model
 
         def _recon_one_half(model, lo, hi, is_top, half_logfile_path, devices, rng):
-            """Reconstructs one detector-row half and returns (host_recon,
-            recon_dict).
+            """This function reconstructs one half of the detector rows on ``devices``.
 
-            ``devices`` is the half's group of devices, or None to let the half
-            model choose its devices as recon does.  ``rng`` is the random
-            generator for recon, or None.  The half's sinogram slice
-            and weights are local, so they are released when this returns.  The
-            returned reconstruction is a host array.
+            It returns (host_recon, recon_dict).  If ``devices`` is None, the model of the half
+            chooses the GPUs.
             """
             recon_shape = model.get_params('recon_shape')
             if devices is not None:
                 model.configure_devices(devices=devices)
 
-            # The sinogram and weight slices are host views, and nothing writes them.
-            # A weights value of None passes through to the constant-weight path.
             sino_half = sino[:, lo:hi, :]
             weights_half = None if weights is None else weights[:, lo:hi, :]
 
-            # The top half takes the first recon_shape[2] slices of the
-            # initial reconstruction, and the bottom half takes the last.
+            # The top half uses the first recon_shape[2] slices of init_recon.  The bottom half uses the last ones.
             half_init = None
             if init_recon is not None:
                 half_init = init_recon[:, :, :recon_shape[2]] if is_top else init_recon[:, :, -recon_shape[2]:]
@@ -1104,8 +1020,7 @@ class ConeBeamModel(TomographyModel):
                                                  print_logs=print_logs, rng=rng)
             return recon_half, recon_dict
 
-        # The halves are reconstructed one at a time, and each logs to its own file.
-        # The merge runs in a finally block so that logs from a failure are kept.
+        # Each half writes its own log file.  The finally block merges the files.
         if logfile_path:
             log_path = os.path.expanduser(logfile_path)
             half_log_paths = (log_path + '.top', log_path + '.bot')
@@ -1114,8 +1029,6 @@ class ConeBeamModel(TomographyModel):
         top_model = _half_model(top_lo, top_hi, top_recon_shape, top_recon_slice_offset)
         bot_model = _half_model(bot_lo, bot_hi, bot_recon_shape, bot_recon_slice_offset)
 
-        # The halves run side by side on 2 equal groups of devices when each half fits on one
-        # group, and otherwise one after the other on all the devices.
         devices = self._split_devices()
         gpus_per_group = self._choose_gpus_per_group(
             devices, lambda group: all(self._section_fits(model, group, weights is not None)
@@ -1130,9 +1043,7 @@ class ConeBeamModel(TomographyModel):
                 merge_log_files(log_path, zip(('recon_split_sino: top half', 'recon_split_sino: bottom half'),
                                               half_log_paths))
 
-        # stitch_arrays assembles the full volume on the host, with an overlap of
-        # half_overlap_recon per side.  ramp_overlap sets which slices are blended.
-        # It is smaller than the overlap to avoid boundary effects, and it is even.
+        # ramp_overlap is the number of blended slices.  It is even, at most 4, and at most half_overlap_recon.
         ramp_overlap = 4
         ramp_overlap = min(ramp_overlap, half_overlap_recon)
         ramp_overlap -= ramp_overlap % 2
@@ -1147,8 +1058,7 @@ class ConeBeamModel(TomographyModel):
                            'notes_bottom': recon_bot_dict.get('notes', '# No notes saved'),
                            'model_params_top': recon_top_dict.get('model_params'),
                            'model_params_bottom': recon_bot_dict.get('model_params'),
-                           # These are the overlaps used, the cut-to-split
-                           # misalignment, and the grid shift in ALU.
+                           # The grid shift is in ALU.  The misalignment is in slices.
                            'split_params': {'half_overlap_sino': int(half_overlap_sino),
                                             'half_overlap_recon': int(half_overlap_recon),
                                             'align_split_grid': bool(align_split_grid),
@@ -1163,38 +1073,32 @@ class ConeBeamModel(TomographyModel):
 def recon_simple_cone(sinogram, angles, source_detector_dist, source_iso_dist,
                       weights=None, sharpness=1.0, max_iterations=15):
     """
-    Functional interface for a basic cone-beam reconstruction.
+    This function performs a basic cone-beam reconstruction in one call with the default
+    geometry parameters.
 
-    This builds a :class:`ConeBeamModel` with default geometry parameters and
-    reconstructs in one call.  For anything beyond the arguments here -- a
-    helical scan, a curved detector, changing the voxel size or the recon
-    shape, choosing devices, controlling the stopping rule or the logs,
-    restarting from a previous reconstruction -- create the model yourself and
-    call :meth:`TomographyModel.recon`; see :class:`ConeBeamModel` for the
-    geometry arguments.
+    For other settings, such as a helical scan or a curved detector, create a
+    :class:`ConeBeamModel` and call :meth:`TomographyModel.recon`.
 
     Args:
-        sinogram (numpy or tensor): 3D sinogram data with shape
+        sinogram (numpy or tensor): The 3D sinogram, with shape
             (num_views, num_det_rows, num_det_channels).
-        angles (numpy or tensor): 1D array of projection angles in radians, one
-            per view.
-        source_detector_dist (float): distance from source to detector in ALU.
-        source_iso_dist (float): distance from source to iso (the center of
-            rotation) in ALU.
-        weights (numpy or tensor, optional): 3D positive weights with the same
-            shape as the sinogram.  Defaults to None (all 1s).
-        sharpness (float, optional): higher values give crisper edges and more
-            noise; lower values give softer edges and less noise.  Defaults
-            to 1.0.
-        max_iterations (int, optional): maximum number of iterations.  Defaults
-            to 15.  Use max_iterations=0 for a filtered back projection scaled
-            to fit the data.
+        angles (numpy or tensor): A 1D array of projection angles in radians, one per view.
+        source_detector_dist (float): The distance from the source to the detector in ALU.
+        source_iso_dist (float): The distance from the source to iso, the center of rotation,
+            in ALU.
+        weights (numpy or tensor, optional): The 3D positive weights, with the same shape as the
+            sinogram.  If None, all weights are 1.  Defaults to None.
+        sharpness (float, optional): Higher values give sharper edges and more noise.  Lower
+            values give softer edges and less noise.  Defaults to 1.0.
+        max_iterations (int, optional): The maximum number of iterations.  Defaults to 15.  If
+            max_iterations is 0, the function returns a filtered back projection scaled to fit
+            the data.
 
     Returns:
-        (recon, recon_dict): the reconstruction volume, and a dict
-        with entries 'recon_params' (per-iteration traces and settings),
-        'recon_log' (the run's log text), 'notes', and
-        'model_params' (a snapshot of the model parameters).
+        (recon, recon_dict): The reconstructed volume and a dict.  The dict has the entries
+        'recon_params', 'recon_log', 'notes', and 'model_params'.  'recon_params' holds the
+        settings and the values recorded at each iteration.  'recon_log' holds the log text.
+        'model_params' holds a copy of the model parameters.
 
     Example:
         >>> import numpy as np, mbirtorch
@@ -1202,12 +1106,10 @@ def recon_simple_cone(sinogram, angles, source_detector_dist, source_iso_dist,
         >>> recon, recon_dict = mbirtorch.recon_simple_cone(
         ...     sinogram, angles, source_detector_dist=600, source_iso_dist=400)
     """
-    # The model's geometry is read from the sinogram's shape, which a divided
-    # array does not have, so that form is refused.
+    # The geometry comes from the shape of the full sinogram, so a sharded array is refused.
     from . import _sharding
     _sharding.reject_shards('recon_simple_cone', sinogram=sinogram,
                             weights=weights)
-    # Torch angles are converted here so that the model gets host angles.
     if torch.is_tensor(angles):
         angles = angles.detach().cpu().numpy()
     model = ConeBeamModel(tuple(sinogram.shape), angles,

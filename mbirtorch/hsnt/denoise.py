@@ -1,11 +1,12 @@
-"""Dehydration and rehydration of hyperspectral neutron data by the maximum-likelihood factorization X = W H."""
+"""This module compresses and restores hyperspectral neutron data with a factorization X = W H.
+The function ``dehydrate`` computes the factors, and the function ``rehydrate`` multiplies them."""
 import warnings
 
 import numpy as np
 
 from ..utilities import _to_host
 
-# The keywords of MBIRJAX's scikit-learn dehydrate that this package does not take.
+# These keywords belong to the MBIRJAX version of dehydrate, which used scikit-learn.  mbirtorch rejects them.
 _L2_KEYWORDS = ("safety_factor", "beta_loss", "max_iter", "tolerance", "batch_size", "random_state")
 
 
@@ -20,15 +21,14 @@ def _reject_unknown_keywords(name, kwargs):
 
 
 def _spatial_shape(lead):
-    """(views, rows, cols) for leading axes of that form or (rows, cols); None for anything else (no pooling)."""
+    """This function returns the leading axes as (views, rows, cols).  It sets views to 1 when
+    there are two leading axes, and it returns None when there are not two or three."""
     return tuple(lead) if len(lead) == 3 else (1,) + tuple(lead) if len(lead) == 2 else None
 
 
 def _clean_transmission(T):
-    """Set every non-finite entry of a float32 transmission to zero (a zero count, which the likelihood handles) and
-    clip the negative ones at zero, in place. Returns the shares of the entries changed, 'nonfinite_frac' and
-    'negative_frac', for those that occur; the loader and the functions here share it, so the files and the arrays
-    are treated alike."""
+    """This function sets each NaN, infinite, or negative entry of a float32 transmission array to
+    zero, in place.  It returns a dict with the fraction of entries that it changed."""
     info = {}
     bad = ~np.isfinite(T)
     if bad.any():
@@ -51,10 +51,9 @@ def _warn_cleaning(info):
 
 
 def _to_transmission(data, dataset_type):
-    """(pixels, bins) float32 transmission ratio from an array with any leading axes, and the input shape.
-
-    Every non-finite transmission becomes zero and negative transmissions are clipped at zero (_clean_transmission).
-    """
+    """This function converts the data to a float32 transmission array of shape (pixels, bins).
+    It cleans the transmission array with ``_clean_transmission``.  It returns the transmission
+    array and the shape of the input."""
     if dataset_type not in ("attenuation", "transmission"):
         raise ValueError("'dataset_type' must be either 'attenuation' or 'transmission'.")
     a = _to_host(data)
@@ -76,43 +75,54 @@ def _to_transmission(data, dataset_type):
 def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_basis=None, spectra="mle", dose=None,
               penalty="auto", max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
               compile_mode="auto", mode="auto", chunk_pixels=None, max_passes=5, verbose=1, **kwargs):
-    """Dehydrate a hyperspectral dataset: factor its attenuation as X = W H, W, H >= 0, by maximum likelihood.
+    """This function factors the attenuation of a hyperspectral dataset as X = W H by maximum
+    likelihood.  The factors satisfy W >= 0 and H >= 0.
 
-    The spectral axis is last; the leading axes are kept. The fit maximizes the Poisson likelihood of the counts,
-    written in terms of the transmission T = exp(-X), so zero counts are handled directly. When num_materials is
-    not given, the rank is estimated by likelihood-ratio tests (see estimate_rank). The components are a
-    nonnegative basis of the data, not necessarily the pure materials. Data too large for the device are fitted
-    by chunks of pixels. Given a subspace_basis, only the maps W are fitted.
+    The spectral axis of the data is the last axis.  The maps ``W`` keep the leading axes of the
+    data.  This function handles zero counts correctly.  The components form a nonnegative basis
+    of the data, but they are not necessarily the spectra of pure materials.
 
     Args:
-        data (numpy.ndarray or torch.Tensor): Hyperspectral data, spectral axis of length :math:`N_k` last. NaN or
-            infinite transmissions count as zero counts; negative transmissions are clipped at zero.
-        dataset_type (str, optional): 'attenuation' or 'transmission', with attenuation = -log(transmission).
-            Defaults to 'attenuation'.
-        num_materials (int, optional): Rank :math:`N_m` of the factorization. Defaults to None, which estimates it.
-        subspace_basis (numpy.ndarray or torch.Tensor, optional): Spectra of shape :math:`(N_m, N_k)` to hold
-            fixed; only the maps are then fitted. Defaults to None.
-        spectra (str, optional): 'mle', the maximum-likelihood spectra; 'unconstrained', a re-estimate that removes
-            the bias of the nonnegativity constraint at low dose; 'support', which selects the components present in
-            each pixel and refits (needs dose). Defaults to 'mle'.
-        dose (float, optional): Open-beam counts per pixel and bin, for spectra='support'. Defaults to None.
-        penalty (str or float, optional): Charge per component for spectra='support', as a multiple of log(N_k), or
-            'auto'. Defaults to 'auto'.
-        max_steps (int, optional): Solver iteration cap. Defaults to 1000.
-        rel_tol (float, optional): Stop when the relative loss change stays below this. Defaults to 1e-8.
-        max_rank (int, optional): Largest rank the estimate considers. Defaults to 6.
-        device (str, optional): Torch device. Defaults to None: CUDA if available, else CPU.
-        compile_mode (str, optional): 'auto', 'on' or 'off' for torch.compile. Defaults to 'auto'.
-        mode (str, optional): 'full' fits on the device at once, 'stream' by chunks of pixels, 'auto' picks from
-            the available memory. Defaults to 'auto'.
-        chunk_pixels (int, optional): Pixels per chunk when streamed. Defaults to None, from the available memory.
-        max_passes (int, optional): Passes over the chunks when streamed. Defaults to 5.
-        verbose (int, optional): 0 prints nothing; 1 a summary; 2 also the rank search. Defaults to 1.
+        data (numpy.ndarray or torch.Tensor): The data.  The last axis is the spectral axis,
+            of length :math:`N_k`.  This function treats a NaN or infinite transmission as zero
+            counts.  It clips a negative transmission to zero.
+        dataset_type (str, optional): 'attenuation' or 'transmission'. Defaults to 'attenuation'.
+        num_materials (int, optional): The rank :math:`N_m`.  Defaults to None, in which case
+            this function estimates the rank.
+        subspace_basis (numpy.ndarray or torch.Tensor, optional): Spectra of shape
+            :math:`(N_m, N_k)`.  When it is given, this function holds the spectra fixed and
+            computes only the maps.  Defaults to None.
+        spectra (str, optional): The method for estimating the spectra.  'mle' gives the
+            maximum likelihood estimate.  'unconstrained' removes the bias that the constraint
+            W >= 0 causes at low dose.  'support' selects which components are present in each
+            pixel, and it requires ``dose``.  Defaults to 'mle'.
+        dose (float, optional): The open beam counts per pixel and bin.  Only 'support' uses
+            it.  Defaults to None.
+        penalty (str or float, optional): The penalty per component that 'support' uses.  It
+            is either a multiple of log(N_k) or 'auto'.  Defaults to 'auto'.
+        max_steps (int, optional): The maximum number of solver iterations.  Defaults to 1000.
+        rel_tol (float, optional): The solver stops when the relative change in the loss falls
+            below this value.  Defaults to 1e-8.
+        max_rank (int, optional): The largest rank that the rank estimate considers.  Defaults
+            to 6.
+        device (str, optional): The torch device.  Defaults to None, which uses CUDA when it is
+            available and the CPU otherwise.
+        compile_mode (str, optional): 'auto', 'on', or 'off'.  The value sets whether this
+            function uses torch.compile.  Defaults to 'auto'.
+        mode (str, optional): 'full', 'stream', or 'auto'.  'stream' processes the pixels in
+            chunks.  Defaults to 'auto'.
+        chunk_pixels (int, optional): The number of pixels in each chunk when streaming.
+            Defaults to None, in which case this function sets it from the available memory.
+        max_passes (int, optional): The number of passes over the chunks when streaming.
+            Defaults to 5.
+        verbose (int, optional): 0 prints nothing, 1 prints a summary, and 2 also prints the
+            rank search.  Defaults to 1.
 
     Returns:
-        list: [subspace_data, subspace_basis, dataset_type]: W reshaped to the leading axes plus :math:`N_m`, H of
-        shape :math:`(N_m, N_k)`, both float32, and the input's dataset_type, so that rehydrate returns the same
-        quantity as the input.
+        list: The list [subspace_data, subspace_basis, dataset_type].  subspace_data is ``W``.
+            Its axes are the leading axes of the data, followed by an axis of length :math:`N_m`.
+            subspace_basis is ``H``, with shape :math:`(N_m, N_k)`.  Both are float32.
+            dataset_type is the dataset_type of the input.
     """
     from ._device import _default_device
     from ._fit import _fit
@@ -153,7 +163,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
 
 
 def _check_basis(subspace_basis, bins, num_materials, spectra):
-    """A given subspace_basis as float32 (rank, bins), checked against the data and the other arguments."""
+    """This function checks ``subspace_basis`` against the data and returns it as a float32 array
+    of shape (rank, bins)."""
     H = np.asarray(_to_host(subspace_basis), dtype=np.float32)
     if H.ndim != 2 or H.shape[1] != bins:
         raise ValueError(f"subspace_basis must have shape (rank, {bins}) for data with {bins} bins; got {H.shape}")
@@ -167,35 +178,38 @@ def _check_basis(subspace_basis, bins, num_materials, spectra):
 
 
 def hyper_denoise(data, dataset_type="attenuation", num_materials=None, **kwargs):
-    """Denoise a hyperspectral dataset: dehydrate, then rehydrate.
+    """This function denoises hyperspectral data.  It calls ``dehydrate`` and then ``rehydrate``.
 
     Args:
-        data (numpy.ndarray or torch.Tensor): Hyperspectral data with the spectral axis last.
+        data (numpy.ndarray or torch.Tensor): The data.  The last axis is the spectral axis.
         dataset_type (str, optional): 'attenuation' or 'transmission'. Defaults to 'attenuation'.
-        num_materials (int, optional): Rank of the factorization. Defaults to None, which estimates it.
+        num_materials (int, optional): The rank.  Defaults to None, in which case
+            ``dehydrate`` estimates the rank.
         **kwargs: The keyword arguments of :func:`~mbirtorch.hsnt.dehydrate`.
 
     Returns:
-        numpy.ndarray: The denoised data, float32, with the shape and dataset_type of the input.
+        numpy.ndarray: The denoised float32 data, with the shape and dataset_type of the input.
     """
     _reject_unknown_keywords("hyper_denoise", {k: v for k, v in kwargs.items() if k in _L2_KEYWORDS})
     return rehydrate(dehydrate(data, dataset_type=dataset_type, num_materials=num_materials, **kwargs))
 
 
 def rehydrate(dehydrated_data, hyperspectral_idx=None):
-    """Rehydrate dehydrated hyperspectral data: multiply the maps by the spectra, for all or selected bins.
-
-    The method is described in M. S. N. Chowdhury et al., "Fast Hyperspectral Neutron Tomography," IEEE Trans.
-    Computational Imaging, vol. 11, pp. 663-677, 2025, doi:10.1109/TCI.2025.3567854.
+    """This function restores hyperspectral data from the output of ``dehydrate``.  It multiplies
+    the maps by the spectra, for all bins or for selected bins.  The method is described in
+    M. S. N. Chowdhury et al., "Fast Hyperspectral Neutron Tomography," IEEE TCI, vol. 11,
+    pp. 663-677, 2025, doi:10.1109/TCI.2025.3567854.
 
     Args:
-        dehydrated_data: [subspace_data, subspace_basis, dataset_type]: the maps, with the component axis of length
-            :math:`N_s` last; the spectra, shape :math:`(N_s, N_k)`; and 'attenuation' or 'transmission'.
-        hyperspectral_idx: Indices of the spectral bins to rehydrate. Defaults to None, all :math:`N_k` bins.
+        dehydrated_data: The list [subspace_data, subspace_basis, dataset_type].  subspace_data
+            holds the maps, with the component axis last.  subspace_basis holds the spectra,
+            with shape :math:`(N_s, N_k)`.  dataset_type is 'attenuation' or 'transmission'.
+        hyperspectral_idx: The indices of the bins to restore.  Defaults to None, which
+            restores all bins.
 
     Returns:
-        numpy.ndarray: Hyperspectral data with the shape of subspace_data, except that the last axis holds the
-        selected bins; attenuation or transmission as dataset_type says.
+        numpy.ndarray: The restored data.  Its last axis holds the bins, and its other axes match
+            subspace_data.  The values are attenuation or transmission, as dataset_type says.
     """
     [subspace_data, subspace_basis, dataset_type] = dehydrated_data
 

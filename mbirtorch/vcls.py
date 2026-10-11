@@ -8,24 +8,19 @@ import tqdm
 
 
 def _normalize_by_norm(x, eps):
-    """``x / (||x|| + eps)``."""
+    """This function returns ``x / (||x|| + eps)``."""
     return x / (np.linalg.norm(x) + eps)
 
 
 def _normalize_and_project(x, ref, eps):
-    """Return the normalized ``x`` and its full contraction with ``ref``."""
+    """This function returns the normalized ``x`` and its inner product with ``ref`` over all axes."""
     x_normalized = x / (np.linalg.norm(x) + eps)
     return x_normalized, np.tensordot(x_normalized, ref, axes=x_normalized.ndim)
 
 
 def _make_single_view_sibling(ct_model):
-    """Return a one-view copy of ``ct_model``.  It has the same class and the
-    same geometry and recon parameters, but its ``sinogram_shape`` holds one
-    view.
-
-    The caller points the copy at one view's parameters with
-    :func:`_set_sibling_view_params` and then back projects that view.  This
-    avoids selecting a subset of the full model's views.
+    """This function returns a copy of ``ct_model`` that has one view.  The copy is used to
+    back project one view at a time.
     """
     required, optional, regularization = ct_model.get_all_params()
     required = dict(required)
@@ -38,31 +33,30 @@ def _make_single_view_sibling(ct_model):
     optional = dict(optional)
     optional['recon_shape'] = tuple(ct_model.get_params('recon_shape'))
     sibling = mt.build_model(required, optional, regularization)
-    # The copy must live where its parent lives, and the constructors take no device
-    # argument, so the layout is set here.  The parent's lead device is the target.
+    # The model constructors take no device argument.  This line places the copy on the first
+    # device of ``ct_model``.
     sibling.configure_devices(devices=[ct_model.torch_device])
     return sibling
 
 
 def _set_sibling_view_params(sibling, view_params_row):
-    """Point the one-view copy at one view's parameters."""
+    """This function sets the view parameters of the one-view model copy to those of one view."""
     view_params_name = sibling.get_params('view_params_name')
     sibling.set_params(no_warning=True, **{view_params_name: np.asarray(view_params_row)})
 
 
 def subsample_R_gamma(R, gamma, selected_indices):
     """
-    Extract a submatrix of R and subvector of gamma corresponding to the selected indices.
+    This function returns the submatrix of R and the subvector of gamma at the selected
+    indices.
 
     Args:
-        R (ndarray): Full covariance matrix of shape (N, N).
-        gamma (ndarray): Full gamma vector of shape (N, 1).
-        selected_indices (ndarray): 1D array of indices to select.
+        R (ndarray): The full covariance matrix, with shape (N, N).
+        gamma (ndarray): The full gamma vector, with shape (N, 1).
+        selected_indices (ndarray): A 1D array of the K indices to select.
 
     Returns:
-        tuple: A tuple (R_sub, gamma_sub) where:
-            R_sub (ndarray): Submatrix of shape (K, K).
-            gamma_sub (ndarray): Subvector of shape (K, 1).
+        tuple: (R_sub, gamma_sub), with shapes (K, K) and (K, 1).
     """
     R_sub = R[selected_indices[:, None], selected_indices]
     gamma_sub = gamma[selected_indices, :]
@@ -74,7 +68,6 @@ def max_abs_neighbor_diff(arr):
     center = arr
     max_diff = np.zeros_like(arr)
 
-    # The offsets are (di, dj) for up, down, left, and right.
     directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
     for di, dj in directions:
@@ -90,40 +83,42 @@ def max_abs_neighbor_diff(arr):
 def get_opt_views(ct_model, reference_object, num_selected_views, r_1=0.002, r_2=0.5,
                   prev_selected_view_inds=np.array([], dtype=int), priority_order=False, verbose=0, seed=None, roi=None):
     """
-    Compute the optimal view angles by minimizing the View Covariance Loss (VCL) using a stochastic greedy optimization algorithm.
-    The VCL is defined in the following paper:
-
-    J. Lin, A. Ziabari, S. V. Venkatakrishnan, O. Rahman, G. T. Buzzard, C. A.Bouman, "Tomographic Sparse View Selection
-    using the View Covariance Loss", to appear in the IEEE Transactions on Pattern Analysis and Machine Intelligence, 2025.
+    This function selects view angles by minimizing the View Covariance Loss (VCL).  It uses a
+    stochastic greedy search.  The VCL is defined in J. Lin, A. Ziabari, S. V.
+    Venkatakrishnan, O. Rahman, G. T. Buzzard, C. A. Bouman, "Tomographic Sparse View
+    Selection using the View Covariance Loss", IEEE Transactions on Pattern Analysis and
+    Machine Intelligence, 2025.
 
     Args:
-        ct_model (TomographyModel): A CT model instance (e.g., ParallelBeamModel or ConeBeamModel) containing the system geometry and angles.
-        reference_object (ndarray): 3D array representing the reference volume (e.g., ground truth).
-        num_selected_views (int): Number of view angles to select.
-        r_1 (float, optional): Voxel sampling rate in the reference object (default is 0.002).
-        r_2 (float, optional): View sampling rate for stochastic minimization (default is 0.5).
-        prev_selected_view_inds (ndarray, optional): 1D array of previously selected view indices. Defaults to an empty NumPy array.
-        priority_order (bool, optional): If True, reorders the selected view indices from most to least important. Defaults to False.
-        verbose (int, optional): Verbosity level. If > 0, visualizations of the covariance matrix and gamma vector will be shown.
-        seed (int, optional): Random seed for deterministic behavior. If set, results will be reproducible.
-        roi (ndarray, optional): 3D mask with the same shape as reference_object. Nonzero
-            voxels identify the region used to select views. If None, the whole
-            reference_object will be used to select views.
+        ct_model (TomographyModel): A CT model, such as ParallelBeamModel or ConeBeamModel,
+            with the system geometry and the candidate angles.
+        reference_object (ndarray): A 3D reference volume, such as the ground truth.
+        num_selected_views (int): The number of view angles to select.
+        r_1 (float, optional): The fraction of voxels sampled in the reference object.
+            Defaults to 0.002.
+        r_2 (float, optional): The fraction of candidate views sampled in each step of the
+            stochastic search.  Defaults to 0.5.
+        prev_selected_view_inds (ndarray, optional): A 1D array of view indices selected
+            earlier.  Defaults to an empty NumPy array.
+        priority_order (bool, optional): If True, the function orders the selected views from
+            most to least important.  Defaults to False.
+        verbose (int, optional): The verbosity level.  If verbose > 0, the function plots the
+            covariance matrix and the gamma vector.
+        seed (int, optional): The random seed for reproducible results.
+        roi (ndarray, optional): A 3D mask with the same shape as reference_object.  The
+            nonzero voxels mark the region used to select views.  If None, the function uses
+            the whole reference_object.
 
     Returns:
-        Tuple[ndarray, float]: A tuple containing:
-            - A 1D NumPy array of the indices into the ct_model angles for the optimal view angles of shape (K,).
-            - The scalar VCL value for the selected subset.
+        Tuple[ndarray, float]: The (K,) indices of the selected views in the ct_model angles,
+        and the VCL value of the selected subset.
 
     Example:
         >>> angles = np.linspace(0, np.pi, num=180, endpoint=False)
-        >>> sinogram_shape = (180, 128, 100)
-        >>> ct_model = mt.ParallelBeamModel(sinogram_shape, angles)
+        >>> ct_model = mt.ParallelBeamModel((180, 128, 100), angles)
         >>> ref_obj = np.random.rand(128, 128, 100)
         >>> selected_angles_idx, vcl_value = get_opt_views(ct_model, ref_obj, num_selected_views=10)
         >>> selected_angles = angles[selected_angles_idx]
-        >>> print(selected_angles.shape)
-        (10,)
     """
     if roi is not None:
         roi = np.asarray(roi)
@@ -136,9 +131,8 @@ def get_opt_views(ct_model, reference_object, num_selected_views, r_1=0.002, r_2
         roi = roi.astype(bool)
 
     num_views = ct_model.get_params('sinogram_shape')[0]
-    # The view-parameter array is looked up by the model's own name for it, which is
-    # 'angles' for parallel beam and 'view_params_array' for cone.  The candidate
-    # angle of a view is its first component.
+    # Each model stores its view parameters under its own name.  The first component of each
+    # view's parameters is its angle.
     view_params_name = ct_model.get_params('view_params_name')
     view_params = np.asarray(ct_model.get_params(view_params_name))
     angle_candidates = view_params.reshape(view_params.shape[0], -1)[:, 0]
@@ -184,24 +178,23 @@ def get_opt_views(ct_model, reference_object, num_selected_views, r_1=0.002, r_2
 
 def compute_view_basis_functions(ct_model, ref_object, r_1, data_store_dir, seed=None, roi=None):
     """
-    Compute the view basis functions and inner product vector (gamma) used in the VCLS algorithm.
+    This function computes the view basis functions and saves them as .npy files.  It also
+    computes and returns the inner product vector gamma that the VCL search uses.
 
     Args:
-        ct_model (TomographyModel): CT model specifying the system geometry.
-        ref_object (ndarray): 3D reference object with shape (rows, cols, slices).
-        r_1 (float): Voxel sampling rate in the reference object (fraction of total voxels).
-        data_store_dir (str): Directory where the computed reconstructions will be stored as .npy files.
-        seed (int, optional): Random seed for deterministic behavior. Default is None.
-        roi (ndarray, optional): Binary 3D mask selecting the reference voxels used in
-            the basis-function inner products. Default is None.
+        ct_model (TomographyModel): The CT model with the system geometry.
+        ref_object (ndarray): The 3D reference object, with shape (rows, cols, slices).
+        r_1 (float): The fraction of the voxels of the reference object that are sampled.
+        data_store_dir (str): The directory where the function saves the basis functions.
+        seed (int, optional): The random seed for reproducible results.  Defaults to None.
+        roi (ndarray, optional): A binary 3D mask.  It selects the reference voxels used in
+            the inner products.  Defaults to None.
 
     Returns:
-        ndarray: A 2D array of shape (num_views, 1) representing the gamma column vector.
+        ndarray: The gamma column vector, with shape (num_views, 1).
 
     Example:
         >>> gamma = compute_view_basis_functions(ct_model, ref_object, 0.001, "/tmp/recons")
-        >>> print(gamma.shape)
-        (180, 1)
     """
     eps = 1e-12
 
@@ -214,7 +207,7 @@ def compute_view_basis_functions(ct_model, ref_object, r_1, data_store_dir, seed
         ref_object_flat = ref_object.reshape(ref_object.shape[0] * ref_object.shape[1], ref_object.shape[2])
         sparse_ref_object = _normalize_by_norm(np.asarray(ref_object_flat[sparse_indices, :]), eps)
     else:
-        # A row-column location is eligible when any slice contains an ROI voxel there.
+        # A (row, col) location is in the ROI if any slice has an ROI voxel there.
         mask = np.any(roi, axis=2)
         sparse_indices, row_col_indices = get_2d_subsampling_indices(mask, r_1, seed=seed)
         ref_object_flat = ref_object.reshape(ref_object.shape[0] * ref_object.shape[1], ref_object.shape[2])
@@ -227,16 +220,12 @@ def compute_view_basis_functions(ct_model, ref_object, r_1, data_store_dir, seed
 
     num_views = ct_model.get_params('sinogram_shape')[0]
 
-    # The one-view copy runs on the parent's lead device.  The message says
-    # whether that device was chosen by the caller or by the library.
     print('Creating recon bases on the {} device'.format(
         'default' if ct_model.device_layout_is_automatic else 'requested'))
 
     filtered_sinogram = np.asarray(ct_model.direct_filter(ref_sino))
     del ref_sino
 
-    # The basis of each view is computed on a one-view copy of the model,
-    # pointed at that view's own parameters.
     single_view_model = _make_single_view_sibling(ct_model)
     view_params_name = ct_model.get_params('view_params_name')
     full_view_params = np.asarray(ct_model.get_params(view_params_name))
@@ -261,23 +250,19 @@ def compute_view_basis_functions(ct_model, ref_object, r_1, data_store_dir, seed
 
 def compute_cov_matrix(num_views, data_store_dir, batch_size=100):
     """
-    Compute the covariance matrix of view basis functions.
-
-    This function computes the symmetric covariance matrix
-    by loading precomputed basis functions stored as `.npy` files.
+    This function computes the covariance matrix of the view basis functions.  It loads the
+    basis functions from the ``.npy`` files that :func:`compute_view_basis_functions` saves.
 
     Args:
-        num_views (int): Total number of view basis functions.
-        data_store_dir (str): Directory containing the stored `.npy` files for each view basis function.
-        batch_size (int, optional): The number of views to use for computing the symmetric covariance matrix.  Defaults to 100.
+        num_views (int): The number of view basis functions.
+        data_store_dir (str): The directory that contains the ``.npy`` files.
+        batch_size (int, optional): The number of views loaded at a time.  Defaults to 100.
 
     Returns:
-        ndarray: A symmetric covariance matrix of shape `(num_views, num_views)`.
+        ndarray: The symmetric covariance matrix, with shape ``(num_views, num_views)``.
 
     Example:
         >>> cov_matrix = compute_cov_matrix(180, "/tmp/recons")
-        >>> print(cov_matrix.shape)
-        (180, 180)
     """
 
     cov_matrix = np.zeros((num_views, num_views))
@@ -290,7 +275,6 @@ def compute_cov_matrix(num_views, data_store_dir, batch_size=100):
         recons_batch = np.zeros((len(batch), recon_size))
         for i in batch:
             recons_batch[i - batch[0]] = np.load(os.path.join(data_store_dir, f'view_basis_function{i}.npy')).flatten()
-        # This batch fills one diagonal block of the matrix.
         batch_start, batch_stop = batch[0], batch[0] + len(batch)
         dot_products = recons_batch @ recons_batch.T
         cov_matrix[batch_start:batch_stop, batch_start:batch_stop] = dot_products
@@ -303,7 +287,7 @@ def compute_cov_matrix(num_views, data_store_dir, batch_size=100):
             batch2_start, batch2_stop = batch2[0], batch2[0] + len(batch2)
             dot_products = recons_batch @ recons_batch2.T
 
-            # The matrix is symmetric, so this block is written twice.
+            # The matrix is symmetric, so the block and its transpose are both written.
             cov_matrix[batch_start:batch_stop, batch2_start:batch2_stop] = dot_products
             cov_matrix[batch2_start:batch2_stop, batch_start:batch_stop] = dot_products.T
 
@@ -313,20 +297,16 @@ def compute_cov_matrix(num_views, data_store_dir, batch_size=100):
 
 def compute_vcl(sub_R, sub_gamma):
     """
-    Compute the View Correlation Loss (VCL) for a subset of views.
-
-    This function evaluates the VCL metric, defined as:
-        VCL = 1 - γᵀ R⁻¹ γ,
-    where R is the submatrix of the covariance matrix and γ is the inner product vector.
-    Lower values of VCL indicate a more informative and less redundant view subset.
+    This function computes the View Covariance Loss, VCL = 1 - γᵀ R⁻¹ γ, for a subset of
+    views.  A lower VCL means that the subset is more informative and less redundant.
 
     Args:
-        sub_R (ndarray): A square (K, K) covariance matrix corresponding to a subset of K views.
-        sub_gamma (ndarray): A column vector of shape (K, 1) representing the inner products
-                              between the reconstruction bases and the reference object.
+        sub_R (ndarray): The (K, K) covariance matrix of a subset of K views.
+        sub_gamma (ndarray): The (K, 1) inner products between the view basis functions and
+            the reference object.
 
     Returns:
-        float: The scalar VCL value for the selected subset of views.
+        float: The VCL value for the subset of views.
     """
     loss_value = 1 - sub_gamma.T @ np.linalg.solve(sub_R, sub_gamma)
     return loss_value.item()
@@ -334,32 +314,31 @@ def compute_vcl(sub_R, sub_gamma):
 
 def compute_opt_angle_subset(R, gamma, candidate_angles, K, r_2, prev_selected_view_inds, search_min=30, max_iterations = 100, seed=None):
     """
-    Select a subset of view angles that minimize the View Correlation Loss (VCL) using stochastic greedy optimization.
-
-    This function performs an iterative stochastic search over candidate view indices to minimize the VCL,
-    defined as VCL = -γᵀ R⁻¹ γ, where R is a covariance matrix of reconstructions and γ is the inner product vector.
-    At each step, it considers random replacements of the current selection and keeps changes that improve the loss.
+    This function selects the subset of view angles that minimizes the VCL of
+    :func:`compute_vcl`.  It uses a stochastic greedy search.  The search replaces one selected
+    angle at a time and keeps each replacement that lowers the VCL.
 
     Args:
-        R (ndarray): Covariance matrix of shape (num_views, num_views).
-        gamma (ndarray): Column vector of shape (num_views, 1), representing the inner product between reconstructions and reference.
-        candidate_angles (ndarray): 1D array of view angles (shape (num_views,)) corresponding to R and gamma.
-        K (int): Number of view angles to select.
-        r_2 (float): Fraction of unchosen candidates to sample per view per iteration.
-        prev_selected_view_inds (ndarray): Indices of previously selected view angles in `candidate_angles`.
-        search_min (int, optional): Minimum number of angles that are searched per iteration. Defaults to 30.
-        max_iterations (int, optional): Maximum allowed number of iterations. Defaults to 100.
-        seed (int, optional): Random seed for deterministic behavior. Default is None.
+        R (ndarray): The covariance matrix, with shape (num_views, num_views).
+        gamma (ndarray): The column vector of inner products between the view basis functions
+            and the reference object, with shape (num_views, 1).
+        candidate_angles (ndarray): The (num_views,) view angles that correspond to R and gamma.
+        K (int): The number of view angles to select.
+        r_2 (float): The fraction of unselected candidates that the search tries for each
+            selected view in each iteration.
+        prev_selected_view_inds (ndarray): The indices in ``candidate_angles`` of the view
+            angles selected earlier.
+        search_min (int, optional): The minimum number of candidates tried for each selected
+            view in each iteration.  Defaults to 30.
+        max_iterations (int, optional): The maximum number of iterations.  Defaults to 100.
+        seed (int, optional): The random seed for reproducible results.  Defaults to None.
 
     Returns:
-        Tuple[ndarray, float]: A tuple containing:
-            - A 1D NumPy array of selected view angles of shape (K,).
-            - The scalar VCL value for the selected subset.
+        Tuple[ndarray, float]: The sorted (K,) indices in ``candidate_angles`` of the selected
+        views, and the VCL of the subset.
 
     Example:
         >>> selected = compute_opt_angle_subset(R, gamma, candidate_angles, K=10, r_2=0.01)
-        >>> print(selected.shape)
-        (10,)
 
     Raises:
         ValueError: If K <= 0.
@@ -377,7 +356,6 @@ def compute_opt_angle_subset(R, gamma, candidate_angles, K, r_2, prev_selected_v
     if K <= 0:
         raise ValueError("K must be positive. Received K={}".format(K))
 
-    # With no angles left over, every candidate is returned.
     if num_unselected_angles <= 0:
         warnings.warn(f"Requested {K} views, but only {num_avail_angle_inds} available. Returning all candidates.")
         sorted_angle_inds = avail_angle_inds
@@ -411,7 +389,6 @@ def compute_opt_angle_subset(R, gamma, candidate_angles, K, r_2, prev_selected_v
                     vcl_current_best = np.copy(vcl_temp)
                     selected_angle_inds = np.copy(selected_angle_inds_tmp)
 
-        # The search stops once an iteration changes no angle.
         if np.array_equal(selected_angle_inds, prev_selected_angle_inds):
             print(f'Early stopping at iteration {i}, no change in indices')
             break
@@ -422,24 +399,22 @@ def compute_opt_angle_subset(R, gamma, candidate_angles, K, r_2, prev_selected_v
 
 def get_2d_subsampling_indices(mask, r_1, seed=None, blue_noise=False):
     """
-    Perform 2D subsampling of voxel indices within a masked region.
-
-    If `blue_noise` is False, then the function samples with a uniformly distributed random sampling pattern.
-    Otherwise, a blue noise pattern is used to select points using a stored blue noise mask.
-    However, the blue noise doesn't work with a ramp filtered signal, so it is probably not a good choice in this applications.
+    This function samples voxel indices within a 2D mask.  It samples uniformly at random or
+    with a stored blue noise pattern.  The blue noise pattern does not suit a ramp-filtered
+    signal.
 
     Args:
-        mask (ndarray): A 2D binary array indicating the region of interest (ROI).
-        r_1 (float): Fraction of voxels to sample from the ROI. Must be in (0, 1].
-        seed (int, optional): Random seed for reproducibility in random mode.
-        blue_noise (bool, optional): If False (default), use uniform random sampling.
-                                     If True, use a blue noise pattern for sampling.
+        mask (ndarray): A 2D binary array that marks the region of interest (ROI).
+        r_1 (float): The fraction of voxels to sample from the ROI.  It must be in (0, 1].
+        seed (int, optional): The random seed for reproducible results with uniform sampling.
+        blue_noise (bool, optional): If False, the function uses uniform random sampling.
+            If True, it uses the blue noise pattern.  Defaults to False.
 
     Returns:
         Tuple:
-            random_indices_2d (ndarray): Flattened 1D array of selected voxel indices.
-            (row_inds, col_inds) (Tuple[ndarray, ndarray]): Arrays of row and column indices
-                corresponding to the selected voxels.
+            random_indices_2d (ndarray): The flattened 1D indices of the selected voxels.
+            (row_inds, col_inds) (Tuple[ndarray, ndarray]): The row and column indices of the
+                selected voxels.
     """
     import math
 
@@ -457,15 +432,13 @@ def get_2d_subsampling_indices(mask, r_1, seed=None, blue_noise=False):
         eligible_indices = np.where(mask_flat > 0)[0]
         flat_indices = np.random.choice(eligible_indices, size=num_samples, replace=False)
     else:
-        # The stored blue noise pattern is tiled to cover the mask.
         bn_pattern = mt.bn256
         tile_rows = math.ceil(num_rows / bn_pattern.shape[0])
         tile_cols = math.ceil(num_cols / bn_pattern.shape[1])
         tiled_pattern = np.tile(bn_pattern, (tile_rows, tile_cols))
         tiled_pattern = tiled_pattern[:num_rows, :num_cols]
 
-        # Setting the values outside the mask to infinity excludes them, and
-        # the lowest remaining values are the sampled points.
+        # Values outside the mask are set to infinity.  The num_samples smallest values are sampled.
         masked_values = np.where(mask, tiled_pattern, np.inf)
         flat_indices = np.argsort(masked_values.ravel())[:num_samples]
 
@@ -483,21 +456,17 @@ def show_image_with_projection_rays(
     title: str = None
 ) -> None:
     """
-    Display an image and overlay arrows pointing along the projection from source to detector for the given
-    rotation angles.  The angles are rotation angles using the convention of mbirtorch objects:
-    Looking down at the object with the detector at the top of the FoV, 0 degrees points from bottom to top of the
-    object.  As the rotation angle increases, the object rotates clockwise, which means that if the object is kept
-    in a fixed view, then the projection angle rotates counterclockwise.
-
-    Exactly one of `rotation_angles_deg` or `rotation_angles_rad` must be provided (not both).
+    This function displays an image with one arrow for each rotation angle.  Each arrow points
+    along the projection from the source to the detector.  With the detector at the top, the
+    arrow for 0 degrees points from the bottom to the top.  The object rotates clockwise as the
+    angle increases.  The caller must give exactly one of ``rotation_angles_deg`` and
+    ``rotation_angles_rad``.
 
     Args:
-        image (np.ndarray): A 2D NumPy array representing the image.
-        rotation_angles_deg (np.ndarray, optional): A 1D array of angles in degrees. Each angle is visualized
-            as an arrow through the image center.
-        rotation_angles_rad (np.ndarray, optional): A 1D array of angles in radians. Each angle is visualized
-            as an arrow through the image center.
-        title (str, optional): Optional title to display above the plot.
+        image (np.ndarray): The 2D image.
+        rotation_angles_deg (np.ndarray, optional): A 1D array of angles in degrees.
+        rotation_angles_rad (np.ndarray, optional): A 1D array of angles in radians.
+        title (str, optional): The title to display above the plot.
 
     Returns:
         None
@@ -510,12 +479,10 @@ def show_image_with_projection_rays(
     if rotation_angles_rad is None:
         rotation_angles_rad = np.deg2rad(rotation_angles_deg)
 
-    # The projection angles are converted to the standard representation.
     rotation_angles_rad = np.pi / 2 + rotation_angles_rad
 
     rows, cols = image.shape
     center_x, center_y = cols / 2, rows / 2
-    # The shortest dimension keeps the arrows inside the image.
     radius = min(rows, cols) / 2
 
     import matplotlib.pyplot as plt
@@ -538,11 +505,14 @@ def show_image_with_projection_rays(
 
 def reorder_by_priority(optimal_angle_inds, prev_selected_view_inds, R, gamma):
     """
-    Reorders the optimal angle indices by importance using iterative removal.
+    This function reorders the selected angle indices from most to least important.  At each
+    step it removes the angle whose removal gives the lowest VCL.  The angles removed last are
+    the most important.
 
     Args:
-        optimal_angle_inds (np.ndarray): The array of newly selected optimal angle indices to be reordered.
-        prev_selected_view_inds (np.ndarray): The array of fixed, previously selected angle indices.
+        optimal_angle_inds (np.ndarray): The selected angle indices to reorder.
+        prev_selected_view_inds (np.ndarray): The angle indices selected earlier.  These
+            indices are kept in every subset.
         R (np.ndarray): The full covariance matrix.
         gamma (np.ndarray): The full gamma vector.
 
@@ -564,7 +534,7 @@ def reorder_by_priority(optimal_angle_inds, prev_selected_view_inds, R, gamma):
         optimal_angle_inds = np.delete(optimal_angle_inds, idx_to_drop)
 
     drop_inds_list.append(optimal_angle_inds[0])
-    # Reversing the list ranks the angles from most to least important.
+    # The reversed removal order ranks the angles from most to least important.
     optimal_angle_inds = np.array(drop_inds_list)[::-1]
 
     return optimal_angle_inds

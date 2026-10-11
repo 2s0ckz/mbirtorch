@@ -1,4 +1,4 @@
-"""Corrections applied to a sinogram before reconstruction."""
+"""This module applies corrections to a sinogram before reconstruction."""
 
 import math
 import warnings
@@ -13,16 +13,16 @@ __all__ = ['correct_background_offset', 'correct_det_rotation', 'remove_all_stri
 
 
 def _resample_views(sino_batch, angles, sampling_offsets):
-    """Resample each view of a batch by its rotation about the detector center and its sampling offset.
-
-    Output pixel ``p`` of a view takes the input at ``R (p - center) + center + offset``, with ``R``
-    the rotation matrix of ``correct_det_rotation`` and ``offset`` in pixels as ``(row, channel)``.
-    The interpolation is bicubic, and a sample from outside the view takes the nearest edge value.
+    """This function resamples each view of a batch.  It rotates each view about the detector
+    center by the angle of that view.  It then shifts the view by the sampling offset of that
+    view.  It uses bicubic interpolation and repeats the edge values outside the detector.
 
     Args:
-        sino_batch (tensor): (num_views, num_det_rows, num_det_channels) on the working device.
-        angles (tensor): (num_views,) in radians, on the same device.
-        sampling_offsets (tensor): (num_views, 2) in pixels, on the same device.
+        sino_batch (tensor): The views, with shape (num_views, num_det_rows, num_det_channels).
+        angles (tensor): The rotation angles in radians, with shape (num_views,).  The tensor
+            must be on the device of ``sino_batch``.
+        sampling_offsets (tensor): The offsets in pixels as (row, channel), with shape
+            (num_views, 2).  The tensor must be on the device of ``sino_batch``.
     """
     num_views, num_rows, num_cols = sino_batch.shape
     device, dtype = sino_batch.device, sino_batch.dtype
@@ -34,7 +34,7 @@ def _resample_views(sino_batch, angles, sampling_offsets):
     rel_i, rel_j = grid_i[None] - center_row, grid_j[None] - center_col
     src_row = cos_a * rel_i + sin_a * rel_j + center_row + sampling_offsets[:, 0, None, None].to(dtype)
     src_col = -sin_a * rel_i + cos_a * rel_j + center_col + sampling_offsets[:, 1, None, None].to(dtype)
-    # grid_sample takes (x, y) in [-1, 1], with align_corners=True mapping -1 and 1 to the edge pixels.
+    # grid_sample takes (x, y) in [-1, 1].  With align_corners=True, -1 and 1 map to the edge pixels.
     grid = torch.stack([2.0 * src_col / max(num_cols - 1, 1) - 1.0,
                         2.0 * src_row / max(num_rows - 1, 1) - 1.0], dim=-1)
     out = torch.nn.functional.grid_sample(sino_batch[:, None].to(torch.float32), grid.to(torch.float32),
@@ -43,24 +43,21 @@ def _resample_views(sino_batch, angles, sampling_offsets):
 
 
 def _rotation_kernel(sino_batch, det_rotation, center=None):
-    """Rotate the (row, channel) plane of each view in a batch by ``det_rotation`` radians.
-
-    The interpolation is bicubic, and a sample from outside the view takes the nearest edge value.
+    """This function rotates each view in a batch by ``det_rotation`` radians.  It uses
+    bicubic interpolation and repeats the edge values outside the detector.
 
     Args:
-        sino_batch (tensor): (num_views, num_det_rows, num_det_channels).
-        det_rotation (float): rotation angle in radians.
-        center (tuple of float or None): the ``(row, channel)`` point the rotation turns about, in the
-            index coordinates of ``sino_batch``.  None (the default) is the center of the array.  A
-            caller that rotates a band of rows cut from a taller detector passes the full detector's
-            center, expressed in the band's row indices, so that the band rotates exactly as it would
-            inside the full detector.
+        sino_batch (tensor): The views, with shape (num_views, num_det_rows, num_det_channels).
+        det_rotation (float): The rotation angle in radians.
+        center (tuple of float or None): The ``(row, channel)`` point of the rotation, in the
+            index coordinates of ``sino_batch``.  None means the center of the array.  Defaults
+            to None.
     """
     num_views, num_rows, num_cols = sino_batch.shape
     device = sino_batch.device
     angles = torch.full((num_views,), float(det_rotation), dtype=torch.float32, device=device)
-    # A rotation about ``center`` is the rotation about the array center plus the sampling offset
-    # (R - I) (array center - center).
+    # A rotation about ``center`` equals the rotation about the array center plus the sampling
+    # offset (R - I) (array center - center).
     offsets = torch.zeros((num_views, 2), dtype=torch.float32, device=device)
     if center is not None:
         cos_a, sin_a = math.cos(det_rotation), math.sin(det_rotation)
@@ -73,23 +70,21 @@ def _rotation_kernel(sino_batch, det_rotation, center=None):
 
 def correct_det_rotation(sino, det_rotation=0.0, batch_size=30, devices=None):
     """
-    Rotate every view of a sinogram to remove a detector rotation.
-
-    The rotation is about the center of the view, with bicubic interpolation, and a sample from
-    outside the view takes the nearest edge value.  Takes a numpy array or a tensor and returns a
-    numpy array.
+    This function rotates each view of a sinogram about the center of the view to remove a
+    detector rotation.  It uses bicubic interpolation and repeats the edge values outside the detector.
 
     Args:
-        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
-        det_rotation (float, optional): The angle between the rotation axis and the detector columns,
-            in radians.  Defaults to 0.0.
-        batch_size (int, optional): Views processed at a time.  Defaults to 30.
-        devices (sequence or None, optional): Devices to spread the views over.  None uses all visible
-            CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when it is set, or the default device
-            when there are none.  Defaults to None.
+        sino (numpy array or tensor): The sinogram, with shape (num_views, num_det_rows,
+            num_det_channels).
+        det_rotation (float, optional): The angle between the rotation axis and the detector
+            columns, in radians.  Defaults to 0.0.
+        batch_size (int, optional): The number of views processed at a time.  Defaults to 30.
+        devices (sequence or None, optional): The devices to divide the views among.  None
+            means all visible CUDA devices, up to the number set by ``MBIRTORCH_NUM_DEVICES``.
+            If there is no CUDA device, None means the default device.  Defaults to None.
 
     Returns:
-        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+        numpy.ndarray: The corrected sinogram, with the shape of ``sino``.
     """
     _pipeline.reject_shards('correct_det_rotation', sino=sino)
 
@@ -99,21 +94,24 @@ def correct_det_rotation(sino, det_rotation=0.0, batch_size=30, devices=None):
 
 def correct_background_offset(sino, edge_width=9, option='global'):
     """
-    Subtract the background offset of a sinogram, estimated from its edges.
+    This function estimates the background offset of a sinogram from the edges of the views.
+    It then subtracts the offset from the sinogram.
 
-    The offset of a view is the median of the medians of its left, right, and top edge strips, each
-    ``edge_width`` pixels wide.  With ``option='global'`` one value, the 10th percentile of the
-    per-view offsets, is subtracted from every view.  With ``'per_view'`` each view's own offset is
-    subtracted.
+    The offset of a view is the median of three values.  These values are the medians of the
+    left, right, and top edge strips of the view.  With ``option='global'``, the function
+    subtracts the 10th percentile of the view offsets from every view.  With
+    ``option='per_view'``, the function subtracts the offset of each view from that view.
 
     Args:
-        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
-        edge_width (int, optional): Width of the edge strips in pixels, at least 1.  Defaults to 9.
-        option (str or None, optional): 'global', 'per_view', or None to return ``sino`` unchanged.
-            Defaults to 'global'.
+        sino (numpy.ndarray): The sinogram, with shape (num_views, num_det_rows,
+            num_det_channels).
+        edge_width (int, optional): The width of the edge strips in pixels.  The function
+            raises a value below 1 to 1.  Defaults to 9.
+        option (str or None, optional): 'global', 'per_view', or None.  If None, the function
+            returns ``sino`` unchanged.  Defaults to 'global'.
 
     Returns:
-        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+        numpy.ndarray: The corrected sinogram, with the shape of ``sino``.
     """
 
     if option is None:
@@ -151,24 +149,20 @@ def correct_background_offset(sino, edge_width=9, option='global'):
 
 def _generate_column_index_matrix(num_rows, num_cols):
     """
-    Create a 2D array of indexes used for the sorting technique.
-
-    This code is based on the method described in:
-    [Nghia T. Vo et al., 2018] - "Superior techniques for eliminating ring artifacts in x-ray micro-tomography"
-
-    This code is adapted from the Tomopy library:
-    https://github.com/tomopy/tomopy.git
-
-    References:
-    [1] Vo N, and Atwood RC, and Drakopoulos M. Superior techniques for eliminating ring artifacts in x-ray micro-tomography. Optics Express, 26(22):28396–28412, 2018.
-    [2] Tomopy library https://github.com/tomopy/tomopy.git
+    This function creates the 2D array of indexes that the sorting method uses.  Each row of
+    the array holds 0, 1, ..., num_cols - 1.
+    The code is adapted from Tomopy (https://github.com/tomopy/tomopy.git).  It follows Vo N,
+    Atwood RC, Drakopoulos M, "Superior techniques for eliminating ring artifacts in x-ray
+    micro-tomography", Optics Express 26(22):28396-28412, 2018.
 
     Args:
-        num_rows (int): number of detector rows in the sinogram
-        num_cols (int): number of detector channels in the sinogram
+        num_rows (int): The number of rows in the array.  The caller passes the number of
+            detector channels.
+        num_cols (int): The number of columns in the array.  The caller passes the number of
+            views.
 
     Returns:
-        index_matrix(ndarray): a 2D array of indexes
+        index_matrix (ndarray): The 2D array of indexes, with shape (num_rows, num_cols).
     """
     list_index = np.arange(0.0, num_cols, 1.0, dtype=np.float32)
     index_matrix = np.tile(list_index, (num_rows, 1))
@@ -177,25 +171,18 @@ def _generate_column_index_matrix(num_rows, num_cols):
 
 def _remove_small_stripes_sorting(sino, filter_size, index_matrix):
     """
-    Remove small-to-medium partial and fulll stripes using the sorting technique.
-
-    This code is based on the method described in:
-    [Nghia T. Vo et al., 2018] - "Superior techniques for eliminating ring artifacts in x-ray micro-tomography"
-
-    This code is adapted from the Tomopy library:
-    https://github.com/tomopy/tomopy.git
-
-    References:
-    [1] Vo N, and Atwood RC, and Drakopoulos M. Superior techniques for eliminating ring artifacts in x-ray micro-tomography. Optics Express, 26(22):28396–28412, 2018.
-    [2] Tomopy library https://github.com/tomopy/tomopy.git
+    This function removes small and medium stripes, both partial and full, by the sorting method.
+    The code is adapted from Tomopy (https://github.com/tomopy/tomopy.git).  It follows Vo N,
+    Atwood RC, Drakopoulos M, "Superior techniques for eliminating ring artifacts in x-ray
+    micro-tomography", Optics Express 26(22):28396-28412, 2018.
 
     Args:
-        sino (ndarray): a 2D slice of the sinogram data with shape (num_views, num_det_channels)
-        filter_size (int): window size of the median filter
-        index_matrix (ndarray): a 2D array of indexes used for the sorting technique
+        sino (ndarray): A 2D slice of the sinogram, with shape (num_views, num_det_channels).
+        filter_size (int): The window size of the median filter.
+        index_matrix (ndarray): The 2D array of indexes for the sorting method.
 
     Return:
-        corrected_sino (ndarray): corrected 2D slice of the sinogram data after stripes removal
+        corrected_sino (ndarray): The corrected 2D slice of the sinogram.
     """
 
     from scipy.ndimage import median_filter
@@ -217,22 +204,20 @@ def _remove_small_stripes_sorting(sino, filter_size, index_matrix):
 
 def _detect_stripe(list_data, snr):
     """
-    Used to locate stripes.
-    A segmentation algorithm to separate the extremely positive and negative defects from the normal values in the
-    sinogram.
-
-    This code is based on the method described in:
-    [Nghia T. Vo et al., 2018] - "Superior techniques for eliminating ring artifacts in x-ray micro-tomography"
-
-    This code is adapted from the Tomopy library:
-    https://github.com/tomopy/tomopy.git
+    This function locates stripes.  It separates the values with very large positive or
+    negative defects from the normal values.
+    The code is adapted from Tomopy (https://github.com/tomopy/tomopy.git).  It follows Vo N,
+    Atwood RC, Drakopoulos M, "Superior techniques for eliminating ring artifacts in x-ray
+    micro-tomography", Optics Express 26(22):28396-28412, 2018.
 
     Args:
-        list_data (ndarray): a normalized 1D array
-        snr (float): a ratio between the defective value and the background value. a reasonable choice of snr should be around 3.0 or above
+        list_data (ndarray): A normalized 1D array.
+        snr (float): The ratio between the defective value and the background value.  It is
+            typically 3.0 or above.
 
     Returns:
-        list_mask (ndarray): a 2D binary array denoting the stripes detected
+        list_mask (ndarray): A binary array with the shape of ``list_data``.  The value 1 marks
+            a detected stripe.
     """
 
     num_data = list_data.shape[0]
@@ -240,7 +225,7 @@ def _detect_stripe(list_data, snr):
     sorted_list = np.sort(list_data)[::-1]
     x_list = np.arange(0, num_data, 1.0, dtype=np.float32)
 
-    # The fit ignores the top and bottom quarter of the sorted values.  Ordinary background variation then does not raise the noise level.
+    # The fit ignores the top and bottom quarters of the sorted values.
     num_data_drop = np.int16(0.25 * num_data)
     (_slope, _intercept) = np.polyfit(x_list[num_data_drop:-num_data_drop - 1], sorted_list[num_data_drop:-num_data_drop - 1], 1)
     fitted_value_last_index = _intercept + _slope * x_list[-1]
@@ -262,27 +247,22 @@ def _detect_stripe(list_data, snr):
 
 def _remove_large_stripes_sorting(sino, snr, filter_size, index_matrix, drop_ratio=0.1):
     """
-    Remove large partial and full stripes using the sorting technique.
-
-    This code is based on the method described in:
-    [Nghia T. Vo et al., 2018] - "Superior techniques for eliminating ring artifacts in x-ray micro-tomography"
-
-    This code is adapted from the Tomopy library:
-    https://github.com/tomopy/tomopy.git
-
-    References:
-    [1] Vo N, and Atwood RC, and Drakopoulos M. Superior techniques for eliminating ring artifacts in x-ray micro-tomography. Optics Express, 26(22):28396–28412, 2018.
-    [2] Tomopy library https://github.com/tomopy/tomopy.git
+    This function removes large stripes, both partial and full, by the sorting method.
+    The code is adapted from Tomopy (https://github.com/tomopy/tomopy.git).  It follows Vo N,
+    Atwood RC, Drakopoulos M, "Superior techniques for eliminating ring artifacts in x-ray
+    micro-tomography", Optics Express 26(22):28396-28412, 2018.
 
     Args:
-        sino (ndarray): a 2D slice of the sinogram data with shape (num_views, num_det_channels)
-        snr (float): a ratio between the defective value and the background value
-        filter_size (int): window size of the median filter
-        index_matrix (ndarray): a 2D array of indexes used for the sorting technique
-        drop_ratio (float, optional): ratio of pixels at the top and the bottom of the sinogram to be removed. Defaults to 0.1.
+        sino (ndarray): A 2D slice of the sinogram, with shape (num_views, num_det_channels).
+        snr (float): The ratio between the defective value and the background value.
+        filter_size (int): The window size of the median filter.
+        index_matrix (ndarray): The 2D array of indexes for the sorting method.
+        drop_ratio (float, optional): The fraction of the sorted values in each channel that
+            the stripe detection ignores.  Half the fraction comes from the top and half from
+            the bottom.  Defaults to 0.1.
 
     Returns:
-        sino (ndarray): corrected 2D slice of the sinogram data after stripes removal
+        sino (ndarray): The corrected 2D slice of the sinogram.
     """
 
     from scipy.ndimage import median_filter, binary_dilation
@@ -330,29 +310,20 @@ def _remove_large_stripes_sorting(sino, snr, filter_size, index_matrix, drop_rat
 
 def _remove_dead_fluctuating_stripes_interpolation(sino, snr, filter_size, index_matrix):
     """
-    Remove unresponsive and fluctuating stripes using the interpolation technique.
-    Sorting approach does not work here because the rankings of the grayscales are significantly different between
-    pixels inside the stripes and outside the stripes. Instead, interpolation is an appropriate choice.
-
-    This code is based on the method described in:
-    [Nghia T. Vo et al., 2018] - "Superior techniques for eliminating ring artifacts in x-ray micro-tomography"
-
-    This code is adapted from the Tomopy library:
-    https://github.com/tomopy/tomopy.git
-
-    References:
-    [1] Vo N, and Atwood RC, and Drakopoulos M. Superior techniques for eliminating ring artifacts in x-ray micro-tomography. Optics Express, 26(22):28396–28412, 2018.
-    [2] Tomopy library https://github.com/tomopy/tomopy.git
+    This function removes unresponsive and fluctuating stripes by interpolation.  The sorting
+    method does not work for these stripes.
+    The code is adapted from Tomopy (https://github.com/tomopy/tomopy.git).  It follows Vo N,
+    Atwood RC, Drakopoulos M, "Superior techniques for eliminating ring artifacts in x-ray
+    micro-tomography", Optics Express 26(22):28396-28412, 2018.
 
     Args:
-        sino (ndarray): a 2D slice of the sinogram data with shape (num_views, num_det_channels)
-        snr (float): a ratio between the defective value and the background value
-        filter_size (int): window size of the median filter
-        index_matrix (ndarray): a 2D array of indexes used for the sorting technique
+        sino (ndarray): A 2D slice of the sinogram, with shape (num_views, num_det_channels).
+        snr (float): The ratio between the defective value and the background value.
+        filter_size (int): The window size of the median filter.
+        index_matrix (ndarray): The 2D array of indexes for the sorting method.
 
     Returns:
-        sino (ndarray): corrected 2D slice of the sinogram data after stripes removal
-
+        sino (ndarray): The corrected 2D slice of the sinogram.
     """
     from scipy import interpolate
     from scipy.ndimage import uniform_filter1d, median_filter, binary_dilation
@@ -393,20 +364,21 @@ def _remove_dead_fluctuating_stripes_interpolation(sino, snr, filter_size, index
 
 def remove_all_stripe(sino, snr=3, large_filter_size=61, small_filter_size=21):
     """
-    Remove stripe artifacts of all sizes from a sinogram.
-
-    The three steps of Vo, Atwood, and Drakopoulos, Optics Express 26(22), 2018, as in tomopy's
-    ``remove_all_stripe``: unresponsive and fluctuating stripes are interpolated over, then large
-    stripes and then small stripes are removed by sorting and median filtering.
+    This function removes stripes of all sizes from a sinogram.  It uses the method of Vo,
+    Atwood, and Drakopoulos, Optics Express 26(22), 2018.  It matches tomopy's
+    ``remove_all_stripe``.
 
     Args:
-        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
-        snr (float, optional): Signal-to-noise ratio used to detect stripes.  Defaults to 3.
-        large_filter_size (int, optional): Median filter window for the large stripes.  Defaults to 61.
-        small_filter_size (int, optional): Median filter window for the small stripes.  Defaults to 21.
+        sino (numpy.ndarray): The sinogram, with shape (num_views, num_det_rows,
+            num_det_channels).
+        snr (float, optional): The signal to noise ratio used to detect stripes.  Defaults to 3.
+        large_filter_size (int, optional): The median filter window for the large stripes.
+            Defaults to 61.
+        small_filter_size (int, optional): The median filter window for the small stripes.
+            Defaults to 21.
 
     Returns:
-        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+        numpy.ndarray: The corrected sinogram, with the shape of ``sino``.
     """
     from concurrent.futures import ThreadPoolExecutor
     sino = np.asarray(sino, dtype=np.float32)
@@ -431,18 +403,20 @@ def remove_all_stripe(sino, snr=3, large_filter_size=61, small_filter_size=21):
 
 def remove_stripe_fw(sino, wavelet_filter_name="db5", sigma=2):
     """
-    Remove vertical stripes from a sinogram by combined wavelet and Fourier filtering.
-
-    The method of Münch et al., Optics Express 17(10), 2009, as in tomopy's ``remove_stripe_fw``.
+    This function removes vertical stripes from a sinogram by wavelet and Fourier filtering.
+    It uses the method of Münch et al., Optics Express 17(10), 2009.  It matches tomopy's
+    ``remove_stripe_fw``.
 
     Args:
-        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
-        wavelet_filter_name (str, optional): The wavelet, such as 'db5' or 'haar'.  Defaults to 'db5'.
-        sigma (float, optional): Damping width in the Fourier domain; it sets the strength of the
-            suppression.  Defaults to 2.
+        sino (numpy.ndarray): The sinogram, with shape (num_views, num_det_rows,
+            num_det_channels).
+        wavelet_filter_name (str, optional): The wavelet, such as 'db5' or 'haar'.  Defaults
+            to 'db5'.
+        sigma (float, optional): The width of the damping in the Fourier domain.  It sets the
+            strength of the stripe removal.  Defaults to 2.
 
     Returns:
-        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+        numpy.ndarray: The corrected sinogram, with the shape of ``sino``.
     """
     import pywt
     sino = np.array(sino, dtype=np.float32)
@@ -479,16 +453,17 @@ def remove_stripe_fw(sino, wavelet_filter_name="db5", sigma=2):
 
 def remove_sino_offset(sino):
     """
-    Remove from each view the additive offset caused by material outside the field of view.
-
-    For each detector row, the mean over channels is made the same in every view, equal to the
-    smallest of the per-view means.
+    This function removes from each view the additive offset caused by material outside the
+    field of view.  For each detector row, the function computes the mean over channels in
+    each view.  It then shifts each view so that this mean equals the smallest mean over all
+    views.
 
     Args:
-        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        sino (numpy.ndarray): The sinogram, with shape (num_views, num_det_rows,
+            num_det_channels).
 
     Returns:
-        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+        numpy.ndarray: The corrected sinogram, with the shape of ``sino``.
     """
     sino_channel_avg = np.mean(sino, axis=2)
 

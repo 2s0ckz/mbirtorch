@@ -2,14 +2,12 @@ import torch
 
 
 def _nnal_prep(T):
-    """
-    Precompute the quantities that depend only on T.
-
-    These are constant for a whole solve, so hoisting them out of the iteration
-    removes a full log over T from every loss and derivative evaluation.
+    """This function computes the quantities in the loss that depend only on the transmission T.
 
     Returns:
-        (log_T, positive, all_positive)
+        tuple: (log_T, positive, all_positive).  ``log_T`` is log(T), with 0 where T is not positive.
+        ``positive`` is the boolean mask T > 0.  ``all_positive`` is True if every entry of T
+        is positive.
     """
     positive = T > 0
     Tsafe = torch.where(positive, T, torch.ones((), dtype=T.dtype, device=T.device))
@@ -19,35 +17,34 @@ def _nnal_prep(T):
 
 
 def _nnal_elementwise(X, T, prep):
-    """The shifted NNAL term by term: T * phi(X + log T) with phi(u) = exp(-u) - 1 + u, and exp(-X) where
-    T == 0. stable_nnal and _nnal_rowwise are reductions of this one tensor."""
+    """This function computes each term of the shifted non-negative attenuation loss (NNAL).
+
+    Where T > 0, the term is T * phi(X + log T), with phi(u) = exp(-u) - 1 + u.  Where T = 0, the
+    term is exp(-X).
+    """
     log_T, positive, all_positive = prep
     Xp = X + log_T
     loss = T * (torch.expm1(-Xp) + Xp)
     if not all_positive:
-        # T == 0 means Xp == X, so the zero-count term is exp(-Xp). It must be a
-        # real exp: expm1(-Xp) saturates at exactly -1 for Xp above ~37 in
-        # float64, so reconstructing it as expm1(-Xp) + 1 underflows to zero.
+        # Where T == 0, the term is exp(-Xp).  The form expm1(-Xp) + 1 underflows for large Xp.
         loss = torch.where(positive, loss, torch.exp(-Xp))
     return loss
 
 
 def stable_nnal(X, T, prep=None, dtype=None):
-    """The non-negative attenuation loss sum[exp(-X) + T X], shifted by a term that depends only on T.
+    """This function computes the non-negative attenuation loss sum[exp(-X) + T X], shifted by a
+    term that depends only on T.
 
-    Each term is written T phi(X + log T) with phi(u) = exp(-u) - 1 + u, so it is nonnegative and zero where
-    X = -log T, which keeps the sum accurate in float32; the shift does not change the minimizer.
+    Each term of the shifted loss is nonnegative, and it is zero where X = -log T.  This form
+    keeps the sum accurate in float32.  The shift does not change the minimizer.
 
     Args:
-        X: Attenuation estimate, broadcastable against T.
-        T: Measured transmission ratio (counts / open beam).
-        prep: Optional tuple from _nnal_prep(T). Pass it inside an iteration to
-            avoid recomputing log(T) on every call.
-        dtype: Accumulation dtype for the final sum. Defaults to X's dtype. Pass
-            torch.float64 when the value drives a convergence test: in float32 a
-            loss near 3e6 has a resolution of 0.25, so two consecutive losses that
-            differ by less than that compare equal and a relative-change test
-            fires spuriously.
+        X: (torch.Tensor) The attenuation estimate.  X must broadcast against T.
+        T: (torch.Tensor) The measured transmission ratio, counts divided by open beam.
+        prep: (tuple, optional) The output of ``_nnal_prep(T)``.  Passing it avoids recomputing
+            log(T).
+        dtype: (torch.dtype, optional) The dtype used to accumulate the sum.  The default is the
+            dtype of X.  Use float64 when the value is used in a convergence test.
 
     Returns:
         torch.Tensor: The loss summed over the last two axes.
@@ -57,23 +54,17 @@ def stable_nnal(X, T, prep=None, dtype=None):
 
 
 def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
-    """
-    Given X = W @ H, compute
+    """This function computes the first and second derivatives of the non-negative attenuation
+    loss L with respect to X = W @ H.
 
-        G = dL/dX = T - exp(-X)
-        Z = d^2L/dX^2 = exp(-X)
-
-    where L is the non-negative attenuation loss in a
-    numerically stable way that handles T = 0 appropriately.
+    The first derivative is G = dL/dX = T - exp(-X).  The second derivative is
+    Z = d^2L/dX^2 = exp(-X).  The function returns correct values where T = 0.
     """
     log_T, positive, all_positive = _nnal_prep(T) if prep is None else prep
 
     Xp = X + log_T
 
-    # Two transcendentals, not four: torch.where evaluates both of its branches,
-    # so the original form paid for four exponentials per call. expm1 is the
-    # accurate one near Xp = 0, where T - exp(-X) cancels; exp is the accurate
-    # one at large Xp, where expm1 saturates at -1 and expm1 + 1 underflows.
+    # expm1 is accurate near Xp = 0.  exp is used where T = 0, because expm1 + 1 underflows at large Xp.
     E = torch.expm1(-Xp)
     eXp = torch.exp(-Xp)
 
@@ -88,11 +79,9 @@ def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
 
 
 def _nnal_rowwise(X, T, prep, dim, dtype=None):
-    """NNAL summed over `dim` only: per-pixel (dim=1) or per-wavelength (dim=0).
+    """This function computes the non-negative attenuation loss summed over the axis ``dim``.
 
-    dtype is the accumulation dtype of the sum: pass float64 whenever the value
-    drives a line search or a stopping test, because the float32 ulp of a sum over
-    many pixels hides the improvement of a single H step (the float32 truncation
-    of the elementwise terms remains, and is what _ARMIJO_FLOOR accounts for).
+    Use dim=1 for the loss of each pixel and dim=0 for the loss of each wavelength.  The argument
+    ``dtype`` sets the dtype used to accumulate the sum.
     """
     return _nnal_elementwise(X, T, prep).sum(dim=dim, dtype=dtype)

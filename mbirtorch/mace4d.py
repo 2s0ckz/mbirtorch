@@ -1,14 +1,10 @@
-"""4D reconstruction of one continuous scan of a moving object.
+"""This module performs 4D reconstruction of one continuous scan of a moving object.
 
-The scan is divided into overlapping angular windows, one per time frame,
-and one volume is reconstructed per frame.  The volumes are held in one
-array of shape ``(frames, x, y, z)``.  :class:`MACE4DModel` computes them as
-the consensus of four agents.  The first agent is the proximal map of each
-frame's data-fit term.  The other three are qGGMRF denoisers, one for each
-pair of spatial axes, on the volumes that hold the frame axis and that pair.
-:func:`temporal_filter_matrix` builds the frame-axis filter that removes the
-modulation the overlapping windows produce, and :func:`apply_temporal_filter`
-applies it.
+The module divides the scan into overlapping angular windows, one for each time frame.  It
+reconstructs one volume for each frame.  :class:`MACE4DModel` holds the volumes in one array
+of shape ``(frames, x, y, z)``.  It computes them as the MACE consensus of a data-fit agent
+and three qGGMRF denoisers.  The overlapping windows produce a periodic modulation along the
+frame axis.  :func:`temporal_filter_matrix` builds a filter that removes this modulation.
 """
 
 import concurrent.futures
@@ -29,15 +25,14 @@ from .parameter_handler import ParameterHandler
 from .utilities import construct_time_frame_models
 from .vcd_utils import gen_set_of_pixel_partitions, named_rng, named_seed
 
-# Iterations and stop threshold of each denoiser sweep.  The threshold is tighter
-# than the 0.2 percent a standalone denoise uses.
+# The maximum iterations and the stop threshold of each denoiser call.
 _DENOISE_MAX_ITERATIONS = 15
 _DENOISE_STOP_THRESHOLD_PCT = 0.05
-# The filter is applied to the data-fit outputs in slabs of about this size.
+# The size in bytes of each slab when the filter is applied to the data-fit outputs.
 _FILTER_SLAB_BYTES = 64 * 2 ** 20
 
-# Each entry is the name of a hyperplane orientation and the spatial axis it
-# fixes, numbered in the (frames, x, y, z) order of the 4D array.
+# The name of each denoiser orientation and the spatial axis that it holds fixed.  The axis
+# index uses the order (frames, x, y, z).
 _ORIENTATIONS = [('XY-t', 3), ('YZ-t', 1), ('XZ-t', 2)]
 
 _TIMING_FIELDS = ['iteration', 'prox_total_sec', 'denoise_total_sec', 'makespan_sec',
@@ -47,31 +42,23 @@ _TASK_FIELDS = ['iteration', 'kind', 'index', 'part', 'worker', 'start_sec', 'en
 
 def temporal_filter_matrix(num_frames, period, harmonics=True, band_width=1):
     """
-    The matrix of the frame-axis filter that removes a periodic modulation.
-
-    A scan divided into overlapping angular windows produces a modulation
-    along the frame axis with a period equal to the number of frames per
-    rotation.  The filter zeroes the type-I discrete cosine modes at that
-    period and its harmonics, with ``band_width`` modes on each side.  It
-    acts along the frame axis alone, so it is one matrix of shape
-    ``(num_frames, num_frames)``.  Apply it with :func:`apply_temporal_filter`.
-
-    At a period of 6 and three frames the matrix is zero, so the filtered
-    array is zero.  The number of frames must be several times the period
-    before the filter leaves much variation along the frame axis.
+    This function returns the matrix of a filter along the frame axis that removes a periodic
+    modulation.  The filter sets to zero the type-I discrete cosine modes at the period and at
+    its harmonics.  It also sets to zero ``band_width`` modes on each side of each such mode.
+    Use :func:`apply_temporal_filter` to apply the filter.  The number of frames must be
+    several times the period, or the filter removes most of the variation along the frame axis.
 
     Args:
-        num_frames (int): number of frames, at least 2.
-        period (float): the main period of the modulation, in frames.
-        harmonics (bool or list of int, optional): True removes the main
-            period and every harmonic with a period of at least two frames;
-            False removes the main period only; a list names the harmonic
-            indices to remove.  Defaults to True.
-        band_width (int, optional): modes zeroed on each side of a removed
+        num_frames (int): The number of frames.  It must be at least 2.
+        period (float): The main period of the modulation, in frames.
+        harmonics (bool or list of int, optional): True removes the main period and every
+            harmonic with a period of at least two frames.  False removes only the main period.
+            A list gives the indices of the harmonics to remove.  Defaults to True.
+        band_width (int, optional): The number of modes set to zero on each side of a removed
             mode.  Defaults to 1.
 
     Returns:
-        torch.Tensor: the float32 matrix, on the CPU.
+        torch.Tensor: The float32 matrix of shape (num_frames, num_frames), on the CPU.
     """
     from scipy.fft import dct, idct
 
@@ -85,8 +72,6 @@ def temporal_filter_matrix(num_frames, period, harmonics=True, band_width=1):
     else:
         harmonic_list = list(harmonics)
 
-    # The filter is linear along the frame axis, so filtering the identity
-    # matrix column by column gives the matrix of the filter.
     coefficients = dct(np.eye(num_frames, dtype=np.float32), type=1, norm='ortho', axis=0)
     for harmonic in harmonic_list:
         removed_period = period / harmonic
@@ -101,17 +86,17 @@ def temporal_filter_matrix(num_frames, period, harmonics=True, band_width=1):
 
 def apply_temporal_filter(x, matrix, axis=0):
     """
-    Apply a frame-axis filter matrix along one axis of a tensor.
+    This function applies a filter matrix along one axis of a tensor.
 
     Args:
-        x (torch.Tensor): the array to filter.
-        matrix (torch.Tensor): a square matrix whose size is the length of
-            ``axis``, from :func:`temporal_filter_matrix`.  It is moved to the
-            device and dtype of ``x``.
-        axis (int, optional): the axis the matrix acts along.  Defaults to 0.
+        x (torch.Tensor): The array to filter.
+        matrix (torch.Tensor): A square matrix from :func:`temporal_filter_matrix`.  Its size
+            equals the length of ``axis``.  The function moves it to the device and dtype of
+            ``x``.
+        axis (int, optional): The axis along which the matrix acts.  Defaults to 0.
 
     Returns:
-        torch.Tensor: a new tensor of the shape of ``x``.
+        torch.Tensor: A new tensor with the shape of ``x``.
     """
     matrix = matrix.to(device=x.device, dtype=x.dtype)
     moved = x.movedim(axis, 0)
@@ -120,9 +105,11 @@ def apply_temporal_filter(x, matrix, axis=0):
 
 
 def _normalize_prior_weights(prior_weight):
-    """Return the four agent weights ``[forward, xyt, yzt, xzt]``.  A scalar
-    prior weight ``w`` gives ``[1 - w, w/3, w/3, w/3]``.  A list of three
-    gives ``[1 - sum, w1, w2, w3]``."""
+    """This function returns the four agent weights ``[forward, xyt, yzt, xzt]``.
+
+    A scalar prior weight ``w`` gives ``[1 - w, w/3, w/3, w/3]``.  A list of three prior
+    weights gives the last three entries.
+    """
     if isinstance(prior_weight, (list, tuple, np.ndarray)):
         prior = [float(w) for w in prior_weight]
         if len(prior) != 3:
@@ -136,7 +123,7 @@ def _normalize_prior_weights(prior_weight):
 
 
 def _write_run_info(path, run_settings):
-    """Write each run setting to ``path`` as one ``key = value`` line."""
+    """This function writes each run setting to ``path`` as one ``key = value`` line."""
     width = max(len(key) for key in run_settings)
     lines = ['# MACE4DModel run settings']
     lines += ['{:<{width}} = {}'.format(key, value, width=width)
@@ -146,9 +133,11 @@ def _write_run_info(path, run_settings):
 
 
 def _describe_filter(matrix, num_frames, period):
-    """Return one line saying which periods the filter removes and how many
-    modes of the frame axis it removes and keeps.  The filter is a
-    projection, so the number of modes it keeps is its trace."""
+    """This function returns one line of text that describes the filter.
+
+    The line lists the periods that the filter removes.  It also gives the number of modes
+    along the frame axis that the filter removes and keeps.
+    """
     harmonics = list(range(1, int(np.floor(period / 2)) + 1))
     periods = [period / h for h in harmonics]
     kept = int(round(float(matrix.trace())))
@@ -159,32 +148,24 @@ def _describe_filter(matrix, num_frames, period):
 
 
 def _permutation(axis):
-    """Return the axis order that puts ``axis`` first and the frame axis
+    """This function returns the axis order that puts ``axis`` first and the frame axis
     second."""
     return (axis,) + tuple(d for d in range(4) if d != axis)
 
 
 def _slab_batch_size(num_planes, volume_shape, slab_gb):
-    """Return the number of hyperplanes per denoiser task.
+    """This function returns the number of hyperplanes in each denoiser task.
 
-    A task sweeps one slab, which is a stack of hyperplane volumes, on one
-    device.  It holds a few arrays of the slab's size while it does so.  The
-    slab is sized by the byte budget ``slab_gb``, in units of 2**30 bytes.
-    The budget is fixed rather than read from the device, because the sweep
-    saturates a GPU well below this size and smaller slabs spread more evenly
-    over the pool.
-
-    The count is the largest that fits the budget, at most ``num_planes``.
-    The planes are then divided into equal slabs so that the padded last slab
-    is nearly full.
+    The function first finds the largest number of hyperplanes that fits in ``slab_gb`` GB.
+    It then divides the hyperplanes into slabs of nearly equal size.
 
     Args:
-        num_planes (int): the hyperplanes of the orientation.
-        volume_shape (tuple of int): the shape of one hyperplane volume.
-        slab_gb (float): the budget, in units of ``2 ** 30`` bytes.
+        num_planes (int): The number of hyperplanes in the orientation.
+        volume_shape (tuple of int): The shape of one hyperplane volume.
+        slab_gb (float): The memory limit of one slab, in units of ``2 ** 30`` bytes.
 
     Returns:
-        int: the hyperplanes per slab, between 1 and ``num_planes``.
+        int: The number of hyperplanes in each slab, between 1 and ``num_planes``.
     """
     num_planes = int(num_planes)
     volume_bytes = 4 * int(np.prod(volume_shape))
@@ -194,9 +175,10 @@ def _slab_batch_size(num_planes, volume_shape, slab_gb):
 
 
 def _centered_block(shape, num_frames, point_budget):
-    """Return the slices of a block centered in each axis of ``shape``.  The
-    block holds at most ``point_budget`` entries over ``num_frames``
-    frames."""
+    """This function returns the slices of a block centered in an array of shape ``shape``.
+
+    The block holds at most ``point_budget`` entries in total over ``num_frames`` frames.
+    """
     total = int(num_frames) * int(np.prod(shape))
     scale = 1.0 if total <= point_budget else (point_budget / total) ** (1.0 / len(shape))
     block = []
@@ -208,9 +190,11 @@ def _centered_block(shape, num_frames, point_budget):
 
 
 def _rms_neighbor_difference(values, support, axes):
-    """Return the root mean square of the difference between neighboring
-    entries along ``axes``, over the entries that ``support`` holds.  Returns
-    None when the support holds no such pair."""
+    """This function returns the RMS difference between neighboring entries along ``axes``
+    inside ``support``.
+
+    The function returns None when ``support`` contains no pair of neighbors.
+    """
     total, count = 0.0, 0
     for axis in axes:
         if values.shape[axis] < 2:
@@ -225,30 +209,23 @@ def _rms_neighbor_difference(values, support, axes):
 
 
 def _spread_along_time(image, chosen, sigma_noise, point_budget=5_000_000):
-    """Return the spread of the image along the frame axis against its spread
-    along the three spatial axes.
+    """This function compares the RMS difference between neighbors along the frame axis with
+    the RMS difference between neighbors along the three spatial axes.
 
-    Each spread is the root mean square of a neighbor difference over the
-    voxels that hold the object.  Their ratio says how much a voxel changes
-    between frames compared with how much it changes between adjacent voxels.
-    That is the quantity ``nbr_weight_time`` balances.
-
-    The ratio is read from the frames in ``chosen`` over a block centered in
-    the three spatial axes.  Those frames are evenly spaced, so when they lie
-    a stride apart the temporal difference is taken across that stride rather
-    than between adjacent frames.
+    The function reads only the frames in ``chosen`` and only the voxels of the object.
 
     Args:
-        image (tensor): the 4D image, of shape ``(frames, x, y, z)``.
-        chosen (numpy): the indices of the frames to read.
-        sigma_noise (float): the noise level, which sets the threshold that
-            separates the object from the background.
-        point_budget (int, optional): the most voxels to read per frame set.
+        image (tensor): The 4D image, of shape ``(frames, x, y, z)``.
+        chosen (numpy): The indices of the frames to read.
+        sigma_noise (float): The noise level.  It sets the threshold that separates the object
+            from the background.
+        point_budget (int, optional): The largest number of voxels to read over all chosen
+            frames.
 
     Returns:
-        dict: the ratio, the two spreads, the number of frames read, the
-        stride between them, and the shape of the block.  The ratio is None
-        when fewer than two frames are chosen or the object is not found.
+        dict: The ratio of the two RMS differences, the two RMS differences, the number of
+        frames read, the stride between them, and the shape of the block.  The ratio is None
+        when fewer than two frames are chosen or when the function does not find the object.
     """
     chosen = np.asarray(chosen, dtype=int).ravel()
     stride = int(chosen[1] - chosen[0]) if chosen.size > 1 else 1
@@ -266,13 +243,11 @@ def _spread_along_time(image, chosen, sigma_noise, point_budget=5_000_000):
 
 
 class _DataFitAgent:
-    """The proximal maps of every frame's data-fit term, as one agent of the
-    4D array.
+    """This class is used to apply the proximal maps of the data-fit terms of all frames.  The
+    class acts as one agent of the MACE reconstruction of the 4D array.
 
-    One :class:`ForwardProxAgent` per frame runs on the frame's device, and
-    each frame starts from its own previous output.  When the filter is on,
-    the agent's contribution to the consensus is the filter applied along the
-    frame axis to the stack of frame outputs.
+    Each frame has one :class:`ForwardProxAgent`, which runs on the device of that frame.  When
+    the temporal filter is on, the class applies the filter to the stack of outputs.
     """
 
     def __init__(self, frame_agents, frame_devices, init_stack, filter_matrix, keep_stack,
@@ -284,8 +259,7 @@ class _DataFitAgent:
         if not keep_stack:
             self._stack = None
         elif adopt_stack:
-            # The array is written in place from here on, so it is taken over
-            # only when no one else holds it.
+            # The class writes into init_stack in place from here on.
             self._stack = init_stack
         else:
             self._stack = init_stack.clone()
@@ -305,8 +279,6 @@ class _DataFitAgent:
         output = agent(w[t], iteration)
         if self._stack is not None:
             self._stack[t].copy_(output)
-            # The host stack holds the warm start, so the frame agent's
-            # device copy is released.
             agent._previous_output = None
         if self.fold_after_all:
             return None
@@ -336,29 +308,23 @@ class _DataFitAgent:
 
 class MACE4DModel(ParameterHandler):
     """
-    Space-time reconstruction of one continuous CT scan.
+    This class is used to compute a space-time reconstruction of one continuous CT scan.
 
-    The views are taken to be recorded in time order.  The scan is divided
-    into overlapping time frames, each a window of consecutive views, and
-    :meth:`recon` returns one volume per frame.  The constructor fixes the
-    frames; the reconstruction parameters are set with :meth:`set_params`.
-    The sinogram is passed to :meth:`recon`.  By default the reconstruction
-    applies a filter along the frame axis, which removes the periodic
-    modulation that the overlapping frames produce; when the frames are too
-    few for the filter it is turned off with a warning.
+    The class assumes that the views are in time order.  It divides the scan into overlapping
+    time frames of consecutive views.  :meth:`recon` returns one volume for each frame.  The
+    overlapping frames produce a periodic modulation along the frame axis.  By default, a
+    filter along the frame axis removes this modulation.
 
     Args:
-        ct_model (TomographyModel): the model of the full scan, a
-            ConeBeamModel or a ParallelBeamModel with one angle per view.
-        frames_per_rotation (int, optional): frames per full rotation.  This
-            is also the period of the temporal filter.  Defaults to 6.
-        frame_overlap_factor (float, optional): the number of frames that
-            cover any one view.  Each frame spans
-            ``frame_overlap_factor * 360 / frames_per_rotation`` degrees.
+        ct_model (TomographyModel): The model of the full scan.  It is a ConeBeamModel or a
+            ParallelBeamModel with one angle for each view.
+        frames_per_rotation (int, optional): The number of frames in each full rotation.  This
+            number is also the period of the temporal filter.  Defaults to 6.
+        frame_overlap_factor (float, optional): The number of frames that cover any one view.
+            Each frame spans ``frame_overlap_factor * 360 / frames_per_rotation`` degrees.
             Defaults to 2.0.
-        num_frames (int, optional): reconstruct only this many frames,
-            counted from the start of the scan.  Defaults to None, every
-            frame.
+        num_frames (int, optional): The number of frames to reconstruct, counted from the start
+            of the scan.  None means every frame.  Defaults to None.
 
     Example:
         >>> mace = mbirtorch.MACE4DModel(ct_model, frames_per_rotation=6)
@@ -395,70 +361,56 @@ class MACE4DModel(ParameterHandler):
         self._devices = None
 
     def refresh_device_bindings(self):
-        """Do nothing.  This model holds no projectors, and each frame model
-        refreshes its own."""
+        """This method does nothing, because this model holds no projectors."""
 
     def set_params(self, no_warning=False, no_compile=False, **kwargs):
         """
-        Set reconstruction parameters by keyword.
-
-        Parameters of the geometry and of the regularization belong to
-        ``ct_model``; set them there before constructing this model.
+        This method sets reconstruction parameters by keyword.  The geometry and regularization
+        parameters belong to ``ct_model``, so set them there.
 
         Args:
-            no_warning (bool, optional): disable the parameter-name check and
-                warnings.  Defaults to False.
-            no_compile (bool, optional): kept for the base class interface.
-            mace_prior_weight (float or list of 3 floats): the total weight of
-                the three priors, or one weight each for XY-t, YZ-t, and
-                XZ-t.  The data-fit agent gets the rest of 1.  Checked when
-                set.  Defaults to 0.5.
-            rho_mann (float): the step of the consensus iteration.  Defaults
-                to 0.5.
-            prox_num_iterations (int): iterations of each data-fit call.
+            no_warning (bool, optional): If True, the method does not check the parameter names
+                and does not warn.  Defaults to False.
+            no_compile (bool, optional): This argument has no effect.  It exists to match the
+                base class.
+            mace_prior_weight (float or list of 3 floats): The total weight of the three priors,
+                or one weight each for XY-t, YZ-t, and XZ-t.  The data-fit agent gets the
+                remainder of 1.  Defaults to 0.5.
+            rho_mann (float): The step size of the consensus iteration.  Defaults to 0.5.
+            prox_num_iterations (int): The number of iterations of each data-fit call.
                 Defaults to 3.
-            prox_stop_threshold (float): has no effect.  It is accepted so
-                that existing scripts that set it still run.  Defaults to
-                0.02.
-            prox_partition_advance (float): how many entries of the partition
-                sequence each data-fit call moves forward per iteration.
-                Defaults to 1.0.
-            prox_warm_start (bool): start each data-fit call from the frame's
-                previous output.  Defaults to True.
-            denoiser_warm_start (bool): start each denoiser sweep from its
-                previous output, at the cost of one full-size array per
-                orientation.  Defaults to False.
-            denoise_slab_gb (float): the size, in GB of ``2**30`` bytes, of
-                the stack of hyperplane volumes one denoiser task sweeps.
-                Each orientation is divided into slabs of at most this size,
-                and a task holds about three arrays of the slab's size on its
-                device.  Defaults to 2.0.
-            sigma_prox (float or None): the strength of every data-fit call.
-                None sets it from the data.  Defaults to None.
-            dejitter (bool): apply the temporal filter along the frame axis.
-                Defaults to True.
-            dejitter_verbose (int): log the periods the filter removes and
-                the modes it keeps.  Defaults to 0.
-            sigma_noise (float or None): the noise level of all three
-                denoisers.  None estimates it from the initial image.
-                Defaults to None.
-            sigma_x (float): the prior strength of all three denoisers.
-                Setting it disables the automatic estimate, as it does for
-                every model.  Defaults to the estimate.
-            sharpness (float): scales the automatic ``sigma_x``.  It scales
-                the denoisers alone; each frame's own prior takes its
-                sharpness from ``ct_model``.  Defaults to 0.
-            nbr_weight_time (float): the weight of a frame neighbor against a
-                spatial neighbor in the denoisers' priors.  The frame
-                direction appears in all three hyperplane volumes and each
-                spatial direction in two of them, so the default of 1.0 gives
-                a frame neighbor 1.5 times the weight of a spatial one, and
-                2/3 makes the two equal.  Defaults to 1.0.
-            verbose (int): 0 is silent, 1 reports progress.  Defaults to 1.
+            prox_stop_threshold (float): This parameter has no effect.  Defaults to 0.02.
+            prox_partition_advance (float): The number of entries of the partition sequence
+                that each data-fit call moves forward in each iteration.  Defaults to 1.0.
+            prox_warm_start (bool): If True, each data-fit call starts from the previous output
+                of its frame.  Defaults to True.
+            denoiser_warm_start (bool): If True, each denoiser call starts from its previous
+                output.  This option uses one more full-size array for each orientation.
+                Defaults to False.
+            denoise_slab_gb (float): The largest size of the stack of hyperplane volumes that
+                one denoiser task processes.  The size is in units of ``2**30`` bytes.  A task
+                holds about three arrays of that size.  Defaults to 2.0.
+            sigma_prox (float or None): The strength of every data-fit call.  None sets it from
+                the data.  Defaults to None.
+            dejitter (bool): If True, the method applies the temporal filter along the frame
+                axis.  Defaults to True.
+            dejitter_verbose (int): If nonzero, the method logs the periods that the filter
+                removes and the modes that it keeps.  Defaults to 0.
+            sigma_noise (float or None): The noise level of all three denoisers.  None
+                estimates it from the initial image.  Defaults to None.
+            sigma_x (float): The prior strength of all three denoisers.  Setting it turns off
+                the automatic estimate.  Defaults to the automatic estimate.
+            sharpness (float): This value scales the automatic ``sigma_x`` of the denoisers.
+                The prior of each frame takes its sharpness from ``ct_model``.  Defaults to 0.
+            nbr_weight_time (float): The weight of a neighbor in time relative to a spatial
+                neighbor in the priors of the denoisers.  The default of 1.0 gives a neighbor
+                in time 1.5 times the weight of a spatial neighbor.  The value 2/3 makes the
+                two weights equal.  Defaults to 1.0.
+            verbose (int): The value 0 prints nothing, and 1 reports progress.  Defaults to 1.
 
         Raises:
-            ValueError: if ``qggmrf_nbr_wts`` is set, in which case use
-                ``nbr_weight_time``, or if ``denoise_slab_gb`` is not positive.
+            ValueError: If ``qggmrf_nbr_wts`` is set, or if ``denoise_slab_gb`` is not positive.
+                Use ``nbr_weight_time`` in place of ``qggmrf_nbr_wts``.
 
         Example:
             >>> mace.set_params(mace_prior_weight=0.5, rho_mann=0.5, dejitter=True)
@@ -476,8 +428,6 @@ class MACE4DModel(ParameterHandler):
                 'direction means the same thing in all three volumes.  Set '
                 'nbr_weight_time instead, which weights a frame neighbor against a '
                 'spatial neighbor.')
-        # This model runs no reconstruction of its own, so setting sigma_prox does
-        # not disable an auto-regularization.
         sigma_prox_given = 'sigma_prox' in kwargs
         sigma_prox = kwargs.pop('sigma_prox', None)
         if sigma_prox_given:
@@ -487,23 +437,18 @@ class MACE4DModel(ParameterHandler):
 
     def set_device_pool(self, devices=None):
         """
-        Set the devices :meth:`recon` spreads its work over.
-
-        Each frame's data-fit task runs on one device of the pool, assigned
-        round robin, and any device takes the denoising tasks.  The pool
-        takes effect at the next :meth:`recon` call.
+        This method sets the devices that :meth:`recon` uses, starting with the next call to
+        :meth:`recon`.  The method assigns the data-fit tasks of the frames to the devices in
+        turn.  Any device can run the denoising tasks.
 
         Args:
-            devices (optional): None for every GPU or the CPU; ``'cpu'`` or
-                ``'gpu'``; a count of devices; a list of device indices; or a
-                list of devices, one worker per entry.  The CPU may be
-                repeated; a repeated GPU is refused.  None and a count are
-                capped by the count ``MBIRTORCH_NUM_DEVICES`` pins.  See
-                ``mbirtorch.mace.resolve_device_pool``.
+            devices (optional): Any value that ``mbirtorch.mace.resolve_device_pool`` accepts.
+                The value can be None for every GPU or else the CPU, ``'cpu'``, ``'gpu'``, a
+                device count, a list of device indices, or a list of devices.
 
         Raises:
-            ValueError: if the pool names a GPU more than once, or if a
-                requested count exceeds the devices available.
+            ValueError: If the list names a GPU more than once, or if the requested count is
+                larger than the number of available devices.
 
         Example:
             >>> mace.set_device_pool(2)
@@ -512,66 +457,60 @@ class MACE4DModel(ParameterHandler):
 
     @property
     def devices(self):
-        """The device pool.  When no pool has been set, this is the default pool."""
+        """This property returns the list of devices that :meth:`recon` uses.
+
+        If no devices have been set, the property returns the default list.
+        """
         return list(self._devices) if self._devices is not None else resolve_device_pool(None)
 
     def recon(self, sinogram, weights=None, init_recon=None, max_iterations=10,
               stop_threshold_change_pct=0.2, init_dir=None, log_dir=None, seed=None):
         """
-        Reconstruct one volume per time frame from the sinogram of the scan.
+        This method reconstructs one volume for each time frame from the sinogram of the scan.
 
         Args:
-            sinogram (numpy or tensor): the full sinogram, of shape
+            sinogram (numpy or tensor): The full sinogram, of shape
                 ``(num_views, num_det_rows, num_det_channels)``.
-            weights (numpy or tensor, optional): positive weights of the
-                sinogram's shape.  Defaults to None, unit weights.
-            init_recon (numpy, optional): the initial 4D image, of shape
-                ``(num_frames,) + recon_shape``.  Defaults to None.  The
-                image is then read from ``init_dir`` when one is there, and
-                is otherwise computed by a direct reconstruction of each
-                frame alone (FDK for cone beam, FBP for parallel beam).
-            max_iterations (int, optional): consensus iterations.  Defaults
-                to 10.
-            stop_threshold_change_pct (float, optional): stop when the percent
-                change of the consensus image in one iteration falls below
-                this.  0 runs every iteration.  Defaults to 0.2.
-            init_dir (str, optional): directory of the cached initial image
-                ``init_recon.npy``, read when present and written otherwise.
-                Defaults to None, no cache.
-            log_dir (str, optional): directory for ``run_info.txt``,
-                ``timing_log.csv``, and ``task_log.csv``.  Defaults to None,
-                no log files.
-            seed (int, optional): the seed every random draw of the run is
-                derived from, so that two runs of one seed on one pool of
-                devices agree to float rounding whatever the workers do.
-                Defaults to None, which draws one from the global np.random
-                state at the start of the call, so ``np.random.seed(k)``
-                before this call fixes the run.  The seed used is recorded in
-                the run settings.
+            weights (numpy or tensor, optional): Positive weights with the shape of the
+                sinogram.  None means that all weights are one.  Defaults to None.
+            init_recon (numpy, optional): The initial 4D image, of shape
+                ``(num_frames,) + recon_shape``.  If it is None, the method reads the image from
+                ``init_dir`` when the file exists.  Otherwise, the method computes a direct
+                reconstruction of each frame.  Defaults to None.
+            max_iterations (int, optional): The number of consensus iterations.  Defaults to 10.
+            stop_threshold_change_pct (float, optional): The method stops when the percent
+                change of the consensus image in one iteration falls below this value.  The
+                value 0 runs every iteration.  Defaults to 0.2.
+            init_dir (str, optional): The directory of the cached initial image
+                ``init_recon.npy``.  The method reads the file when it exists and writes it
+                otherwise.  None means no cache.  Defaults to None.
+            log_dir (str, optional): The directory for ``run_info.txt``, ``timing_log.csv``,
+                and ``task_log.csv``.  None means no log files.  Defaults to None.
+            seed (int, optional): The seed of every random draw in the run.  Two runs with the
+                same seed on the same devices agree up to float rounding.  None means that the
+                method draws a seed from the global np.random state.  Defaults to None.
 
         Returns:
-            (recon, recon_dict): the 4D reconstruction as a numpy array of
-            shape ``(num_frames,) + recon_shape``, and a dict with the run
-            settings under ``'recon_params'``, the per-iteration timing under
-            ``'timing'``, a completion time under ``'notes'``, and a copy of
-            the model's parameters under ``'model_params'``.
+            (recon, recon_dict): recon is the 4D reconstruction, a numpy array of shape
+            ``(num_frames,) + recon_shape``.  recon_dict is a dict with these entries: the run
+            settings under ``'recon_params'``, the timing of each iteration under
+            ``'timing'``, the completion time under ``'notes'``, and a copy of the model
+            parameters under ``'model_params'``.
 
         Raises:
-            ValueError: if ``sinogram``, ``weights``, or ``init_recon`` has
-                the wrong shape, or if the initial image is constant so that
-                no denoiser noise level can be estimated.
+            ValueError: If ``sinogram``, ``weights``, or ``init_recon`` has the wrong shape.
+                The method also raises ValueError if the initial image is constant, because
+                then it cannot estimate the noise level of the denoisers.
 
         Warns:
-            UserWarning: if the temporal filter is on but the frames are too
-                few for it, fewer than ``frames_per_rotation``, in which case
-                the run proceeds with the filter off and the run settings
-                say so.
+            UserWarning: If the temporal filter is on but there are fewer frames than
+                ``frames_per_rotation``.  The run then continues with the filter off.
 
         Example:
             >>> recon_4d, recon_dict = mace.recon(sinogram, weights=weights, log_dir='./logs')
         """
-        # Every draw of the run comes from this seed, and this is the one draw
-        # the run makes from the global state.
+        # This line is the only draw from the global random state.  Every other draw comes
+        # from this seed.
         seed = int(np.random.randint(1 << 31)) if seed is None else int(seed)
         num_frames = self.num_frames
         beta = _normalize_prior_weights(self.get_params('mace_prior_weight'))
@@ -584,15 +523,14 @@ class MACE4DModel(ParameterHandler):
         sinogram = self._validate_sinogram(sinogram, 'sinogram')
         if weights is not None:
             weights = self._validate_sinogram(weights, 'weights')
-        # An initial image the caller supplies stays the caller's.  One that
-        # recon reads or computes belongs to recon and may be written.
+        # The method does not write into an initial image that the caller supplied.
         init_is_own = init_recon is None
         if init_recon is not None:
             init_recon = self._validate_init_recon(init_recon)
             init_source = 'provided by caller'
 
-        # The filter is turned off when the frame count is below the period, or when
-        # the matrix would remove every mode and zero the whole reconstruction.
+        # The filter is turned off when there are fewer frames than the period, or when the
+        # filter would remove every mode.
         filter_matrix = None
         dejitter_note = None
         if dejitter:
@@ -666,8 +604,8 @@ class MACE4DModel(ParameterHandler):
         counts_lock = threading.Lock()
         priors = []
         batch_sizes = []
-        # The denoisers receive filtered inputs when the filter is on, so
-        # their strength is set from the filtered initial image.
+        # When the filter is on, the denoiser strength is computed from the filtered initial
+        # image.
         image_for_statistics = (x0 if filter_matrix is None
                                 else apply_temporal_filter(x0, filter_matrix, axis=0))
         sigma_x, sigma_x_source, spread = self._denoiser_sigma_x(
@@ -708,8 +646,6 @@ class MACE4DModel(ParameterHandler):
 
         timing_rows = []
         loop = MACE([data_fit] + priors, x0, mu=beta, rho=rho_mann, devices=pool)
-        # The loop holds its own copies, so the initial image is released
-        # here.
         del x0, init_recon
 
         def after_step(iteration, x_bar):
@@ -750,8 +686,7 @@ class MACE4DModel(ParameterHandler):
             x_bar, _ = loop.run(max_iterations=max_iterations,
                                 stop_threshold_change_pct=stop_threshold_change_pct,
                                 callback=after_step)
-        # The result shares storage with the loop's average buffer.  The loop
-        # is not used after this call returns.
+        # x_bar shares storage with the average buffer of the MACE loop.
         result = x_bar.cpu().numpy()
         if verbose:
             self.logger.info('[MACE] Reconstruction complete.')
@@ -768,12 +703,9 @@ class MACE4DModel(ParameterHandler):
         return result, recon_dict
 
     def _prior_params(self):
-        """Return the qGGMRF parameters given to every denoiser.
+        """This method returns the qGGMRF parameters of every denoiser.
 
-        ``sharpness`` is not among them.  Setting it on a denoiser would turn
-        that denoiser's own automatic regularization back on.  The frame axis
-        is the row axis of every hyperplane volume, so ``nbr_weight_time`` is
-        the first neighbor weight.
+        The frame axis is the row axis of every hyperplane volume.
         """
         p, q, T = self.get_params(['p', 'q', 'T'])
         nbr_weight_time = float(self.get_params('nbr_weight_time'))
@@ -781,14 +713,11 @@ class MACE4DModel(ParameterHandler):
                     qggmrf_nbr_wts=[nbr_weight_time, 1.0, 1.0])
 
     def _denoiser_sigma_x(self, image, global_sigma, device):
-        """Return the prior strength of all three denoisers, where it came
-        from, and the spread of the image along time against space.
+        """This method returns the prior strength ``sigma_x`` that all three denoisers share.
 
-        One strength is used for the whole 4D volume, because the three
-        hyperplane priors add up to one 4D prior only when they share it.  It
-        is estimated from the image as a stack of frames, so that every
-        neighbor difference the estimate reads lies inside one frame.
-        Setting ``sigma_x`` disables the estimate.
+        The method also returns a description of where ``sigma_x`` came from.  Third, the method
+        returns the result of ``_spread_along_time``.  That result compares the variation of
+        the image in time with the variation of the image in space.
         """
         num_frames = int(image.shape[0])
         frame_shape = tuple(int(n) for n in image.shape[1:])
@@ -805,18 +734,11 @@ class MACE4DModel(ParameterHandler):
         return (float(regularization['sigma_x']), 'estimated from the initial image', spread)
 
     def _configure_orientation(self, axis, x0, sigma, sigma_x, rng=None):
-        """Return the volume shape, the denoiser parameters, the batch size,
-        and the pixel partition of one orientation.
-
-        Every orientation is given the same noise level and the same prior
-        strength, so that the three priors add up to one 4D prior.  The batch
-        size comes from :func:`_slab_batch_size`.  The partition is drawn once
-        here and used by every denoiser of the orientation, so that a slab
-        gives the same result on whichever worker takes it.
+        """This method returns the volume shape, the denoiser parameters, the batch size, and
+        the pixel partition of one orientation.
         """
         image_shape = tuple(int(x0.shape[d]) for d in _permutation(axis)[1:])
-        # A subset with fewer than about 64 pixels makes the line search
-        # compute zero over zero on flat regions.
+        # With fewer than about 64 pixels in a subset, the line search divides zero by zero.
         num_pixels = image_shape[0] * image_shape[1]
         default_subsets = int(QGGMRFDenoiser(image_shape).get_params('granularity')[0])
         num_subsets = max(1, min(default_subsets, num_pixels // 64))
@@ -832,23 +754,24 @@ class MACE4DModel(ParameterHandler):
     @staticmethod
     def _stack_denoiser_factory(image_shape, params, sigma, batch_size, partition,
                                 iteration_counts, lock):
-        """Return a ``make_stack_denoiser(device)`` for
-        :class:`HyperplaneAgent`.  Each denoiser it returns is pinned to its
-        device, uses the given parameters and the given pixel partition,
-        sweeps every slab at ``batch_size`` volumes, and records the iteration
-        count of every volume it sweeps."""
+        """This method returns a function ``make_stack_denoiser(device)`` for
+        :class:`HyperplaneAgent`.
+
+        That function builds a denoiser on ``device`` and returns a function that denoises a
+        stack of hyperplane volumes.
+        """
         def make_stack_denoiser(device):
             denoiser = QGGMRFDenoiser(image_shape)
             denoiser.configure_devices(devices=[device])
             denoiser.set_params(no_warning=True, verbose=0, **params)
-            # The parameters are set and the automatic regularization is off,
-            # so nothing here needs an image.
             denoiser.initialize_denoiser(partition=partition)
 
             def padded(stack, count):
-                """Return the stack with its last volume repeated up to
-                ``count`` volumes.  A short last slab is then swept at the
-                shape of the others, so no second variant is compiled."""
+                """This function pads the stack to ``count`` volumes by repeating its last
+                volume.
+
+                With this padding, a short last slab does not need a second compiled version.
+                """
                 short = count - int(stack.shape[0])
                 if short <= 0:
                     return stack
@@ -857,8 +780,7 @@ class MACE4DModel(ParameterHandler):
             def denoise(stack, init_stack=None):
                 real = int(stack.shape[0])
                 count = real if batch_size is None else max(int(batch_size), real)
-                # The agent hands over its own copies of the slab, and nothing reads
-                # them again, so the sweep writes them in place.
+                # The slab is a copy that nothing reads again, so the denoiser overwrites it.
                 out, info = denoiser.denoise_stack(
                     padded(stack, count), sigma_noise=sigma,
                     init_stack=None if init_stack is None else padded(init_stack, count),
@@ -874,8 +796,7 @@ class MACE4DModel(ParameterHandler):
 
     @staticmethod
     def _estimate_global_sigma(init_recon, device):
-        """Return the noise level used by all three denoisers, estimated from
-        the initial image."""
+        """This method estimates the noise level of the denoisers from the initial image."""
         init_recon = np.asarray(init_recon, dtype=np.float32)
         image_3d = init_recon.reshape(-1, init_recon.shape[2], init_recon.shape[3])
         denoiser = QGGMRFDenoiser(image_3d.shape)
@@ -883,9 +804,12 @@ class MACE4DModel(ParameterHandler):
         return float(denoiser.estimate_image_noise_std(image_3d))
 
     def _compute_init_recon(self, frame_agents, pool, init_dir):
-        """Reconstruct each frame alone with a direct reconstruction, on the
-        frame's device, with the sinograms the frame agents already placed,
-        and cache the result.  The weights are not used."""
+        """This method computes a direct reconstruction of each frame on the device of that
+        frame.
+
+        The method does not use the weights.  When ``init_dir`` is given, the method saves the
+        result there.
+        """
         verbose = self.get_params('verbose')
         if verbose:
             self.logger.info(f'[MACE] Computing the initial reconstruction on {len(pool)} worker(s)...')
@@ -898,8 +822,7 @@ class MACE4DModel(ParameterHandler):
                 volume = agent.model.recon_direct(agent.sinogram)
                 volumes[t] = np.asarray(volume, dtype=np.float32)
 
-        # Frames are grouped by pool entry, as the loop's workers are, so
-        # that the frames of one worker run one after another on one thread.
+        # The frames of one device run one after another on one thread.
         by_worker = {}
         for t in range(self.num_frames):
             by_worker.setdefault(t % len(pool), []).append(t)
@@ -919,9 +842,11 @@ class MACE4DModel(ParameterHandler):
         return init_recon
 
     def _load_cached_init(self, init_dir):
-        """Return the image in ``init_dir/init_recon.npy``, or None when the
-        file is missing.  When the file cannot be loaded or has the wrong
-        shape, a warning is issued and the result is None."""
+        """This method returns the image in ``init_dir/init_recon.npy``.
+
+        If the file is missing, the method returns None.  If the file is not valid, the method
+        warns and returns None.
+        """
         path = os.path.join(init_dir, 'init_recon.npy')
         if not os.path.isfile(path):
             return None
@@ -935,8 +860,10 @@ class MACE4DModel(ParameterHandler):
         return init_recon
 
     def _validate_sinogram(self, sinogram, name):
-        """Return the array unchanged.  Raises ValueError when its shape is
-        not the sinogram shape."""
+        """This method checks the shape of the array and returns the array unchanged.
+
+        The method raises ValueError when the shape of the array is not the sinogram shape.
+        """
         if not torch.is_tensor(sinogram):
             sinogram = np.asarray(sinogram)
         shape = tuple(int(n) for n in sinogram.shape)
@@ -949,8 +876,10 @@ class MACE4DModel(ParameterHandler):
         return (self.num_frames,) + self.recon_shape
 
     def _validate_init_recon(self, init_recon):
-        """Return the initial image as float32 numpy.  Raises ValueError on a
-        wrong shape."""
+        """This method returns the initial image as a float32 numpy array.
+
+        The method raises ValueError when the image has the wrong shape.
+        """
         init_recon = np.asarray(init_recon, dtype=np.float32)
         expected = self._expected_init_shape()
         if init_recon.shape != expected:
@@ -960,8 +889,7 @@ class MACE4DModel(ParameterHandler):
     def _run_settings(self, pool, init_source, global_sigma, sigma_source, weights,
                       max_iterations, stop_threshold_change_pct, sigma_x, sigma_x_source,
                       spread, batch_sizes, seed):
-        """Return the settings of a run, for ``run_info.txt`` and the result
-        dict."""
+        """This method returns the settings of a run."""
         from . import __version__
         beta = _normalize_prior_weights(self.get_params('mace_prior_weight'))
         sigma_prox = self.get_params('sigma_prox')

@@ -1,12 +1,8 @@
-"""The host thread count torch uses, against the cores the process may run on.
+"""This module compares the number of CPU threads torch uses with the number of available cores.
 
-Every host tensor operation in this package runs on torch's intra-op
-threads: the consensus folds of the MACE loops, CPU reconstructions, the
-denoiser statistics, the preprocessing, and the host side of every copy
-from a device.  Torch takes the count from ``OMP_NUM_THREADS`` and
-``MKL_NUM_THREADS`` at import, and honors the smaller of the two.  A shell
-or a cluster module that sets them to one leaves every such operation on
-one core, however many the allocation holds.
+Torch runs every CPU tensor operation in this package on its intra-op threads.  Torch reads the
+thread count from ``OMP_NUM_THREADS`` and ``MKL_NUM_THREADS`` at import and uses the smaller of
+the two.  If either variable is set to one, every CPU tensor operation runs on one core.
 """
 
 import os
@@ -18,9 +14,9 @@ THREAD_VARIABLES = ('OMP_NUM_THREADS', 'MKL_NUM_THREADS')
 
 
 def available_cores():
-    """Return the number of cores this process may run on: the affinity mask
-    where the platform reports one, which respects a scheduler's allocation,
-    and the machine's count otherwise."""
+    """This function returns the number of cores this process may run on.  It uses the
+    CPU affinity mask when the platform reports one, so it respects a job scheduler's
+    allocation.  Otherwise it returns the machine's core count."""
     try:
         return len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
@@ -28,17 +24,16 @@ def available_cores():
 
 
 def host_thread_report():
-    """Return ``(threads, cores, variables)``: torch's intra-op thread count,
-    the cores available, and the thread variables set in the environment as
-    a dict."""
+    """This function returns the tuple ``(threads, cores, variables)``.  The values are
+    torch's intra-op thread count, the number of available cores, and a dict of the
+    thread variables set in the environment."""
     variables = {name: os.environ[name] for name in THREAD_VARIABLES if name in os.environ}
     return torch.get_num_threads(), available_cores(), variables
 
 
 def warn_if_threads_unused():
-    """Warn once when torch runs on one host thread while more cores are
-    available.  Returns the warning text, or None when there is nothing to
-    say."""
+    """This function issues a warning when torch uses one CPU thread and more cores
+    are available.  It returns the warning text, or None when it issues no warning."""
     threads, cores, variables = host_thread_report()
     if threads > 1 or cores <= 1:
         return None

@@ -1,17 +1,9 @@
-"""Interactive multi-volume slice viewer.
+"""This module provides an interactive multi-volume slice viewer.
 
-This module is package-independent by design: it imports numpy, matplotlib,
-and (lazily, only for HDF5 file access) h5py, and nothing else.  A host
-package wraps the public entry point to supply its own conversions -- a
-tensor-to-numpy shim, serialization of rich data dicts to plain-string dicts,
-and an optional HDF5 save function -- so the identical file can serve any
-host package.
-
-The module has two layers.  ``VolumeStack`` is the pure-numpy data model:
-volumes, axis permutations, slice positions, intensity range, difference
-images, ROI statistics, and file loading.  The matplotlib view/controller
-(``SliceViewer`` and the ``slice_viewer`` entry point) sits on top of it and
-holds no data logic of its own.
+``VolumeStack`` holds the volumes and the display state as numpy arrays.  ``SliceViewer``
+displays them with matplotlib.  The module imports numpy and matplotlib.  It imports h5py only
+to read and write files.  A package that uses this viewer wraps ``slice_viewer`` to convert its
+own tensors and data dicts.
 """
 
 import enum
@@ -21,14 +13,14 @@ import time
 import warnings
 
 import numpy as np
-import matplotlib  # base package only; no GUI toolkit is touched at import
+import matplotlib  # Only the base package.  Import does not load a GUI toolkit.
 
 __all__ = ['SliceViewer', 'VolumeStack', 'slice_viewer']
 
-# Shape of the placeholder volume shown for a dataset passed as None.
+# The shape of the placeholder volume shown for a dataset passed as None.
 PLACEHOLDER_SHAPE = (20, 20, 20)
 
-# --- appearance constants ---
+# --- Appearance constants ---
 TOOLTIP_FONT_SIZE = 9
 TOOLTIP_BOX_ALPHA = 0.9
 TOOLTIP_OFFSET = (10, 10)
@@ -52,19 +44,19 @@ DIALOG_PAGE_LINES = 30
 
 ROI_STATS_THROTTLE_S = 0.3
 
-# These backends have no interactive window.  show() warns and returns.
+# These backends have no interactive window.  On these backends, show() warns and returns.
 NONINTERACTIVE_BACKENDS = {'agg', 'pdf', 'ps', 'svg', 'template', 'cairo'}
 
-# The partial redraw path is verified on these backends only.  The macosx backend
-# reports blit support but repaints the whole window on each blit.
+# The viewer redraws only the changed regions on these backends.  The macosx backend
+# reports blit support, but it repaints the whole window on each blit.
 BLIT_BACKENDS = {'agg', 'tkagg'}
 
-# Extensions offered by the file-load browser (save always writes .h5).
+# The file extensions that the file-load browser offers.  Save always writes .h5.
 FILE_EXTENSIONS = ('.npy', '.npz', '.h5', '.hdf5')
 FILE_DIALOG_ROWS = 11
 
-# The native-dialog chain returns this when no native file dialog can run.
-# The caller then falls back to the in-figure browser.
+# The native file dialog functions return this value when no native dialog can run.
+# The caller then uses the file browser inside the figure.
 _NATIVE_UNAVAILABLE = object()
 
 
@@ -73,7 +65,8 @@ def multiline(*lines):
 
 
 class Mode(enum.Enum):
-    """Interaction mode for the controller; exactly one is active at a time."""
+    """This class is used to list the interaction modes of the viewer.  Exactly one mode is active
+    at a time."""
     IDLE = enum.auto()
     DRAW_ROI = enum.auto()
     MOVE_ROI = enum.auto()
@@ -81,8 +74,8 @@ class Mode(enum.Enum):
     SELECT_COMPARISON = enum.auto()
 
 
-# Populated by _load_pyplot on first viewer construction, so that importing
-# this module never resolves a matplotlib backend or touches a GUI toolkit.
+# _load_pyplot sets these names when the first viewer is constructed.  For this reason,
+# importing this module does not choose a matplotlib backend or load a GUI toolkit.
 plt = None
 gridspec = None
 make_axes_locatable = None
@@ -93,7 +86,7 @@ IdentityTransform = None
 
 
 def _load_pyplot():
-    """Import pyplot and the widget classes on first use."""
+    """This function imports pyplot and the widget classes the first time it is called."""
     global plt, gridspec, make_axes_locatable, Slider, RangeSlider, \
         RadioButtons, Button, TextBox, Bbox, Rectangle, IdentityTransform
     if plt is not None:
@@ -117,39 +110,25 @@ def _load_pyplot():
 
 
 class VolumeStack:
-    """Pure-numpy data model for the slice viewer.
+    """This class is used to hold the volumes and the display state of the slice viewer.
 
-    Holds one or more 3D volumes together with the state the viewer displays:
-    per-volume axis permutations, a shared master slice position with
-    proportional per-volume mapping, a shared display intensity range,
-    difference-image state, and per-volume labels and data dicts.  The class
-    imports no GUI code, so every behavior is unit-testable headlessly.
-
-    Contract notes:
-        - ``datasets`` entries are numpy-convertible 2D or 3D arrays, or None
-          (None becomes a placeholder zero volume).  Conversion from framework
-          tensors happens in the host package's wrapper, not here.
-        - ``data_dicts`` entries are dicts whose values are strings.  Any
-          serialization from richer structures happens in the wrapper before
-          construction.
-        - Default ``vmin``/``vmax`` scan every voxel of every volume once at
-          construction; pass explicit values to skip the scan for very large
-          volumes.
+    The class uses only numpy and imports no GUI code.  The display state includes the axis
+    permutation of each volume, the shared slice position, the intensity range, the difference
+    images, and the data dicts.  The shared slice position is scaled to the depth of each volume.
+    If the caller passes both ``vmin`` and ``vmax``, the class does not need to scan every voxel.
 
     Args:
-        datasets (sequence of ndarray or None): One or more 2D or 3D arrays.
-            2D arrays are promoted to 3D via a trailing singleton axis.
-        data_dicts (None, dict, or list of dict/None, optional): String-valued
-            dict(s) associated with the volumes.  A bare dict is accepted only
-            for a single volume; otherwise the list length must match.
-        vmin (float, optional): Display minimum.  Defaults to the global
-            minimum across all volumes.
-        vmax (float, optional): Display maximum.  Defaults to the global
-            maximum across all volumes.
-        slice_label (str or list of str, optional): Label(s) for the slice
-            title.  Defaults to "Slice".
-        slice_axis (int or list of int, optional): Axis to slice along (0, 1,
-            or 2) for all volumes or per volume.  Defaults to 2.
+        datasets (sequence of ndarray or None): One or more 2D or 3D arrays.  A 2D array
+            gets a third axis of length 1.  A None entry becomes a placeholder volume of zeros.
+        data_dicts (None, dict, or list of dict/None, optional): The dicts of strings that go
+            with the volumes.  A single dict is accepted only for a single volume.  Otherwise,
+            the list must have one entry for each volume.
+        vmin (float, optional): The display minimum.  Defaults to the minimum over all volumes.
+        vmax (float, optional): The display maximum.  Defaults to the maximum over all volumes.
+        slice_label (str or list of str, optional): The label or labels for the slice title.
+            Defaults to "Slice".
+        slice_axis (int or list of int, optional): The axis to slice along (0, 1, or 2).  It can
+            be one value for all volumes or a list with one value for each volume.  Defaults to 2.
     """
 
     def __init__(self, datasets, data_dicts=None, vmin=None, vmax=None,
@@ -163,8 +142,8 @@ class VolumeStack:
         self.labels = self._normalize_labels(slice_label)
         self.data_dicts = self._normalize_data_dicts(data_dicts)
 
-        # original_data holds each volume in the axis order it was passed in.  data
-        # holds the permuted view that is displayed, with the slice axis last.
+        # original_data holds each volume in the axis order of the input.  data holds the
+        # permuted view that is displayed, with the slice axis last.
         self.original_data = []
         self.data = []
         for i, dataset in enumerate(datasets):
@@ -178,12 +157,12 @@ class VolumeStack:
             self.original_data.append(dataset)
             self.data.append(np.transpose(dataset, self.axes_perms[i]))
 
-        # Difference-image state: None, or a dict with keys
-        # 'comparison_index', 'use_abs', 'prev_label'.
+        # Each entry is None, or a dict for a difference image with the keys
+        # 'comparison_index', 'use_abs', and 'prev_label'.
         self._difference_info = [None] * self.n_volumes
 
-        # Each volume opens at its own midpoint, and the shared slider starts at
-        # volume 0's midpoint.
+        # Each volume opens at its own middle slice.  The shared slider starts at the
+        # middle slice of volume 0.
         self.cur_slices = [d.shape[2] // 2 for d in self.data]
         self.master_index = self.cur_slices[0]
 
@@ -193,10 +172,10 @@ class VolumeStack:
 
     @staticmethod
     def perm_from_slice_axis(slice_axis):
-        """Return the display permutation for a slice axis.
+        """This method returns the display permutation for a slice axis.
 
-        The permutation lists the two in-plane axes in ascending order
-        followed by the slice axis, e.g. axis 0 -> [1, 2, 0].
+        The permutation lists the two in-plane axes in increasing order and then the slice
+        axis.  For example, slice axis 0 gives [1, 2, 0].
         """
         slice_axis = int(slice_axis)
         if slice_axis not in (0, 1, 2):
@@ -238,38 +217,45 @@ class VolumeStack:
                 "same length as the number of datasets")
         return data_dicts
 
-    # --- Slice position: master index with proportional per-volume mapping ---
+    # --- Slice position ---
+    # The master index is the shared slice position.  Each volume shows the slice at the
+    # same fraction of its own depth.
 
     @property
     def max_slices(self):
-        """Depth of the deepest volume in display orientation."""
+        """This property is the largest depth of any volume in display orientation."""
         return max(d.shape[2] for d in self.data)
 
     @property
     def slice_counts(self):
-        """Per-volume displayed depth."""
+        """This property is the list of the displayed depths of the volumes."""
         return [d.shape[2] for d in self.data]
 
     @property
     def slice_axes(self):
-        """Per-volume slice axis (the last entry of each permutation)."""
+        """This property is the list of the slice axes of the volumes.
+
+        The slice axis of a volume is the last entry of its permutation.
+        """
         return [perm[-1] for perm in self.axes_perms]
 
     @property
     def master_fraction(self):
-        """Master position as a fraction of the deepest volume, in [0, 1]."""
+        """This property is the master index as a fraction of the largest depth.
+
+        The fraction is in [0, 1].
+        """
         if self.max_slices > 1:
             return self.master_index / (self.max_slices - 1)
         return 0.0
 
     def set_master_index(self, index):
-        """Set the shared slice position; return the volumes whose slice changed.
+        """This method sets the shared slice position and returns the indices of the volumes
+        whose slice changed.
 
-        The master index runs over the deepest volume, 0 to max_slices - 1
-        (values outside that range are clipped).  Each volume's slice is the
-        proportional position ``round(fraction * (depth - 1))``, so the
-        deepest volume follows the master exactly and shallower volumes track
-        proportionally rather than clipping at their last slice.
+        The method clips the master index to the range 0 to max_slices - 1.  Each volume then
+        shows slice ``round(fraction * (depth - 1))``.  In this way, a volume with fewer slices
+        moves in proportion.
         """
         index = int(np.clip(int(np.round(index)), 0, self.max_slices - 1))
         self.master_index = index
@@ -294,17 +280,18 @@ class VolumeStack:
         return changed
 
     def slice_image(self, i):
-        """Return the 2D array currently displayed for volume ``i``."""
+        """This method returns the 2D array currently displayed for volume ``i``."""
         return self.data[i][:, :, self.cur_slices[i]]
 
     # --- Axis permutations ---
 
     def set_perm(self, i, new_perm):
-        """Re-orient volume ``i``; return True if the permutation changed.
+        """This method changes the orientation of volume ``i``.  It returns True if the
+        permutation changed.
 
-        ``new_perm`` is either a slice axis (int) or a full permutation of
-        (0, 1, 2).  The master fraction is preserved, so every volume keeps
-        its proportional position under the new depths.
+        ``new_perm`` is either a slice axis (int) or a full permutation of (0, 1, 2).  The
+        method keeps ``master_fraction`` unchanged.  For this reason, every volume stays at the
+        same fraction of its new depth.
         """
         if isinstance(new_perm, (int, np.integer)):
             new_perm = self.perm_from_slice_axis(new_perm)
@@ -323,7 +310,7 @@ class VolumeStack:
         return True
 
     def transpose(self, i):
-        """Swap the two in-plane axes of volume ``i``."""
+        """This method swaps the two in-plane axes of volume ``i``."""
         perm = list(self.axes_perms[i])
         perm[0], perm[1] = perm[1], perm[0]
         self.set_perm(i, perm)
@@ -331,17 +318,16 @@ class VolumeStack:
     # --- Intensity range ---
 
     def data_range(self):
-        """Return (min, max) over all volumes' current data."""
+        """This method returns (min, max) over the current data of all volumes."""
         lo = min(float(np.min(d)) for d in self.data)
         hi = max(float(np.max(d)) for d in self.data)
         return lo, hi
 
     def resolve_range(self, vmin=None, vmax=None):
-        """Fill missing bounds from the data and validate.
+        """This method returns the display bounds after it fills missing bounds from the data.
 
-        None bounds are replaced by the data minimum/maximum.  Equal bounds
-        are split by a small scale-aware epsilon so downstream widgets always
-        see a nonempty range.  vmin > vmax raises ValueError.
+        If the bounds are equal, the method moves them apart by a small amount.  If vmin > vmax,
+        the method raises a ValueError.
         """
         if vmin is None or vmax is None:
             data_lo, data_hi = self.data_range()
@@ -357,33 +343,34 @@ class VolumeStack:
         return vmin, vmax
 
     def set_range(self, vmin=None, vmax=None):
-        """Set the display range; None bounds are filled from the data."""
+        """This method sets the display range.  A bound that is None comes from the data."""
         self.vmin, self.vmax = self.resolve_range(vmin, vmax)
         return self.vmin, self.vmax
 
     # --- Difference images ---
 
     def is_difference(self, i):
-        """Return True if volume ``i`` currently shows a difference image."""
+        """This method returns True if volume ``i`` shows a difference image."""
         return self._difference_info[i] is not None
 
     def can_difference(self, baseline_index, comparison_index):
-        """Return True if the pair is a valid difference: distinct indices
-        with equal original shapes.  Orientations may differ; the comparison
-        is re-oriented into the baseline's frame."""
+        """This method returns True if the two volumes can form a difference image.
+
+        The two indices must differ, and the original shapes must be equal.  The orientations
+        can differ, because :meth:`apply_difference` reorients the comparison volume to match
+        the baseline volume.
+        """
         return (baseline_index != comparison_index
                 and self.original_data[baseline_index].shape
                 == self.original_data[comparison_index].shape)
 
     def apply_difference(self, baseline_index, comparison_index, use_abs=False):
-        """Replace volume ``baseline_index`` with (comparison - baseline).
+        """This method replaces volume ``baseline_index`` with (comparison - baseline).
 
-        The comparison uses the volumes' current data, so a difference against
-        an already-differenced volume compares against what is displayed.  If
-        the two volumes are viewed in different orientations (transposed, or
-        sliced along different axes), the comparison is re-oriented into the
-        baseline's frame first.  With ``use_abs`` the absolute difference is
-        shown.  The previous label is saved and restored by :meth:`restore`.
+        If ``use_abs`` is True, the method uses the absolute value of the difference.  The
+        method uses the displayed data.  If the orientations differ, it reorients the comparison
+        volume to match the baseline volume.  :meth:`restore` brings back the original data and
+        label.
         """
         if not self.can_difference(baseline_index, comparison_index):
             raise ValueError(
@@ -409,7 +396,7 @@ class VolumeStack:
         self.labels[baseline_index] = label_prepend + self.labels[baseline_index]
 
     def restore(self, i):
-        """Restore volume ``i`` from its original data, ending any difference."""
+        """This method resets volume ``i`` to its original data.  This ends any difference image."""
         self.data[i] = np.transpose(self.original_data[i], self.axes_perms[i])
         info = self._difference_info[i]
         if info is not None:
@@ -419,11 +406,11 @@ class VolumeStack:
     # --- ROI statistics ---
 
     def roi_stats(self, i, x, y, radius):
-        """Statistics of the current slice of volume ``i`` inside a circle.
+        """This method returns statistics of the current slice of volume ``i`` inside a circle.
 
-        ``x`` and ``y`` are data coordinates (column, row) of the circle
-        center.  Returns a dict with keys 'mean', 'std', 'min', 'max', or
-        None when no pixel center falls inside the circle.
+        ``x`` and ``y`` are the data coordinates (column, row) of the circle center.  The method
+        returns a dict with the keys 'mean', 'std', 'min', and 'max'.  It returns None if no
+        pixel center falls inside the circle.
         """
         slice_2d = self.slice_image(i)
         ny, nx = slice_2d.shape[:2]
@@ -439,11 +426,11 @@ class VolumeStack:
 
     @staticmethod
     def list_file_arrays(file_path):
-        """List the arrays available in a file, for a chooser dialog.
+        """This method lists the arrays in a file, for use in a dialog that chooses one.
 
-        Returns (names, shapes) for .npz and .h5/.hdf5 files, or None for
-        .npy files (a single unnamed array).  Unsupported extensions raise
-        ValueError.
+        For .npz and .h5/.hdf5 files, the method returns (names, shapes).  For a .npy file, it
+        returns None, because the file holds one unnamed array.  For other extensions, it
+        raises a ValueError.
         """
         ext = os.path.splitext(file_path)[-1].lower()
         if ext == '.npy':
@@ -463,11 +450,11 @@ class VolumeStack:
 
     @staticmethod
     def read_file_array(file_path, name=None):
-        """Read one array from a file; return (array, data_dict).
+        """This method reads one array from a file and returns (array, data_dict).
 
-        ``name`` selects the array for .npz and .h5/.hdf5 files (default:
-        the first).  The data dict comes from HDF5 dataset attributes,
-        coerced to strings; it is None for the other formats.
+        For .npz and .h5/.hdf5 files, ``name`` selects the array.  If ``name`` is None, the
+        method reads the first array.  For HDF5 files, the data dict holds the dataset
+        attributes converted to strings.  For the other formats, the data dict is None.
         """
         ext = os.path.splitext(file_path)[-1].lower()
         if ext == '.npy':
@@ -486,8 +473,8 @@ class VolumeStack:
                     for k, v in dataset.attrs.items()
                 } or None
                 array = dataset[()]
-            # A file that states its axis order is permuted to the display order,
-            # (row, col, slice) or (time, row, col, slice).
+            # If the file states its axis order, the array is permuted to the display order.
+            # The display order is (row, col, slice) or (time, row, col, slice).
             axes = (data_dict or {}).get('axes')
             if axes:
                 names = axes.split(',')
@@ -498,17 +485,15 @@ class VolumeStack:
         raise ValueError("Unsupported file type: {}".format(ext))
 
     def load_array(self, image_index, new_array, data_dict=None):
-        """Replace volume(s) with a loaded array; return the affected indices.
+        """This method replaces one or more volumes with a loaded array.  It returns the indices
+        of the replaced volumes.
 
-        2D arrays are promoted to 3D.  A 3D array replaces volume
-        ``image_index``.  A 4D array replaces volumes 0..k-1 with its slabs
-        along the last axis, where k = min(last dim, n_volumes); the primary
-        index (which receives ``data_dict`` and a permutation reset) becomes
-        min(image_index, k - 1).  Anything else raises ValueError.
-
-        Replaced volumes leave any difference state, since the data they were
-        differenced against is gone.  The master position moves to the primary
-        volume's middle slice.
+        A 2D or 3D array replaces volume ``image_index``.  A 4D array replaces volumes 0 to k-1
+        with its 3D parts along the last axis, where k = min(last dimension, n_volumes).  In
+        this case, ``image_index`` becomes min(image_index, k - 1).  For any other number of
+        dimensions, the method raises a ValueError.  A replaced volume is no longer a
+        difference image.  The slice position moves to the middle slice of volume
+        ``image_index``.
         """
         new_array = np.asarray(new_array)
         if new_array.ndim == 2:
@@ -528,8 +513,8 @@ class VolumeStack:
             raise ValueError("Loaded array must be 2D, 3D, or 4D")
 
         self.data_dicts[image_index] = data_dict
-        # The primary volume returns to the standard display order for its
-        # slice axis.  Other replaced volumes keep their permutations.
+        # Volume image_index returns to the standard display order for its slice axis.
+        # Other replaced volumes keep their permutations.
         self.axes_perms[image_index] = self.perm_from_slice_axis(
             self.axes_perms[image_index][-1])
         for j in replaced:
@@ -545,14 +530,11 @@ class VolumeStack:
 
 
 def _save_data_hdf5(file_path, array, array_name='recon', attributes_dict=None):
-    """Default save function: one HDF5 dataset with string attributes.
+    """This function writes one HDF5 dataset with string attributes.  It is the default save
+    function of the viewer.
 
-    The layout is the one mbirtorch's export_recon_hdf5 writes: the dataset
-    ``recon`` in right-hand axis order, (slice, col, row) for a 3D volume and
-    (time, slice, col, row) for a 4D one, with the attributes ``format`` and
-    ``axes`` stating the layout and the data dict as text attributes.  Files
-    round-trip through :meth:`VolumeStack.read_file_array`.  Host packages can
-    inject another writer through ``slice_viewer(..., save_fn=...)``.
+    The file format matches ``export_recon_hdf5``.  The dataset is in (slice, col, row) or
+    (time, slice, col, row) order.  The data dict is stored as text attributes.
     """
     import h5py
     array = np.asarray(array)
@@ -570,13 +552,14 @@ def _save_data_hdf5(file_path, array, array_name='recon', attributes_dict=None):
             dataset.attrs['axes'] = axes
 
 
-# Native Tk dialogs.  Each creates a hidden Tk root at call time and destroys it
-# before returning, so importing this module never touches a GUI toolkit.
+# Native Tk dialogs.  Each dialog creates a hidden Tk root when it is called and destroys
+# the root before it returns.  For this reason, importing this module does not load a GUI toolkit.
 
 def _tk_menu(labels):
-    """Show a menu-like popup at the mouse pointer; return the chosen label.
+    """This function shows a popup menu at the mouse pointer and returns the chosen label.
 
-    Returns None when dismissed (Escape, click-away focus loss, or Cancel).
+    The function returns None if the user closes the menu without a choice.  The user can close
+    the menu with Escape or by clicking outside it.
     """
     import tkinter
 
@@ -612,8 +595,8 @@ def _tk_menu(labels):
         top.attributes('-topmost', True)
         top.lift()
         listbox.focus_force()
-        # The popup closes when it loses focus.  The binding is made after the
-        # focus has settled, so it cannot fire while the popup is being created.
+        # The popup closes when it loses focus.  The binding is made 200 ms later,
+        # so that it cannot fire while the popup is being created.
         top.after(200, lambda: top.winfo_exists() and top.bind(
             '<FocusOut>', lambda _event: top.destroy()))
         root.wait_window(top)
@@ -623,11 +606,10 @@ def _tk_menu(labels):
 
 
 def _tk_range_dialog(current_vmin, current_vmax):
-    """Modal min/max entry dialog.
+    """This function shows a modal dialog in which the user enters the min and max.
 
-    Returns ('apply', min_text, max_text), ('data',), or None if cancelled.
-    Blank entries mean "keep the current bound"; parsing stays with the
-    caller so this and the in-figure dialog share one code path.
+    The function returns ('apply', min_text, max_text) for Apply, ('data',) for Data range, or
+    None for Cancel.  A blank entry keeps the current bound.
     """
     import tkinter
     from tkinter import ttk
@@ -679,17 +661,16 @@ def _tk_range_dialog(current_vmin, current_vmax):
     return result['value']
 
 
-# Keys always offered by the save-time dict editor.
+# The keys that the dict editor always shows when the user saves.
 DICT_EDITOR_KEYS = ('model_params', 'notes', 'recon_log', 'recon_params')
 
 
 def _tk_dict_editor(data_dict):
-    """Modal editor for the data dict written by Save.
+    """This function shows a modal editor for the data dict that Save writes.
 
-    Shows the union of DICT_EDITOR_KEYS and any existing keys, with a key
-    list on the left and a multi-line editor on the right.  Returns
-    ('save', edited_dict) (blank entries dropped), ('as-is',) to save the
-    dict unchanged, or None to cancel the save.
+    The function returns ('save', edited_dict) for Save.  The edited dict leaves out blank
+    entries.  The function returns ('as-is',) to save the dict unchanged, or None to cancel
+    the save.
     """
     import tkinter
     from tkinter import ttk
@@ -759,42 +740,34 @@ def _tk_dict_editor(data_dict):
 
 
 class SliceViewer:
-    """Interactive multi-volume slice viewer for 2D and 3D arrays (matplotlib).
+    """This class is used to display 2D and 3D arrays in an interactive matplotlib slice viewer.
 
-    The viewer displays one panel per volume with a shared slice slider,
-    a shared intensity-range slider, and slice-axis radio buttons.
-    Right-click an image for the context menu of per-image actions
-    (difference/error images, data-dict display, transpose, file load/save,
-    view reset) and the couple/decouple toggles.  Left-click and drag on an
-    image draws an ROI circle with live statistics; press 'h' for help and
-    Esc to clear overlays.  File dialogs and (under TkAgg) the menu and
-    range dialogs use native windows; other backends use in-figure dialogs.
-
-    Construction builds the figure but does not display it; call
-    :meth:`show` to display.  All data logic lives in :class:`VolumeStack`
-    (available as ``self.stack``).
+    The viewer shows one panel for each volume.  The panels share a slice slider and an
+    intensity slider.  A right-click on a panel opens a menu of actions for the image in that
+    panel.  A left-drag draws a circular ROI and shows its statistics.  The 'h' key shows help.
+    The constructor builds the figure, and :meth:`show` displays the figure.  ``self.stack``
+    holds the :class:`VolumeStack`.
 
     Args:
-        *datasets (ndarray or None): One or more 2D or 3D arrays to display.
-            2D arrays are promoted to 3D via a trailing singleton axis, and
-            None values are replaced with placeholder zero arrays.
-        data_dicts (None, dict, or list of dict/None, optional): String-valued
-            dict(s) associated with the volumes, viewable in the viewer.
-        title (str, optional): Figure title.  Defaults to ''.
-        vmin (float, optional): Minimum display intensity.  Defaults to the
-            global minimum across all datasets.
-        vmax (float, optional): Maximum display intensity.  Defaults to the
-            global maximum across all datasets.
-        slice_label (str or list of str, optional): Label(s) shown before the
-            slice number in each panel title.  Defaults to "Slice".
-        slice_axis (int or list of int, optional): Axis along which to slice
-            (0, 1, or 2).  Defaults to the last axis (2).
-        cmap (str, optional): Colormap.  Defaults to 'gray'.
-        show_instructions (bool, optional): Show the "Press h for help" hint.
-            Defaults to True.
-        save_fn (callable, optional): Replacement for the built-in HDF5
-            writer, called as ``save_fn(file_path, array, array_name,
-            attributes_dict)``.  Defaults to a minimal h5py writer.
+        *datasets (ndarray or None): One or more 2D or 3D arrays to display.  A 2D array gets
+            a third axis of length 1.  A None entry becomes a placeholder array of zeros.
+        data_dicts (None, dict, or list of dict/None, optional): The dicts of strings that go
+            with the volumes.  The user can view them in the viewer.
+        title (str, optional): The figure title.  Defaults to ''.
+        vmin (float, optional): The minimum display intensity.  Defaults to the minimum over
+            all datasets.
+        vmax (float, optional): The maximum display intensity.  Defaults to the maximum over
+            all datasets.
+        slice_label (str or list of str, optional): The label or labels shown before the slice
+            number in each panel title.  Defaults to "Slice".
+        slice_axis (int or list of int, optional): The axis to slice along (0, 1, or 2).
+            Defaults to the last axis (2).
+        cmap (str, optional): The colormap.  Defaults to 'gray'.
+        show_instructions (bool, optional): If True, the viewer shows the "Press h for help"
+            hint.  Defaults to True.
+        save_fn (callable, optional): A function that replaces the built-in HDF5 writer.  The
+            viewer calls it as ``save_fn(file_path, array, array_name, attributes_dict)``.
+            Defaults to a minimal h5py writer.
     """
 
     def __init__(self, *datasets, data_dicts=None, title='', vmin=None,
@@ -809,8 +782,8 @@ class SliceViewer:
         self.show_instructions = show_instructions
         self.save_fn = save_fn if save_fn is not None else _save_data_hdf5
 
-        # All interaction state is initialized before any widget or callback
-        # is created, so no callback sees a partly built viewer.
+        # The interaction state must be set before any widget or callback is created.
+        # Otherwise a callback could see a partly built viewer.
         self._init_interaction_state()
         self._build_figure()
         self._connect_events()
@@ -821,21 +794,21 @@ class SliceViewer:
         n = self.stack.n_volumes
         self.mode = Mode.IDLE
         self._mode_data = {}
-        # These two are the user's sync settings.  _in_sync_callback below
-        # is the reentrancy latch and is not a setting.
+        # sync_limits and sync_axes are user settings.  _in_sync_callback is not a
+        # setting.  It blocks a callback from running inside another callback.
         self.sync_limits = True
         self.sync_axes = len(set(self.stack.slice_axes)) == 1
         self._in_sync_callback = False
-        # The ROI graphics are one circle and one stats text per volume.
+        # Each volume has one ROI circle and one statistics text.
         self.circles = [None] * n
         self.stats_texts = [None] * n
         self.tooltips = []
-        # These two throttle the ROI statistics updates.
+        # These two values limit how often the ROI statistics are updated.
         self._last_stats_time = 0.0
         self._stats_timer = None
         self._dialog = None
         self._message_artist = None
-        # Blitting turns on once the first full draw has happened.
+        # Blitting starts after the first full draw.
         self.enable_blit = True
         self._renderer_ready = False
         self._clear_rect = None
@@ -859,8 +832,8 @@ class SliceViewer:
         self._create_slice_slider()
         self._create_intensity_slider()
 
-        # This opaque rectangle is drawn under partial redraws.  Marking it
-        # animated keeps it out of ordinary full draws.
+        # This opaque rectangle is drawn under each partial redraw.  It is marked
+        # animated, so a full draw does not draw it.
         self._clear_rect = Rectangle((0, 0), 1, 1,
                                      facecolor=self.fig.get_facecolor(),
                                      edgecolor='none', animated=True,
@@ -884,8 +857,8 @@ class SliceViewer:
             ax = self.fig.add_subplot(self.gs[0, i])
             img = ax.imshow(stack.slice_image(i), cmap=self.cmap,
                             aspect='equal', vmin=stack.vmin, vmax=stack.vmax)
-            # _reset_view manages the limits.  Autoscale must not rederive them
-            # from set_extent, which would carry one volume's extent onto others.
+            # _reset_view sets the axis limits.  Autoscale is off, because set_extent would
+            # otherwise apply the extent of one volume to the other volumes.
             ax.set_autoscale_on(False)
             ax.set_title(self._title_text(i), fontsize=10)
             divider = make_axes_locatable(ax)
@@ -898,7 +871,7 @@ class SliceViewer:
             self.images[i] = img
 
     def _create_tooltips(self):
-        # The tooltips are created exactly once, and only here.
+        # This is the only place that creates the tooltips, and it runs once.
         self.tooltips = [
             ax.annotate(TOOLTIP_TEXT, xy=(0, 0), xytext=TOOLTIP_OFFSET,
                         textcoords='offset points', ha='left',
@@ -909,12 +882,12 @@ class SliceViewer:
             for ax in self.axes
         ]
 
-    # --- slice-axis radios and range button ---
+    # --- Slice-axis radio buttons and the Set range button ---
 
     def _create_axis_row(self):
         n = self.stack.n_volumes
-        # Each cell splits into a radio part and a spare part.  The last spare cell
-        # holds the Set-range button.
+        # Each grid position is split into a part for the radio buttons and a spare part.
+        # The last spare part holds the Set range button.
         self._radio_slots = []
         spare_slots = []
         for i in range(n):
@@ -962,11 +935,11 @@ class SliceViewer:
                 radio.on_clicked(
                     lambda label, i=i: self._on_axis_selected(i, int(label)))
 
-    # --- sliders ---
+    # --- Sliders ---
 
     def _slider_slot(self, row):
-        # Inset the slider inside its row so the left label and right value
-        # text render inside the figure instead of clipping at its edges.
+        # The slider is inset within its row.  This keeps the label on the left and the
+        # value on the right inside the figure.
         sub = gridspec.GridSpecFromSubplotSpec(
             1, 3, subplot_spec=self.gs[row, :], width_ratios=[1.7, 8.0, 2.0])
         return sub[0, 1]
@@ -1022,21 +995,10 @@ class SliceViewer:
         self._patch_toolbar()
 
     def _patch_toolbar(self):
-        """Adapt the navigation toolbar to this viewer (instance patches).
+        """This method changes the toolbar so that Home, Back, and Forward restore the view of
+        each panel separately.
 
-        Home/Back/Forward restore every panel's own saved view through
-        ``_update_view``; each restore fires the zoom-sync callback, so
-        without the latch the last panel restored would stamp its view onto
-        all the others (visibly cropping them when displayed shapes differ).
-        The restore therefore runs with the sync latch held.
-
-        On macosx only, ``drag_zoom`` also needs help: that backend fills
-        motion events' ``buttons`` from the LIVE hardware state
-        (NSEvent.pressedMouseButtons), so motion events still queued when a
-        fast drag releases are processed with an empty buttons set, and
-        matplotlib >= 3.10 treats that as a missed release and cancels the
-        zoom.  During an active zoom, missing button state counts as
-        still-held; a real release still completes the gesture normally.
+        On the macosx backend, the method also prevents the cancellation of a fast drag zoom.
         """
         toolbar = getattr(self.fig.canvas, 'toolbar', None)
         if toolbar is None:
@@ -1055,8 +1017,8 @@ class SliceViewer:
 
         toolbar._update_view = types.MethodType(_update_view, toolbar)
 
-        # In stock matplotlib, Home with an empty navigation stack does
-        # nothing.  This viewer falls back to the full-extent reset.
+        # In standard matplotlib, Home does nothing if there are no saved views.
+        # In this viewer, Home then resets each panel to its full extent.
         stock_home = type(toolbar).home
 
         def home(tb, *args):
@@ -1086,8 +1048,8 @@ class SliceViewer:
         return bool(getattr(toolbar, 'mode', ''))
 
     def _sync_limits_from(self, src_ax, which):
-        # This runs for both directions.  sync_limits is the user setting,
-        # and _in_sync_callback is the reentrancy latch.
+        # This runs for both the x and y limits.  sync_limits is the user setting.
+        # _in_sync_callback blocks a call from inside another call.
         if not self.sync_limits or self._in_sync_callback:
             return
         if src_ax not in self.axes:
@@ -1102,7 +1064,7 @@ class SliceViewer:
             self._in_sync_callback = False
         self.fig.canvas.draw_idle()
 
-    # --- The one button-press dispatcher ---
+    # --- Mouse button handling ---
 
     def _volume_index_of(self, ax):
         try:
@@ -1112,15 +1074,14 @@ class SliceViewer:
 
     def _on_button_press(self, event):
         if self._dialog is not None:
-            # A click outside an open context menu closes it.  Every other
-            # dialog's widgets handle their own events.
+            # A click outside an open context menu closes the menu.  The widgets of
+            # every other dialog handle their own events.
             if (self._dialog['kind'] == 'menu'
                     and event.inaxes not in self._dialog.get('menu_axes', ())):
                 self._close_dialog()
             return
         if event.button == 3:
-            # Right-click works even while the toolbar's pan or zoom tool
-            # is active.
+            # A right-click works even while the pan or zoom tool of the toolbar is active.
             if event.inaxes is self.intensity_slider.ax:
                 self._open_range_dialog()
                 return
@@ -1130,8 +1091,8 @@ class SliceViewer:
             return
         if event.button != 1:
             return
-        # Comparison selection outranks the toolbar tools.  While the instruction
-        # overlay is up, a left-click selects an image even with pan or zoom armed.
+        # The choice of a comparison image takes priority over the toolbar tools.  While the
+        # instructions are shown, a left-click selects an image even if pan or zoom is on.
         if self.mode is Mode.SELECT_COMPARISON:
             i = self._volume_index_of(event.inaxes)
             if i is not None:
@@ -1144,8 +1105,8 @@ class SliceViewer:
             return
         if event.xdata is None or event.ydata is None:
             return
-        # A click on a circle's edge resizes it, and a click inside it moves
-        # it.  A click anywhere else starts a new ROI.
+        # A click on the edge of a circle resizes the circle.  A click inside a circle
+        # moves the circle.  A click anywhere else starts a new ROI.
         for circle in self.circles:
             if circle is None:
                 continue
@@ -1205,8 +1166,7 @@ class SliceViewer:
     def _on_release(self, _event):
         if self.mode in (Mode.DRAW_ROI, Mode.MOVE_ROI, Mode.RESIZE_ROI):
             self._set_mode(Mode.IDLE)
-            # Force the final update so a fast release never leaves stats
-            # showing the pre-release position.
+            # The final update always runs, so that the statistics are current after a fast release.
             self._display_roi_stats(force=True)
             self._partial_redraw()
 
@@ -1264,7 +1224,7 @@ class SliceViewer:
             return
         now = time.monotonic()
         if not force and now - self._last_stats_time < ROI_STATS_THROTTLE_S:
-            # This guarantees one final update after a burst of moves.
+            # This timer runs one final update after a rapid series of moves.
             self._schedule_trailing_stats()
             return
         self._last_stats_time = now
@@ -1327,10 +1287,11 @@ class SliceViewer:
                 bbox=dict(facecolor='white', alpha=0.9), zorder=20)
         self.fig.canvas.draw_idle()
 
-    # --- In-place refresh (there is no teardown/rebuild path) ---
+    # --- In-place refresh ---
 
     def refresh(self, volume_index=None):
-        """Push model state into the panels in place: data, extent, title."""
+        """This method copies the data, extent, and title of each volume from the stack into its
+        panel."""
         indices = (range(self.stack.n_volumes) if volume_index is None
                    else [volume_index])
         for i in indices:
@@ -1341,8 +1302,8 @@ class SliceViewer:
             self.axes[i].set_title(self._title_text(i), fontsize=10)
 
     def _reset_view(self, volume_index=None):
-        # The sync latch is held here.  A reset gives each volume its own full
-        # extent and must not carry it onto panels with a different shape.
+        # _in_sync_callback is set here.  A reset gives each volume its own full extent.
+        # The synchronization must not copy this extent to panels with a different shape.
         indices = (range(self.stack.n_volumes) if volume_index is None
                    else [volume_index])
         already_syncing = self._in_sync_callback
@@ -1356,7 +1317,10 @@ class SliceViewer:
             self._in_sync_callback = already_syncing
 
     def _update_slice_slider(self):
-        """Track model depth changes: bounds, value, and visibility."""
+        """This method updates the slice slider after the depths of the volumes change.
+
+        The method updates the range, the value, and the visibility of the slider.
+        """
         max_slices = self.stack.max_slices
         if max_slices <= 1:
             if self.slice_slider is not None:
@@ -1388,9 +1352,10 @@ class SliceViewer:
     # --- Slice-axis selection and coupling ---
 
     def _reset_navigation(self):
-        """Clear the toolbar's saved views; they are stale after structural
-        changes (axis change, transpose, load), and Home falls back to the
-        explicit full-extent reset when the stack is empty."""
+        """This method clears the saved views of the toolbar.
+
+        The saved views are out of date after a change of slice axis, a transpose, or a load.
+        """
         toolbar = getattr(self.fig.canvas, 'toolbar', None)
         if toolbar is not None:
             try:
@@ -1408,7 +1373,7 @@ class SliceViewer:
                 self._reset_view(i)
         if not any_changed:
             return
-        self.refresh()  # fraction-preserving remap can move any volume
+        self.refresh()  # The new depth can change the slice of any volume.
         self._update_slice_slider()
         self._reset_navigation()
         self.fig.canvas.draw_idle()
@@ -1417,7 +1382,7 @@ class SliceViewer:
         self.sync_axes = not self.sync_axes
         self._rebuild_axis_radios()
         if self.sync_axes:
-            # Harmonize every volume to volume 0's slice axis.
+            # Every volume uses the slice axis of volume 0.
             self._on_axis_selected(None, self.stack.slice_axes[0])
         self.fig.canvas.draw_idle()
 
@@ -1427,19 +1392,16 @@ class SliceViewer:
     # --- The context menu ---
 
     def _in_process_tk_ok(self):
-        """True when opening an in-process Tk window is safe.
+        """This method returns True if it is safe to open a Tk window in this process.
 
-        Only under TkAgg, where Tk already runs the GUI: creating a Tk root
-        inside another toolkit's event loop crashes at the native level on
-        the macosx backend (SIGBUS), so everywhere else the viewer uses its
-        in-figure dialogs or out-of-process (osascript) ones.
+        It is safe only with the TkAgg backend.
         """
         return matplotlib.get_backend().lower() == 'tkagg'
 
     def _menu_items(self, i):
-        """(label, callback) pairs for volume ``i``'s context menu.
+        """This method returns the (label, callback) pairs for the context menu of volume ``i``.
 
-        A None callback (Cancel) just closes the menu.
+        The Cancel item has the callback None, and it closes the menu.
         """
         stack = self.stack
         items = []
@@ -1478,7 +1440,7 @@ class SliceViewer:
                 for label, callback in items:
                     if label == chosen and callback is not None:
                         callback()
-            # Launch from Tk's scheduler, not from inside this callback.
+            # Tk runs the menu after this callback returns, not inside this callback.
             try:
                 self.fig.canvas.manager.window.after(10, run)
                 return
@@ -1489,7 +1451,10 @@ class SliceViewer:
         self._open_menu_dialog(items, event)
 
     def _open_menu_dialog(self, items, event):
-        """In-figure popup menu at the click position (non-Tk backends)."""
+        """This method opens a popup menu inside the figure at the click position.
+
+        The viewer uses this menu on backends other than TkAgg.
+        """
         dialog = self._open_dialog('menu', dim=False)
         canvas_w, canvas_h = self.fig.canvas.get_width_height()
         fx, fy = event.x / canvas_w, event.y / canvas_h
@@ -1525,11 +1490,11 @@ class SliceViewer:
         else:
             self.fig.canvas.draw_idle()
 
-    # --- Strip actions ---
+    # --- Actions on one image ---
 
     def _on_difference_button(self, i, use_abs=False):
-        # No toolbar state is touched here.  Toggling pan or zoom in code leaves
-        # the macosx backend's native buttons out of step with matplotlib's mode.
+        # This code does not change the toolbar state.  On the macosx backend, a change of
+        # pan or zoom in code makes the native buttons disagree with the matplotlib mode.
         if self.stack.is_difference(i):
             self._on_restore(i)
             return
@@ -1544,7 +1509,7 @@ class SliceViewer:
 
     def _on_error_button(self, i):
         if self.stack.is_difference(i):
-            return  # the strip shows Restore in this state; Err is inert
+            return  # The menu offers Restore for a difference image, so this does nothing.
         self._on_difference_button(i, use_abs=True)
 
     def _complete_difference(self, comparison_index):
@@ -1552,7 +1517,7 @@ class SliceViewer:
         use_abs = self._mode_data['use_abs']
         if not self.stack.can_difference(baseline_index, comparison_index):
             self._show_message(True, message_type='difference')
-            return  # stay in selection mode, as the reference does
+            return  # The viewer stays in the mode that selects a comparison image.
         self._set_mode(Mode.IDLE)
         self._show_message(False)
         self._apply_difference(baseline_index, comparison_index, use_abs)
@@ -1576,16 +1541,15 @@ class SliceViewer:
         self.fig.canvas.draw_idle()
 
     def _on_reset_button(self, i):
-        # This resets the zoom, the ROI, the overlays, and any pending
-        # selection.
+        # This resets the zoom, the ROI, the messages, and any unfinished selection.
         self._reset_view(None if self.sync_limits else i)
         self._remove_roi_graphics()
         self._set_mode(Mode.IDLE)
         self._show_message(False)
         self.fig.canvas.draw_idle()
 
-    # A modal in-figure dialog is a set of high-zorder axes.  Its backdrop makes
-    # event.inaxes resolve to dialog axes only, so the widgets underneath do nothing.
+    # A modal dialog inside the figure is a set of axes with a high zorder.  Its backdrop covers
+    # the figure, so event.inaxes is always a dialog axes.  The widgets underneath get no clicks.
 
     def _main_widgets(self):
         widgets = list(self.axis_radios)
@@ -1604,9 +1568,9 @@ class SliceViewer:
         backdrop.set_yticks([])
         self._dialog = {'kind': kind, 'axes': [backdrop], 'widgets': {},
                         'texts': {}, 'state': {}}
-        # Matplotlib widgets hit-test by position and not by stacking order, so the
-        # widgets under the dialog are disabled through the .active flag that every
-        # widget's ignore() checks.  RadioButtons give set_active another meaning.
+        # Matplotlib widgets respond to clicks by position, not by zorder.  For this reason, the
+        # widgets under the dialog are disabled with the .active flag, which ignore() checks.
+        # The flag is set directly, because RadioButtons.set_active has another meaning.
         for widget in self._main_widgets():
             widget.active = False
         return self._dialog
@@ -1623,8 +1587,11 @@ class SliceViewer:
             self.fig.canvas.draw_idle()
 
     def _dialog_panel(self, width_in, height_in):
-        """Add the centered white panel; return its (x0, y0, w, h) in figure
-        fractions for laying out the widgets inside."""
+        """This method adds a centered white panel to the dialog and returns its (x0, y0, w, h).
+
+        The values are fractions of the figure size.  The caller uses them to place the widgets
+        inside the panel.
+        """
         fig_w, fig_h = self.fig.get_size_inches()
         w = min(width_in / fig_w, 0.92)
         h = min(height_in / fig_h, 0.88)
@@ -1651,14 +1618,14 @@ class SliceViewer:
         textbox = TextBox(ax, label, initial=initial, textalignment='left')
         textbox.label.set_fontsize(DIALOG_FONT_SIZE)
         textbox.text_disp.set_fontsize(DIALOG_FONT_SIZE)
-        textbox.text_disp.set_clip_on(True)  # long paths clip at the box edge
+        textbox.text_disp.set_clip_on(True)  # A long path is cut off at the edge of the box.
         self._dialog['axes'].append(ax)
         self._dialog['widgets'][name] = textbox
         return textbox
 
     def _dialog_text(self, name, xy, text, **kwargs):
-        # The texts are children of the panel axes, so they draw above the panel's
-        # opaque face and are removed with the panel.
+        # The texts belong to the panel axes.  For this reason, they are drawn above the
+        # opaque panel, and they are removed with the panel.
         kwargs.setdefault('fontsize', DIALOG_FONT_SIZE)
         panel = self._dialog['panel_ax']
         artist = panel.text(xy[0], xy[1], text,
@@ -1666,7 +1633,7 @@ class SliceViewer:
         self._dialog['texts'][name] = artist
         return artist
 
-    # --- intensity-range dialog ---
+    # --- Intensity range dialog ---
 
     def _open_range_dialog(self):
         if self._in_process_tk_ok():
@@ -1688,7 +1655,10 @@ class SliceViewer:
         self._open_range_dialog_infigure()
 
     def _handle_range_result(self, result):
-        """Apply a Tk range-dialog result; errors go to a figure overlay."""
+        """This method applies the result of the Tk range dialog.
+
+        If the input is not valid, the method shows the error as a message in the figure.
+        """
         if result is None:
             return
         try:
@@ -1704,7 +1674,11 @@ class SliceViewer:
         self.fig.canvas.draw_idle()
 
     def _parse_and_set_range(self, min_text, max_text):
-        """Shared range parsing: blank keeps the current bound."""
+        """This method converts the text of the min and max entries to numbers and sets the
+        range.
+
+        Both range dialogs use this method.  A blank entry keeps the current bound.
+        """
         try:
             vmin = (self.stack.vmin if not min_text.strip()
                     else float(min_text))
@@ -1721,7 +1695,7 @@ class SliceViewer:
         x0, y0, w, h = self._dialog_panel(4.6, 2.6)
         self._dialog_text('title', (x0 + 0.02 * w, y0 + h - 0.06),
                           'Set intensity range', fontweight='bold')
-        # The fields start empty, so a new bound can be typed directly.  A
+        # The fields start empty, so the user can type a new bound directly.  A
         # blank field keeps its current bound.
         self._dialog_text('hint', (x0 + 0.02 * w, y0 + h - 0.11),
                           f'Blank keeps the current bound '
@@ -1766,7 +1740,7 @@ class SliceViewer:
         self.fig.canvas.draw_idle()
 
     def _set_intensity_bounds(self):
-        """Push stack.vmin/vmax into the range slider and the images."""
+        """This method copies stack.vmin and stack.vmax to the range slider and the images."""
         stack = self.stack
         slider = self.intensity_slider
         slider.valmin = stack.vmin
@@ -1775,7 +1749,7 @@ class SliceViewer:
         slider.ax.set_xlim(stack.vmin, stack.vmax)
         slider.set_val((stack.vmin, stack.vmax))
 
-    # --- data-dict dialogs ---
+    # --- Data dict dialogs ---
 
     def _on_dict_button(self, i):
         data_dict = self.stack.data_dicts[i]
@@ -1871,11 +1845,15 @@ class SliceViewer:
         self._render_text_page()
         self.fig.canvas.draw_idle()
 
-    # File selection tries native dialogs first, in the order Qt, the macOS panel
-    # through osascript, then tkinter, and falls back to the in-figure browser.
+    # File selection tries the native dialogs first, in this order: Qt, the macOS panel through
+    # osascript, and tkinter.  If none of them runs, the viewer uses the file browser in the figure.
 
     def _native_choose_file(self, mode, directory, initial_file):
-        """Return a chosen path, None if cancelled, or _NATIVE_UNAVAILABLE."""
+        """This method shows a native file dialog and returns the chosen path.
+
+        The method returns None if the user cancels.  It returns ``_NATIVE_UNAVAILABLE`` if no
+        native dialog can run.
+        """
         backend = matplotlib.get_backend().lower()
         if backend in NONINTERACTIVE_BACKENDS:
             return _NATIVE_UNAVAILABLE
@@ -1890,8 +1868,8 @@ class SliceViewer:
                                                    initial_file)
             except Exception:
                 pass
-        # In-process Tk is safe only under TkAgg.  Under another toolkit's event
-        # loop it can crash the process, so the in-figure browser is used instead.
+        # A Tk window in this process is safe only with TkAgg.  With the event loop of another
+        # toolkit, Tk can crash the process.  In that case, the viewer uses the file browser in the figure.
         if not self._in_process_tk_ok():
             return _NATIVE_UNAVAILABLE
         try:
@@ -1931,7 +1909,7 @@ class SliceViewer:
                                 capture_output=True, text=True)
         if result.returncode != 0:
             if 'canc' in (result.stderr or '').lower():
-                return None  # the user cancelled the panel
+                return None  # The user cancelled the dialog.
             raise RuntimeError(result.stderr.strip())
         path = result.stdout.strip()
         return path or None
@@ -1976,8 +1954,8 @@ class SliceViewer:
                 self._finish_save(i, chosen)
 
         if matplotlib.get_backend().lower() == 'tkagg':
-            # This launches from Tk's scheduler rather than from inside this
-            # callback.  A second Tk root started inside a callback misbehaves.
+            # Tk runs the dialog after this callback returns.  A second Tk root that
+            # starts inside a callback does not work correctly.
             try:
                 self.fig.canvas.manager.window.after(10, run)
                 return
@@ -1987,11 +1965,9 @@ class SliceViewer:
 
     def _open_file_dialog(self, i, mode, directory=None, page=0,
                           filename=None, select_name=None):
-        """Load/save dialog with a directory listing.
+        """This method opens the load or save dialog inside the figure.
 
-        Clicking a directory navigates into it; clicking a file selects it
-        (and, for load, applies immediately).  The path box stays editable
-        for direct entry.
+        The dialog shows a directory listing and a text box for the path.
         """
         directory = os.path.abspath(directory or self._last_dir)
         self._last_dir = directory
@@ -2031,8 +2007,8 @@ class SliceViewer:
             if os.path.isfile(full) and \
                     name.lower().endswith(FILE_EXTENSIONS):
                 entries.append((name, full, False))
-        # Navigating up reselects the directory the listing came from, so the
-        # browser lands on the page that contains it rather than on the first page.
+        # When the user moves up one directory, the browser selects the previous directory.
+        # The browser then shows the page that contains that directory, not the first page.
         if select_name is not None:
             for index, (label, _full, _is_dir) in enumerate(entries):
                 if label.rstrip(os.sep) == select_name:
@@ -2122,14 +2098,18 @@ class SliceViewer:
         self._start_load(i, path)
 
     def _file_error(self, message):
-        """Route an error to the open dialog, or to a figure overlay."""
+        """This method shows an error in the open dialog, or as a message in the figure if no
+        dialog is open."""
         if self._dialog is not None:
             self._dialog_error(message)
         else:
             self._show_message(True, message=f"{message}. Press Esc to exit.")
 
     def _start_load(self, i, path):
-        """Load ``path`` into volume ``i``, via the array chooser if needed."""
+        """This method loads the file ``path`` into volume ``i``.
+
+        If the file holds more than one array, the method first asks the user to choose one.
+        """
         try:
             listing = VolumeStack.list_file_arrays(path)
         except Exception as e:
@@ -2177,15 +2157,15 @@ class SliceViewer:
     def _finish_save(self, i, path):
         if not path.lower().endswith('.h5'):
             path += '.h5'
-        # Under TkAgg the data dict is offered for editing before it is
-        # written.  On every other backend it is saved as it is.
+        # With TkAgg, the user can edit the data dict before it is written.  With every
+        # other backend, the data dict is saved unchanged.
         if self._in_process_tk_ok():
             try:
                 result = _tk_dict_editor(self.stack.data_dicts[i])
             except Exception:
                 result = ('as-is',)
             if result is None:
-                return  # the user cancelled the save
+                return  # The user cancelled the save.
             if result[0] == 'save':
                 self.stack.data_dicts[i] = result[1] or None
         try:
@@ -2199,9 +2179,9 @@ class SliceViewer:
         self._show_message(True,
                            message=f"Saved to {path}. Press Esc to dismiss.")
 
-    # A partial redraw repaints only the affected panels or slider rows.  No artist
-    # is marked animated, so full draws and savefig need no special case.  A backend
-    # without blit support falls back to draw_idle.
+    # A partial redraw repaints only the changed panels or sliders.  Only the clearing
+    # rectangle is marked animated, so full draws and savefig need no special case.
+    # A backend without blit support uses draw_idle instead.
 
     def _partial_redraw(self, volume_indices=None, widgets=()):
         canvas = self.fig.canvas
@@ -2214,8 +2194,8 @@ class SliceViewer:
             canvas.draw_idle()
             return
         renderer = canvas.get_renderer()
-        # The clip is against the renderer buffer rather than the logical canvas
-        # size.  On a HiDPI display the two differ by the device pixel ratio.
+        # The region is clipped to the renderer buffer, not to the logical canvas size.
+        # On a HiDPI display, the two sizes differ by the device pixel ratio.
         buffer_w = getattr(renderer, 'width', 0) or canvas.get_width_height()[0]
         buffer_h = getattr(renderer, 'height', 0) or canvas.get_width_height()[1]
         canvas_box = Bbox([[0, 0], [buffer_w, buffer_h]])
@@ -2238,8 +2218,8 @@ class SliceViewer:
                 except Exception:
                     boxes.append(ax.bbox)
             current = Bbox.union(boxes).padded(6)
-            # Clear the union with the group's previous region so text that
-            # shrank or moved since the last redraw leaves no ghost.
+            # The cleared region includes the previous region of the group.  In this way, text
+            # that shrank or moved leaves no old pixels.
             previous = self._last_blit_regions.get(key)
             region = (current if previous is None
                       else Bbox.union([current, previous]))
@@ -2261,17 +2241,12 @@ class SliceViewer:
     # --- Showing ---
 
     def show(self, block=True):
-        """Display the viewer window.
+        """This method displays the viewer window.
 
-        With ``block=True`` this runs the GUI event loop until every open
-        matplotlib window is closed, then closes this figure by object so
-        its widgets are torn down deterministically.  With ``block=False``
-        the window is drawn and left open; it becomes fully interactive when
-        a later blocking show (or ``plt.show()``) runs the event loop, and
-        the caller must keep the viewer alive (see ``slice_viewer``).
-
-        On a non-interactive backend (e.g. Agg) this warns and returns,
-        leaving the figure available for ``savefig``.
+        If ``block`` is True, the method runs the GUI event loop until every open matplotlib
+        window is closed.  If ``block`` is False, the method draws the window and leaves it
+        open.  The window becomes fully interactive when a later blocking show runs.  On a
+        non-interactive backend such as Agg, the method issues a warning and returns.
         """
         if matplotlib.get_backend().lower() in NONINTERACTIVE_BACKENDS:
             warnings.warn(
@@ -2287,53 +2262,47 @@ class SliceViewer:
             self.fig.canvas.draw_idle()
 
 
-# This keeps nonblocking viewers alive for callers who drop the returned
-# viewer.  The next blocking call adopts and closes them.
+# This list keeps nonblocking viewers alive if the caller discards the returned viewer.
+# The next blocking call to slice_viewer closes them.
 _NONBLOCKING_VIEWERS = []
 
 
 def slice_viewer(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
                  slice_label=None, slice_axis=None, cmap='gray',
                  show_instructions=True, block=True, save_fn=None):
-    """Launch an interactive viewer for one or more 2D or 3D image arrays.
+    """This function opens an interactive viewer for 2D or 3D image arrays.
 
-    This function builds a :class:`SliceViewer`, shows it, and returns it.
-    Features include synchronized slice navigation with proportional mapping
-    across volumes of unequal depth, ROI statistics, difference images, axis
-    transposition, file load/save, dynamic intensity range adjustment, and a
-    right-click context menu of per-image actions.
+    The function builds a :class:`SliceViewer`, shows it, and returns it.  The viewer has one
+    slice slider for all volumes, even if their depths differ.  It also shows ROI statistics
+    and difference images, transposes images, and loads and saves files.
 
     Args:
-        *datasets (ndarray or None): One or more 2D or 3D arrays to display.
-            2D arrays are promoted to 3D via a trailing singleton axis, and
-            None values are replaced with placeholder zero arrays.
-        data_dicts (None, dict, or list of dict/None, optional): String-valued
-            dict(s) associated with the volumes, viewable in the viewer.
-        title (str, optional): Figure title.  Defaults to ''.
-        vmin (float, optional): Minimum display intensity.  Defaults to the
-            global minimum across all datasets.
-        vmax (float, optional): Maximum display intensity.  Defaults to the
-            global maximum across all datasets.
-        slice_label (str or list of str, optional): Label(s) shown before the
-            slice number in each panel title.  Defaults to "Slice".
-        slice_axis (int or list of int, optional): Axis along which to slice
-            (0, 1, or 2).  Defaults to the last axis (2).
-        cmap (str, optional): Colormap.  Defaults to 'gray'.
-        show_instructions (bool, optional): Show the "Press h for help" hint.
-            Defaults to True.
-        block (bool, optional): If True (default), block until the window is
-            closed.  If False, leave the window open and return immediately;
-            the window becomes fully interactive when the next blocking
-            slice_viewer runs, and that blocking call returns when ALL open
-            windows are closed.
-        save_fn (callable, optional): Replacement for the built-in HDF5
-            writer, called as ``save_fn(file_path, array, array_name,
-            attributes_dict)``.
+        *datasets (ndarray or None): One or more 2D or 3D arrays to display.  A 2D array gets
+            a third axis of length 1.  A None entry becomes a placeholder array of zeros.
+        data_dicts (None, dict, or list of dict/None, optional): The dicts of strings that go
+            with the volumes.  The user can view them in the viewer.
+        title (str, optional): The figure title.  Defaults to ''.
+        vmin (float, optional): The minimum display intensity.  Defaults to the minimum over
+            all datasets.
+        vmax (float, optional): The maximum display intensity.  Defaults to the maximum over
+            all datasets.
+        slice_label (str or list of str, optional): The label or labels shown before the slice
+            number in each panel title.  Defaults to "Slice".
+        slice_axis (int or list of int, optional): The axis to slice along (0, 1, or 2).
+            Defaults to the last axis (2).
+        cmap (str, optional): The colormap.  Defaults to 'gray'.
+        show_instructions (bool, optional): If True, the viewer shows the "Press h for help"
+            hint.  Defaults to True.
+        block (bool, optional): If True, the function returns after the window is closed.  If
+            False, the function returns at once.  In that case, the window becomes fully
+            interactive when the next blocking call to slice_viewer runs.  That call returns
+            after all open windows are closed.  Defaults to True.
+        save_fn (callable, optional): A function that replaces the built-in HDF5 writer.  The
+            viewer calls it as ``save_fn(file_path, array, array_name, attributes_dict)``.
 
     Returns:
-        SliceViewer: the viewer object.  Nonblocking callers may keep it to
-        interact programmatically; a module-level registry also keeps it
-        alive if the return value is dropped.
+        SliceViewer: The viewer object.  The viewer stays open even if the caller discards the
+        return value.
     """
     viewer = SliceViewer(*datasets, data_dicts=data_dicts, title=title,
                          vmin=vmin, vmax=vmax, slice_label=slice_label,
@@ -2343,8 +2312,8 @@ def slice_viewer(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
     if not block:
         _NONBLOCKING_VIEWERS.append(viewer)
         return viewer
-    # The blocking show returned, so earlier nonblocking viewers are closed here.
-    # Under TkAgg the garbage collection also runs here, on the main thread.
+    # The blocking show has returned, so this code closes the earlier nonblocking viewers.
+    # With TkAgg, this code also runs garbage collection on the main thread.
     for nonblocking_viewer in _NONBLOCKING_VIEWERS:
         plt.close(nonblocking_viewer.fig)
     _NONBLOCKING_VIEWERS.clear()

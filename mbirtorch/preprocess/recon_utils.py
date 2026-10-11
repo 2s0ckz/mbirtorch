@@ -4,14 +4,16 @@ from mbirtorch import _sharding
 
 __all__ = ['segment_plastic_metal', 'multi_threshold_otsu', 'apply_cylindrical_mask']
 
-# Largest number of elements in one chunk of the per-shard histogram passes.
+# The largest number of elements in one chunk when the histogram is computed one shard at a time.
 _HISTOGRAM_CHUNK_ELEMENTS = 1 << 24
 
 
 def _shard_valid_masks(valid_mask, placement, ndim):
-    """Split a broadcastable host mask into one piece per shard.
+    """This function splits a mask in host memory into one piece for each shard.
 
-    Returns a list of numpy arrays, or a list of Nones when there is no mask.
+    A shard is the part of a volume that is stored on one device.  If the mask has length 1 on
+    the shard axis, each piece is the whole mask.  If ``valid_mask`` is None, the function
+    returns a list of None values.
     """
     if valid_mask is None:
         return [None] * placement.n_devices
@@ -29,10 +31,10 @@ def _shard_valid_masks(valid_mask, placement, ndim):
 
 
 def _shard_chunks(tensor, mask_piece):
-    """Yield (chunk, mask_chunk) pairs over the leading axis.
+    """This function splits a tensor along its first axis and yields (chunk, mask_chunk) pairs.
 
-    Each chunk holds at most _HISTOGRAM_CHUNK_ELEMENTS elements.  The mask
-    chunk is a torch bool tensor broadcast to the chunk's shape, or None.
+    Each chunk has at most ``_HISTOGRAM_CHUNK_ELEMENTS`` elements.  Each mask_chunk is a torch
+    bool tensor or None.
     """
     per_row = max(1, int(np.prod(tensor.shape[1:], dtype=np.int64)))
     step = max(1, _HISTOGRAM_CHUNK_ELEMENTS // per_row)
@@ -50,33 +52,31 @@ def _shard_chunks(tensor, mask_piece):
 
 
 def _sharded_masked_histogram(shards, valid_mask, num_bins):
-    """Histogram the valid entries of a sharded volume, one shard at a time.
+    """This function computes the histogram of the valid entries of a sharded volume, one shard
+    at a time.
 
-    The volume is never gathered.  Only the per-shard count tables leave a
-    device.  The binning here is a truncated float32 multiply, so a few values
-    near a bin edge can land in a different bin than np.histogram would choose.
+    A value near a bin edge can fall in a different bin than the bin that np.histogram chooses.
 
     Returns:
-        (hist, bin_edges): host numpy arrays, int64 counts and numpy's edges.
+        tuple: (hist, bin_edges).  Both are numpy arrays in host memory.  ``hist`` holds int64
+        counts, and ``bin_edges`` holds the edges that np.histogram computes.
 
     Raises:
-        ValueError: if the valid entries are empty or span a degenerate range.
+        ValueError: If there are no valid entries, or if all valid entries have the same value.
     """
     masks = _shard_valid_masks(valid_mask, shards.placement,
                                shards.tensors[0].ndim)
 
-    # Pass 1 takes the masked min and max per chunk and combines them on the host.
     lo, hi = np.inf, -np.inf
     for t, mp in zip(shards.tensors, masks):
         for chunk, mc in _shard_chunks(t, mp):
             vals = chunk.reshape(-1) if mc is None else chunk[mc]
             if vals.numel() == 0:
-                continue          # The shard is empty, or the mask excludes it.
+                continue          # The chunk is empty, or the mask excludes all of it.
             lo = min(lo, float(vals.min()))
             hi = max(hi, float(vals.max()))
 
-    # A degenerate range raises rather than binning.  numpy expands a zero
-    # width range when it derives edges, so the counts and edges would disagree.
+    # A range of zero width raises an error, because numpy would widen it silently.
     if not (np.isfinite(lo) and np.isfinite(hi)):
         raise ValueError(
             'The sharded volume has no valid entries to histogram: every '
@@ -87,8 +87,7 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
             f'(min == max), so there are no intensity classes to separate.  '
             f'Segmentation needs a volume that takes more than one value.')
 
-    # Pass 2 counts each chunk into num_bins buckets on the device and sums the
-    # counts on the host.  The value hi lands in the last bin, which is closed.
+    # Each chunk is counted on its own device.  The last bin is closed, so the value hi falls in it.
     hist = np.zeros(num_bins, dtype=np.int64)
     scale = num_bins / (hi - lo)
     for t, mp in zip(shards.tensors, masks):
@@ -101,8 +100,7 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
                               max=num_bins - 1)
             hist += torch.bincount(idx, minlength=num_bins).cpu().numpy()
 
-    # The edges come from np.histogram on an empty array, so the sharded and
-    # unsharded paths use the same edge arithmetic.
+    # np.histogram on an empty array gives the same bin edges as the unsharded case.
     edges_dtype = shards.dtype
     empty = np.empty(0, dtype=str(edges_dtype).replace('torch.', ''))
     _, bin_edges = np.histogram(empty, bins=num_bins, range=(float(lo), float(hi)))
@@ -110,37 +108,35 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
 
 
 def _masked_histogram(image, valid_mask, num_bins, xp):
-    """Histogram the valid entries of ``image`` over their own min to max range.
+    """This function computes the histogram of the valid entries of ``image``.
 
-    Invalid entries are replaced by a finite sentinel above the range, which
-    ``histogram`` then drops.  The constants are typed to ``image.dtype`` so
-    that ``where`` does not upcast and double the size of the temporaries.
+    The histogram range runs from the smallest to the largest valid entry.
     """
     inf = xp.asarray(xp.inf, dtype=image.dtype)
     lo = xp.min(xp.where(valid_mask, image, inf))
     hi = xp.max(xp.where(valid_mask, image, -inf))
-    sentinel = hi + xp.maximum(xp.abs(hi), xp.asarray(1.0, dtype=image.dtype))  # Finite and above hi.
-    # The range endpoints are Python floats.  numpy computes the bin edges in
-    # the dtype of the range, and float32 endpoints would shift some edges.
+    sentinel = hi + xp.maximum(xp.abs(hi), xp.asarray(1.0, dtype=image.dtype))  # Above hi, so outside the range.
+    # The range endpoints are Python floats.  float32 endpoints would shift some edges.
     return xp.histogram(xp.where(valid_mask, image, sentinel), bins=num_bins, range=(float(lo), float(hi)))
 
 
 def multi_threshold_otsu(image, classes=2, num_bins=1024, valid_mask=None):
     """
-    Compute the Otsu thresholds that divide an image into ``classes`` intensity classes.
+    This function computes the Otsu thresholds that divide an image into ``classes`` intensity
+    classes.
 
-    The thresholds minimize the within-class variance of the histogram.  Nothing is segmented; apply
-    the thresholds yourself.  A numpy array, a tensor, or a sharded volume is accepted.
+    The thresholds minimize the within-class variance of the histogram.  The image can be a
+    numpy array, a torch tensor, or a sharded volume.
 
     Args:
-        image (numpy.ndarray, torch.Tensor, or Shards): Image of floating-point values.
-        classes (int, optional): The number of classes, at least 2.  Defaults to 2.
-        num_bins (int, optional): Histogram bins.  Defaults to 1024.
-        valid_mask (array or None, optional): Boolean mask of the entries to include.  None includes
-            all.  Defaults to None.
+        image (numpy.ndarray, torch.Tensor, or Shards): The image, with floating-point values.
+        classes (int, optional): The number of classes.  It must be at least 2.  Defaults to 2.
+        num_bins (int, optional): The number of histogram bins.  Defaults to 1024.
+        valid_mask (array or None, optional): A boolean mask of the entries to include.  If
+            None, the function includes all entries.  Defaults to None.
 
     Returns:
-        list of float: ``classes - 1`` thresholds in increasing order.
+        list of float: The ``classes - 1`` thresholds in increasing order.
 
     Example:
         >>> low, high = multi_threshold_otsu(recon, classes=3)
@@ -166,55 +162,50 @@ def multi_threshold_otsu(image, classes=2, num_bins=1024, valid_mask=None):
 
     thresholds = _otsu_thresholds_dp(hist, classes - 1)
 
-    # bin_edges[t] is the cut for boundary t.  Values below it fall in bins
-    # less than t, which are the lower classes.
+    # Values below bin_edges[t] fall in the lower classes.
     scaled_thresholds = [bin_edges[t] for t in thresholds]
 
     return scaled_thresholds
 
 
 def _otsu_thresholds_dp(hist, num_thresholds):
-    """Find multi-threshold Otsu boundaries by dynamic programming.
+    """This function finds the multi-threshold Otsu class boundaries by dynamic programming.
 
-    The returned boundaries are half open.  Boundary ``t`` means that bin ``t``
-    starts the next class, so the matching threshold value is ``bin_edges[t]``.
+    A boundary ``t`` means that bin ``t`` is the first bin of the next class.
 
     Args:
-        hist (ndarray): Histogram counts of the image.
-        num_thresholds (int): Number of thresholds to find.
+        hist (ndarray): The histogram counts of the image.
+        num_thresholds (int): The number of thresholds to find.
 
     Returns:
-        list of int: strictly increasing boundary indices in ``[1, len(hist) - 1]``.
+        list of int: The boundary indices in strictly increasing order, in ``[1, len(hist) - 1]``.
     """
     if num_thresholds == 0:
         return []
 
     hist = np.asarray(hist, dtype=np.float64)
     num_bins = len(hist)
-    # The bin coordinates are centered and scaled to [-1, 1].  This leaves the
-    # thresholds unchanged and keeps the moment prefix sums well conditioned.
-    half_span = max((num_bins - 1) / 2.0, 1.0)     # The max guards a one bin histogram.
+    # The bin coordinates are scaled to [-1, 1] so that the prefix sums are well conditioned.
+    half_span = max((num_bins - 1) / 2.0, 1.0)     # The max handles a one-bin histogram.
     bin_coord = (np.arange(num_bins, dtype=np.float64) - (num_bins - 1) / 2.0) / half_span
 
-    # Each prefix sum has a leading zero, so the moment of bins [a, b) is P[b] - P[a].
+    # Each prefix sum P starts with a zero, so the moment of bins [a, b) is P[b] - P[a].
     m0 = np.concatenate(([0.0], np.cumsum(hist)))
     m1 = np.concatenate(([0.0], np.cumsum(bin_coord * hist)))
     m2 = np.concatenate(([0.0], np.cumsum(bin_coord * bin_coord * hist)))
 
-    # Entry [a, b] of each outer difference is the moment of bins [a, b).
     int_m0 = m0[None, :] - m0[:, None]
     int_m1 = m1[None, :] - m1[:, None]
     int_m2 = m2[None, :] - m2[:, None]
 
-    # The within class cost of bins [a, b) is M2 - M1^2/M0, and an empty interval costs
-    # zero.  Entries with a >= b are infinite, so the boundaries must increase.
+    # The within-class cost of bins [a, b) is M2 - M1^2/M0.  An empty interval has cost zero.
+    # Entries with a >= b are set to infinity.
     mean_sq_term = np.divide(int_m1 ** 2, int_m0, out=np.zeros_like(int_m0), where=int_m0 > 0)
-    cost = np.maximum(int_m2 - mean_sq_term, 0.0)      # Clip negative rounding residue.
+    cost = np.maximum(int_m2 - mean_sq_term, 0.0)      # Rounding can make the cost slightly negative.
     invalid = ~np.triu(np.ones((num_bins + 1, num_bins + 1), dtype=bool), k=1)   # a >= b
     cost[invalid] = np.inf
 
-    # best[b] is the least cost of covering bins [0, b) with the classes so far.
-    # Each stage adds one class and records the argmin for the backtrack.
+    # best[b] is the smallest cost of dividing bins [0, b) into the classes placed so far.
     best = cost[0, :].copy()                           # One class covering [0, b).
     split_of = np.zeros((num_thresholds, num_bins + 1), dtype=np.int64)
     for stage in range(num_thresholds):
@@ -222,7 +213,6 @@ def _otsu_thresholds_dp(hist, num_thresholds):
         split_of[stage] = np.argmin(total, axis=0)
         best = np.min(total, axis=0)
 
-    # The backtrack starts at b = num_bins and walks the stages in reverse.
     boundaries = []
     b = num_bins
     for stage in range(num_thresholds - 1, -1, -1):
@@ -233,34 +223,35 @@ def _otsu_thresholds_dp(hist, num_thresholds):
 
 def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None, bottom_margin=None):
     """
-    Segment a reconstruction into a plastic mask and one mask per metal.
+    This function segments a reconstruction into a plastic mask and one mask for each metal.
 
-    The volume is masked with :func:`apply_cylindrical_mask` and split into ``num_metal + 2``
-    classes by Otsu thresholds.  The lowest class is background, the next is plastic, and the rest
-    are the metals in order of increasing value.  The scale of a mask is the mean of the volume over
-    it.  A numpy array, a tensor, or a sharded volume is accepted, and the masks come back in the
-    same form.
+    The function first applies :func:`apply_cylindrical_mask` to the volume.  It then uses Otsu
+    thresholds to divide the volume into ``num_metal + 2`` classes.  The classes are the
+    background, the plastic, and the metals in order of increasing value.  The scale of each mask
+    is the mean of the volume over the mask.  The masks have the same type as ``recon``.
 
     Args:
-        recon (numpy.ndarray, torch.Tensor, or Shards): Reconstruction, shape (num_rows, num_cols, num_slices).
+        recon (numpy.ndarray, torch.Tensor, or Shards): The reconstruction, with shape
+            (num_rows, num_cols, num_slices).
         num_metal (int): The number of metals.
-        radial_margin (int or None, optional): Pixels taken off the cylinder radius.  None uses
+        radial_margin (int or None, optional): The number of pixels subtracted from the cylinder
+            radius.  If None, the function uses
             ``max(2, min(10, min(num_rows, num_cols) // 25))``.  Defaults to None.
-        top_margin (int or None, optional): Slices masked at the top.  None uses
-            ``max(2, min(10, num_slices // 25))``.  Defaults to None.
-        bottom_margin (int or None, optional): Slices masked at the bottom.  None as for
-            ``top_margin``.  Defaults to None.
+        top_margin (int or None, optional): The number of slices masked at the top.  If None,
+            the function uses ``max(2, min(10, num_slices // 25))``.  Defaults to None.
+        bottom_margin (int or None, optional): The number of slices masked at the bottom.  If
+            None, the function uses the same default as ``top_margin``.  Defaults to None.
 
     Returns:
-        tuple: ``(plastic_mask, metal_masks, plastic_scale, metal_scales)``: the plastic mask, a
-        list of ``num_metal`` metal masks, and the scale of each as a float.
+        tuple: ``(plastic_mask, metal_masks, plastic_scale, metal_scales)``.  ``metal_masks`` is
+        a list of ``num_metal`` masks.  ``plastic_scale`` is a float, and ``metal_scales`` is a
+        list of floats.
     """
     if num_metal <= 0:
         raise ValueError("num_metal must be positive")
 
     is_shards = isinstance(recon, _sharding.Shards)
     if is_shards and recon.placement.is_trivial:
-        # There is one shard, so the tensor path handles it.
         pl = recon.placement
         plastic_mask, metal_masks, plastic_scale, metal_scales = segment_plastic_metal(
             recon.tensors[0], num_metal, radial_margin=radial_margin,
@@ -269,8 +260,6 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
                 [_sharding.Shards([m], pl) for m in metal_masks],
                 plastic_scale, metal_scales)
 
-    # The default margins scale with the volume, so the mask never removes a
-    # large fraction of a small field of view.
     shape = recon.tensors[0].shape if is_shards else recon.shape
     num_slices = recon.placement.axis_len if is_shards else recon.shape[2]
     if radial_margin is None:
@@ -280,7 +269,6 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
     if bottom_margin is None:
         bottom_margin = max(2, min(10, num_slices // 25))
 
-    # The mask removes flash at the boundary of the recon.
     recon = apply_cylindrical_mask(recon, radial_margin=radial_margin, top_margin=top_margin,
                                        bottom_margin=bottom_margin)
 
@@ -288,7 +276,6 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
 
     is_torch = isinstance(recon, torch.Tensor)
 
-    # Plastic is the lowest class.
     plastic_low_threshold = thresholds[0]
     plastic_metal_threshold = thresholds[1]
 
@@ -297,8 +284,6 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
 
     def class_mask(lower, upper):
         if is_shards:
-            # The mask is built on each shard's own device and comes back
-            # sharded the same way as the volume.
             return _sharding.Shards(
                 [_tensor_class_mask(t, lower, upper) for t in recon.tensors],
                 recon.placement)
@@ -324,23 +309,26 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
 
 def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0):
     """
-    Zero the voxels of a reconstruction outside a centered cylinder.
+    This function sets to zero the voxels of a reconstruction that lie outside a centered
+    cylinder.
 
-    The radius of the cylinder is half the larger of the row and column extents, less
-    ``radial_margin``, and ``top_margin`` and ``bottom_margin`` slices are zeroed at the two ends.
-    This removes the flash that a reconstruction leaves at the boundary of the volume.  A numpy
-    array, a tensor, or a sharded volume is masked where it sits and returned in the same form.
+    This mask removes bright artifacts at the edge of the volume.  The cylinder radius is half the
+    larger of the row and column extents, minus ``radial_margin``.  The function does not modify
+    ``recon``.
 
     Args:
-        recon (numpy.ndarray, torch.Tensor, or Shards): Reconstruction, shape (num_rows, num_cols, num_slices).
-        radial_margin (int, optional): Pixels taken off the cylinder radius.  Defaults to 0.
-        top_margin (int, optional): Slices zeroed at the top.  Defaults to 0.
-        bottom_margin (int, optional): Slices zeroed at the bottom.  Defaults to 0.
+        recon (numpy.ndarray, torch.Tensor, or Shards): The reconstruction, with shape
+            (num_rows, num_cols, num_slices).
+        radial_margin (int, optional): The number of pixels subtracted from the cylinder radius.
+            Defaults to 0.
+        top_margin (int, optional): The number of slices set to zero at the top.  Defaults to 0.
+        bottom_margin (int, optional): The number of slices set to zero at the bottom.
+            Defaults to 0.
 
     Returns:
-        The masked reconstruction, the shape and type of ``recon``.
+        The masked reconstruction, with the same shape and type as ``recon``.
     """
-    # The top and bottom margins are global slice ranges, so each shard zeroes its own overlap with them.
+    # The top and bottom margins count slices of the whole volume, not of one shard.
     if isinstance(recon, _sharding.Shards):
         pl = recon.placement
         num_slices = pl.axis_len
@@ -378,10 +366,9 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
         dist_sq = (row_coords - row_center) ** 2 + (col_coords - col_center) ** 2
         circular_mask = (dist_sq <= radius ** 2).astype(recon.dtype)
 
-    # This multiply allocates the array that is returned.  The input is not modified.
+    # This multiplication creates a new array, so the input is not modified.
     recon = recon * circular_mask[:, :, None]
 
-    # Zero the top and bottom margins in place on that new array.
     if top_margin > 0:
         recon[:, :, :top_margin] = 0
     if bottom_margin > 0:
@@ -392,26 +379,24 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
 
 def compute_scaling_factor(target_vect, vect_to_scale) -> float:
     """
-    Approximate the optimal scalar α that minimizes the squared error ‖target_vect – α vect_to_scale‖².
-    This is computed as <target_vect, vect_to_scale> / (<vect_to_scale, vect_to_scale> + epsilon) to
-    avoid division by 0, hence is only approximate for vect_to_scale near 0.
+    This function returns the scalar α that approximately minimizes
+    ‖target_vect – α vect_to_scale‖².
+
+    The function computes α as
+    <target_vect, vect_to_scale> / (<vect_to_scale, vect_to_scale> + epsilon), with epsilon = 1e-8.
 
     Args:
-        target_vect (ndarray or tensor):
-            Target reconstruction vector or array of shape (N,) or higher-dimensional.
-        vect_to_scale (ndarray or tensor):
-            Vector or array of same shape as `target_vect`.
+        target_vect (ndarray or tensor): The target array, of any shape.
+        vect_to_scale (ndarray or tensor): An array with the same shape as ``target_vect``.
 
     Returns:
-        float:
-            Scalar α minimizing ‖target_vect – α vect_to_scale‖².
+        float: The scalar α.
 
     Example:
         >>> v = np.array([1.0, 2.0, 3.0])
         >>> u = np.array([0.5, 1.0, 1.5])
         >>> alpha = compute_scaling_factor(v,u)
     """
-    # A sharded input is summed on each shard's own device, and the sums are combined on the host.
     if isinstance(target_vect, _sharding.Shards):
         numerator = 0.0
         denominator = 0.0
@@ -436,8 +421,7 @@ def compute_scaling_factor(target_vect, vect_to_scale) -> float:
 
 
 def _dot_sums(target_vect, vect_to_scale):
-    """The two inner products <v,t> and <v,v>, computed in chunks along the leading axis.  A whole
-    array product would allocate a temporary as large as the input."""
+    """This function returns the inner products <v,t> and <v,v>."""
     numerator = 0.0
     denominator = 0.0
     per_row = max(1, int(np.prod(target_vect.shape[1:], dtype=np.int64)))

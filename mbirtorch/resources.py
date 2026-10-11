@@ -1,8 +1,6 @@
-"""Estimates the GPU memory and the compute time of a reconstruction before it runs.
-
-The estimate needs only the model, not the data, so it runs on any computer.  Memory comes
-from the same functions that mbirtorch calls at the start of every reconstruction.  Times
-come from measured speeds stored in ``data/gpu_speeds.json``.
+"""This module estimates the GPU memory and the compute time of a reconstruction before it
+runs.  The estimate needs only the model, not the data.  The time estimates use measured speeds
+stored in ``data/gpu_speeds.json``.
 """
 import dataclasses
 import importlib.resources
@@ -23,16 +21,17 @@ __all__ = ['estimate_resources']
 
 _GIB = 2 ** 30
 
-#: The overlap recon_split_sino uses by default, in detector rows.
+#: The default overlap, in detector rows, that ``recon_split_sino`` uses.
 _SPLIT_HALF_OVERLAP = 5
 
-#: The default fewest slices of a parallel beam section, as in ParallelBeamModel.recon_split_sino.
+#: The default minimum number of slices in each section of a parallel beam split reconstruction.
 _MIN_SLICES_PER_SECTION = 200
 
-#: The memory a GPU driver keeps for itself when the speed file has no value for the GPU model, in GiB.
+#: The memory, in GiB, that the GPU driver keeps.  The estimate uses this value when the speed
+#: file has no value for the GPU.
 _DEFAULT_DRIVER_RESERVE_GIB = 2.0
 
-#: The factor that bounds the reported time: the estimate aims to be within this factor of the measured time.
+#: The time estimate is meant to be within this factor of the measured time.
 _TIME_ACCURACY_FACTOR = 1.5
 
 _STEP_NAMES = {'direct': 'direct reconstruction', 'recon': 'full reconstruction',
@@ -41,11 +40,10 @@ _STEP_NAMES = {'direct': 'direct reconstruction', 'recon': 'full reconstruction'
 
 @dataclasses.dataclass
 class _StepEstimate:
-    """This class is used to hold the estimate for one step: its GPU memory, whether it fits, and its time.
-
-    ``gpu_memory_gib`` includes the safety margin of the runtime memory check.  ``fits`` is
-    None when the GPU memory is unknown.  ``time_minutes`` is None when no speed data covers
-    the case.  ``note`` says why a value is missing, or how a split was made.
+    """This class is used to hold the estimate for one reconstruction step.  The estimate
+    gives the GPU memory, whether the step fits, and the time.  ``fits`` is None when the GPU
+    memory is unknown.  ``time_minutes`` is None when the speed file has no data for the case.
+    ``note`` says why a value is missing.
     """
     gpu_memory_gib: float = None
     fits: bool = None
@@ -55,7 +53,8 @@ class _StepEstimate:
 
 @dataclasses.dataclass
 class _ResourceEstimate:
-    """This class is used to hold the estimate for one model on the named hardware.  Printing it gives the report."""
+    """This class is used to hold the estimate for one model on the named hardware.
+    Printing an instance gives the report."""
     model_name: str
     sinogram_shape: tuple
     recon_shape: tuple
@@ -113,19 +112,15 @@ class _ResourceEstimate:
 
 
 def estimate_resources(ct_model, gpu_model='H100', num_gpus=1, gpu_memory_gb=None, max_iterations=15):
-    """This function estimates the GPU memory and the compute time that a reconstruction needs on
-    hardware the user names.  It covers the direct reconstruction, the full reconstruction, and the
-    split reconstruction of ``recon_split_sino``.
+    """This function estimates the GPU memory and the compute time that a
+    reconstruction needs on hardware that the user names.  The function makes estimates for
+    the direct reconstruction, the full reconstruction, and the split reconstruction
+    (``recon_split_sino``).
 
-    The memory is computed by the same code that checks memory at the start of every
-    reconstruction, applied to a temporary copy of the model, so a run the estimate says fits will
-    pass that check.  The times come from measured speeds that ship with mbirtorch in the speed
-    file.  The estimate needs no data and no GPU, so it runs on a laptop in seconds, and it does
-    not change ``ct_model``.  It assumes the reconstruction uses weights.  A value that cannot be
-    estimated is reported as not available, with the reason.
-
-    The function is used by building a model and naming the hardware, as in the example below.
-    Printing the result gives the report.
+    The memory estimate uses the same memory check that mbirtorch runs at the start of every
+    reconstruction.  If the estimate says that a reconstruction fits, then that check passes.
+    The estimate needs no data and no GPU.  The function does not change ``ct_model``.  The
+    estimate assumes that the reconstruction uses weights.
 
     Args:
         ct_model (TomographyModel): The model to estimate.
@@ -134,12 +129,12 @@ def estimate_resources(ct_model, gpu_model='H100', num_gpus=1, gpu_memory_gb=Non
         num_gpus (int, optional): The number of GPUs the job will use.  Defaults to 1.
         gpu_memory_gb (float, optional): The memory of each GPU, as printed on the card.
             Defaults to the value stored for ``gpu_model``.
-        max_iterations (int, optional): The number of iterations, as in ``recon``.  Defaults to 15.
+        max_iterations (int, optional): The number of iterations, as in ``recon``.  Defaults
+            to 15.
 
     Returns:
-        An estimate.  Printing it gives the report.  A script reads the numbers
-        from ``estimate.direct``, ``estimate.recon``, or ``estimate.split``, one for each step.
-        Each has these values:
+        An estimate.  Printing it gives the report.  ``estimate.direct``, ``estimate.recon``,
+        and ``estimate.split`` each have these values:
 
         - ``gpu_memory_gib``: the memory each GPU needs, in GiB.
         - ``fits``: True if that memory fits on each GPU, False if not, and None if the GPU
@@ -178,7 +173,8 @@ def estimate_resources(ct_model, gpu_model='H100', num_gpus=1, gpu_memory_gb=Non
             'total': 2 * sino_gib + recon_gib}
 
     def step(model, workload, iterations, gpus=num_gpus):
-        """Returns the _StepEstimate of one ordinary reconstruction of ``model`` on ``gpus`` GPUs."""
+        """This function returns the _StepEstimate of one reconstruction of ``model`` on
+        ``gpus`` GPUs, without splitting."""
         memory = _gpu_memory_gib(model, gpus, workload)
         fits = None if usable is None else memory <= usable
         minutes, reason = _time_minutes(model, speeds, speed_reason, gpu_model, gpus, workload, iterations)
@@ -196,10 +192,9 @@ def estimate_resources(ct_model, gpu_model='H100', num_gpus=1, gpu_memory_gb=Non
 
 
 def projection_work(ct_model):
-    """Returns the projection work W of one forward or back projection: voxels times views.
-
-    The speed file's time lines are fitted in W, so the update script computes W with this
-    same function.
+    """This function returns the projection work W of one forward or back projection.  W is
+    the number of voxels times the number of views.  The speed file gives each time as a
+    linear function of W.
     """
     num_views = int(ct_model.get_params('sinogram_shape')[0])
     return float(math.prod(int(n) for n in ct_model.get_params('recon_shape'))) * num_views
@@ -208,9 +203,9 @@ def projection_work(ct_model):
 # ── memory ──────────────────────────────────────────────────────────────────────────────
 
 def _gpu_projection_functions(ct_model):
-    """Returns the (forward, back) projection functions a CUDA GPU runs for this geometry.
-
-    Returns None for a geometry whose projection functions do not depend on the computer.
+    """This function returns the (forward, back) projection functions that a CUDA GPU runs
+    for this geometry.  The function returns None when the geometry uses the same functions on
+    every kind of device.
     """
     if isinstance(ct_model, ConeBeamModel):
         from .triton_cone import _cone_back_view_batch_triton, _cone_forward_view_batch_triton
@@ -225,20 +220,18 @@ def _gpu_projection_functions(ct_model):
 
 
 def _gpu_memory_gib(ct_model, num_gpus, workload, weights=True):
-    """Returns the GPU memory a reconstruction of ``ct_model`` needs on each of ``num_gpus`` GPUs, in GiB.
-
-    The memory is computed by the model's own memory calculation, with its safety margin, on
-    a temporary copy of the model that uses the projection functions of a CUDA GPU.
+    """This function returns the GPU memory, in GiB, that a reconstruction of ``ct_model``
+    needs on each of ``num_gpus`` GPUs.  The value includes the safety margin.
     """
     model = copy_ct_model(ct_model, no_warning=True)
     gpu_functions = _gpu_projection_functions(model)
     if gpu_functions is not None:
-        # Set on the copy only, so no other model is affected.
+        # This line changes only the copy, not ct_model.
         model._view_batch_bodies = lambda: gpu_functions
     devices = [torch.device(f'cuda:{i}') for i in range(num_gpus)]
     call_arrays = {}
     if weights:
-        # A read-only array of the sinogram's shape that occupies no memory.
+        # This read-only array has the shape of the sinogram and uses almost no memory.
         shape = tuple(int(n) for n in model.get_params('sinogram_shape'))
         call_arrays['weights'] = np.broadcast_to(np.ones(1, dtype=np.float32), shape)
     ledger = model._build_memory_ledger(devices=devices, workload=workload, **call_arrays)
@@ -248,10 +241,8 @@ def _gpu_memory_gib(ct_model, num_gpus, workload, weights=True):
 # ── split reconstruction ────────────────────────────────────────────────────────────────
 
 def _split_estimate(ct_model, num_gpus, usable, step, max_iterations):
-    """Returns the _StepEstimate of ``recon_split_sino``: the largest section's memory and the time of the slowest group.
-
-    The GPUs are divided into groups by the same method recon_split_sino uses.  Groups run
-    side by side, and each group runs its sections one after another.
+    """This function returns the _StepEstimate of ``recon_split_sino``.  The memory is the
+    memory of the largest section.  The time is the time of the slowest group of GPUs.
     """
     devices = list(range(num_gpus))
 
@@ -282,7 +273,9 @@ def _split_estimate(ct_model, num_gpus, usable, step, max_iterations):
 
 
 def _slowest_group_minutes(times, num_groups):
-    """Returns when the last group finishes, when each group takes the next waiting section."""
+    """This function returns the time, in minutes, at which the last group of GPUs finishes.
+    The function assumes that each group starts the next waiting section when it finishes its
+    current section."""
     finish = [0.0] * num_groups
     for minutes in times:
         group = finish.index(min(finish))
@@ -291,9 +284,9 @@ def _slowest_group_minutes(times, num_groups):
 
 
 def _cone_split_parts(ct_model):
-    """Returns the two part models ConeBeamModel.recon_split_sino reconstructs, and a note.
-
-    The cut and the overlaps follow the formulas in ConeBeamModel.recon_split_sino.
+    """This function returns the two part models that ConeBeamModel.recon_split_sino
+    reconstructs, and a note.  Each part model is a copy of ``ct_model`` with fewer detector
+    rows and fewer slices.
     """
     if any(np.asarray(ct_model.get_params('view_params_array'))[:, 1] != 0):
         return None, 'not available for a helical scan'
@@ -328,10 +321,8 @@ def _cone_split_parts(ct_model):
 
 
 def _parallel_split_sections(ct_model, num_gpus, usable):
-    """Returns the section models ParallelBeamModel.recon_split_sino reconstructs, a note, and the GPUs per group.
-
-    The sections and the groups follow the rule recon_split_sino applies on the GPUs present,
-    with the stated GPUs instead.
+    """This function returns the section models that ParallelBeamModel.recon_split_sino
+    reconstructs on the given GPUs, a note, and the number of GPUs in each group.
     """
     num_rows = int(ct_model.get_params('sinogram_shape')[1])
     recon_rows, recon_cols = (int(n) for n in ct_model.get_params('recon_shape')[:2])
@@ -367,11 +358,8 @@ def _parallel_split_sections(ct_model, num_gpus, usable):
 
 
 def _parallel_largest_section_rows(num_rows, num_sections, half_overlap):
-    """Returns the detector rows of the largest section when ParallelBeamModel.recon_split_sino makes ``num_sections``.
-
-    It is the bound recon_split_sino uses to choose the number of sections: the largest kept
-    section plus ``half_overlap`` rows for each side it shares with another section.  It can
-    exceed the real largest section by a row when the sections are unequal.
+    """This function returns the number of detector rows in the largest section model when
+    ParallelBeamModel.recon_split_sino makes ``num_sections`` sections.
     """
     biggest = -(-num_rows // num_sections)
     if num_sections == 1:
@@ -380,7 +368,8 @@ def _parallel_largest_section_rows(num_rows, num_sections, half_overlap):
 
 
 def _part_model(ct_model, num_rows, recon_shape):
-    """Returns a copy of ``ct_model`` with ``num_rows`` detector rows and ``recon_shape``."""
+    """This function returns a copy of ``ct_model`` with ``num_rows`` detector rows and
+    ``recon_shape``."""
     model = copy_ct_model(ct_model, new_num_det_rows=num_rows, no_warning=True)
     model.set_params(no_warning=True, auto_regularize_flag=False, recon_shape=recon_shape)
     return model
@@ -389,7 +378,8 @@ def _part_model(ct_model, num_rows, recon_shape):
 # ── time ────────────────────────────────────────────────────────────────────────────────
 
 def _load_speed_file():
-    """Returns the speed file's contents and None, or None and the reason it could not be read."""
+    """This function returns the contents of the speed file and None.  If the file cannot be
+    read, the function returns None and the reason."""
     try:
         text = importlib.resources.files('mbirtorch').joinpath('data/gpu_speeds.json').read_text()
         return json.loads(text), None
@@ -398,7 +388,8 @@ def _load_speed_file():
 
 
 def _geometry_key(ct_model):
-    """Returns the speed file's name for the geometry of ``ct_model``."""
+    """This function returns the name that the speed file uses for the geometry of
+    ``ct_model``."""
     for cls, key in ((ConeBeamModel, 'cone'), (ParallelBeamModel, 'parallel'),
                      (MultiAxisParallelModel, 'multiaxis'), (TranslationModel, 'translation')):
         if isinstance(ct_model, cls):
@@ -407,7 +398,8 @@ def _geometry_key(ct_model):
 
 
 def _time_minutes(ct_model, speeds, speed_reason, gpu_model, num_gpus, workload, iterations):
-    """Returns the time of one ordinary reconstruction in minutes and a note, or None and the reason."""
+    """This function returns the time, in minutes, of one reconstruction without splitting,
+    and a note.  If no time is available, the function returns None and the reason."""
     if speeds is None:
         return None, speed_reason
     gpu = speeds['gpus'].get(gpu_model)

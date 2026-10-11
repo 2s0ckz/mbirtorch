@@ -1,13 +1,9 @@
-"""Partitions, masks, and weights.
+"""This module builds pixel partitions, masks, and sinogram weights.
 
-The partition generators run in numpy.  They draw from the global np.random
-state by default, and from a ``numpy.random.Generator`` given as ``rng``.
-That call sequence is deliberate: restart reproducibility depends on a
-seeded run drawing the identical subsets in the identical order.  Do not
-reorder the calls.  :func:`named_rng` builds the generator of one named
-draw of a seeded run, so that a draw depends on neither the thread that
-makes it nor the moment it is made.  Not implemented: the grid and
-blue-noise partition variants.
+The partition functions draw random numbers from the global np.random state.  If the caller
+passes a ``numpy.random.Generator`` as ``rng``, they draw from that generator instead.  A run
+with a fixed seed must draw the same subsets in the same order.  For this reason, the order of
+the random calls must not change.
 """
 
 import warnings
@@ -20,18 +16,14 @@ from . import _sharding
 
 def named_rng(seed, name):
     """
-    Return the random generator of one named draw of a seeded run.
-
-    The generator depends on the seed and the name alone, so two draws with
-    the same pair agree whatever thread, moment, or process makes them, and
-    two draws with different names are independent.
+    This function returns a random generator for one named use within a run with a fixed seed.
+    The generator depends only on the seed and the name.  As a result, it does not depend on
+    which thread uses it.
 
     Args:
-        seed (int or None): the seed of the run.  None returns None, which
-            every generator argument in this package takes to mean the global
-            np.random state.
-        name (int or str): what the draw is for, such as an iteration number
-            or a short word.
+        seed (int or None): The seed of the run.  If the seed is None, the function returns
+            None.  Every ``rng`` argument in mbirtorch treats None as the global np.random state.
+        name (int or str): A label for the use, such as an iteration number or a short word.
 
     Returns:
         numpy.random.Generator or None
@@ -39,15 +31,15 @@ def named_rng(seed, name):
     if seed is None:
         return None
     if isinstance(name, str):
-        # A seed sequence takes integers, so the name is read as one.
+        # A seed sequence takes only integers, so the name is converted to an integer.
         name = int.from_bytes(name.encode('utf-8'), 'little')
     return np.random.default_rng([int(seed), int(name)])
 
 
 def named_seed(seed, name):
     """
-    Return the seed of one named part of a seeded run, which that part then
-    uses as its own seed.  None returns None.
+    This function returns a seed for one named part of a run with a fixed seed.  That part then
+    uses the returned seed as its own seed.  If ``seed`` is None, the function returns None.
     """
     generator = named_rng(seed, name)
     return None if generator is None else int(generator.integers(1 << 31))
@@ -56,28 +48,27 @@ def named_seed(seed, name):
 def get_2d_ror_mask(recon_shape, *, use_ror_mask=True, crop_radius_pixels=0,
                     crop_radius_fraction=0.0):
     """
-    Get a binary mask for the region of reconstruction.  By default, the mask is
-    an ellipse inscribed in the edges of the 2D recon_shape[0:2].  The size of
-    this ellipse can be reduced by setting crop_radius_pixels or
-    crop_radius_fraction, either of which is subtracted from the ellipse axes.
-    Only one of these can be nonzero.  Negative values are clipped to 0.
+    This function returns a binary mask for the region of reconstruction.  By default, the mask
+    is an ellipse inscribed in the rectangle of size recon_shape[0:2].  The function shrinks
+    the axes of the ellipse by ``crop_radius_pixels`` or by ``crop_radius_fraction``.  At most
+    one of these two arguments can be nonzero.
 
     Args:
-        recon_shape (tuple): Shape of recon in (rows, columns, slices), or just
+        recon_shape (tuple): The shape of the recon as (rows, columns, slices) or as
             (rows, columns).
-        use_ror_mask (default is True):
+        use_ror_mask (bool or ndarray, optional): The type of mask.  Defaults to True.
             False:
-                No mask.
+                The mask is all True.
             True:
                 The mask is an ellipse inscribed in the reconstruction volume.
             2D array:
-                Use a custom binary mask.  Must have shape recon_shape[:2].
-        crop_radius_pixels (int): Number of column-pixel-equivalent pixels to
-            subtract from the radius.
-        crop_radius_fraction (float): Fraction to subtract from each axis radius.
+                The function uses this binary mask.  It must have shape recon_shape[:2].
+        crop_radius_pixels (int): The number of pixels to subtract from each radius of the
+            ellipse.  Negative values are treated as 0.
+        crop_radius_fraction (float): The fraction to subtract from each radius of the ellipse.
 
     Returns:
-        np.ndarray: Boolean 2D binary mask.
+        np.ndarray: A 2D boolean mask.
     """
     if use_ror_mask is False:
         if crop_radius_pixels != 0 and crop_radius_fraction != 0.0:
@@ -86,7 +77,6 @@ def get_2d_ror_mask(recon_shape, *, use_ror_mask=True, crop_radius_pixels=0,
         return np.ones(recon_shape[:2], dtype=bool)
 
     elif use_ror_mask is True:
-        # Set up a mask to zero out points outside the RoR.
         if crop_radius_pixels != 0 and crop_radius_fraction != 0.0:
             raise ValueError('Only one of crop_radius_pixels and crop_radius_fraction '
                              'can be nonzero.')
@@ -118,12 +108,12 @@ def get_2d_ror_mask(recon_shape, *, use_ror_mask=True, crop_radius_pixels=0,
 
 
 def get_support_radius(recon_shape, delta_voxel_row, delta_voxel_col, use_ror_mask=True):
-    """Maximum distance (in ALU) from the rotation axis to the outer edge of any
-    voxel the projectors can update.  With the default inscribed-ellipse mask the
-    farthest updatable pixels sit at the ends of the longer grid axis (half the
-    larger physical width); with the mask disabled (or custom) the conservative
-    half-diagonal is used.  Overestimating only pads slightly; underestimating
-    reintroduces truncation artifacts."""
+    """This function returns the largest distance, in ALU, from the rotation axis to the outer
+    edge of any voxel that the projectors can update.
+
+    With the default mask, this distance is half of the larger physical width of the volume.
+    Otherwise, it is half of the diagonal.
+    """
     num_rows, num_cols = recon_shape[:2]
     half_width_row = 0.5 * num_rows * delta_voxel_row
     half_width_col = 0.5 * num_cols * delta_voxel_col
@@ -134,24 +124,21 @@ def get_support_radius(recon_shape, delta_voxel_row, delta_voxel_col, use_ror_ma
 
 def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True, rng=None):
     """
-    Generates a partition of pixel indices into a specified number of subsets for
-    use in tomographic reconstruction algorithms.  The function ensures that each
-    subset contains an equal number of pixels, suitable for VCD reconstruction.
-
-    The random call sequence here (permutation, then choice) and the
-    single-subset RNG skip are deliberate; seeded runs must reproduce exactly.
-    Do not reorder the calls.
+    This function divides the pixel indices into ``num_subsets`` random subsets of equal size
+    for VCD reconstruction.  A run with a fixed seed must give the same subsets every time.  For
+    this reason, the order of the random calls must not change.
 
     Args:
-        recon_shape (tuple): Shape of recon in (rows, columns, slices).
-        num_subsets (int): The number of subsets to divide the pixel indices into.
-        use_ror_mask: as in :func:`get_2d_ror_mask` (True / False / custom array).
-        rng (numpy.random.Generator, optional): the generator the subsets are
-            drawn from.  Defaults to None, the global np.random state.
+        recon_shape (tuple): The shape of the recon as (rows, columns, slices).
+        num_subsets (int): The number of subsets.
+        use_ror_mask (bool or ndarray, optional): The mask, as in :func:`get_2d_ror_mask`.
+            Defaults to True.
+        rng (numpy.random.Generator, optional): The generator that draws the subsets.  None
+            means the global np.random state.  Defaults to None.
 
     Returns:
-        np.ndarray: each row is a subset of pixel indices, sorted within each
-        subset.
+        np.ndarray: An array in which each row is one subset of pixel indices.  The indices in
+        each row are sorted.
     """
     draw = np.random if rng is None else rng
     num_recon_rows, num_recon_cols = recon_shape[:2]
@@ -167,18 +154,16 @@ def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True, rng=None):
                       'pixels in the region of reconstruction.  \nReducing the number '
                       'of subsets to equal the number of indices.')
 
-    # A single subset is not permuted, so that it does not advance the
-    # generator.  A restarted reconstruction then draws the same subsets.
+    # The function does not permute a single subset, so it does not advance the generator.
     if num_subsets == 1:
         return np.sort(indices).reshape(1, -1)
 
-    # The index array is padded to a length divisible by num_subsets.
     num_indices_per_subset = int(np.ceil(len(indices) / num_subsets))
     array_size = num_subsets * num_indices_per_subset
     num_extra_indices = array_size - len(indices)
     indices = draw.permutation(indices)
 
-    # The padding indices are drawn from outside the final subset.
+    # The extra indices that pad the subsets to equal size come from outside the final subset.
     num_non_final_indices = (num_subsets - 1) * num_indices_per_subset
     extra_indices = draw.choice(indices[:num_non_final_indices],
                                 size=num_extra_indices, replace=False)
@@ -191,20 +176,21 @@ def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True, rng=None):
 def gen_set_of_pixel_partitions(recon_shape, granularity, device=None, use_ror_mask=True,
                                 rng=None):
     """
-    Generates a collection of voxel partitions for an array of specified
-    partition sizes -- one randomly generated 2D partition per granularity entry.
+    This function generates one random pixel partition for each entry of ``granularity``.
 
     Args:
-        recon_shape (tuple): Shape of recon in (rows, columns, slices).
-        granularity (list or tuple): num_subsets to use for each partition.
-        device (torch.device): device on which to place each partition tensor.
-        use_ror_mask: as in :func:`get_2d_ror_mask`.
-        rng (numpy.random.Generator, optional): the generator the partitions
-            are drawn from.  Defaults to None, the global np.random state.
+        recon_shape (tuple): The shape of the recon as (rows, columns, slices).
+        granularity (list or tuple): The number of subsets in each partition.
+        device (torch.device, optional): The device that holds each partition tensor.
+            Defaults to None.
+        use_ror_mask (bool or ndarray, optional): The mask, as in :func:`get_2d_ror_mask`.
+            Defaults to True.
+        rng (numpy.random.Generator, optional): The generator that draws the partitions.  None
+            means the global np.random state.  Defaults to None.
 
     Returns:
-        list of int64 tensors, each a partition of voxels into the specified
-        number of subsets.
+        list of torch.Tensor: One int64 tensor for each partition.  Each tensor divides the
+        pixels into the given number of subsets.
     """
     partitions = []
     for num_subsets in granularity:
@@ -217,8 +203,9 @@ def gen_set_of_pixel_partitions(recon_shape, granularity, device=None, use_ror_m
 
 def gen_partition_sequence(partition_sequence, max_iterations):
     """
-    Generates a sequence of voxel partitions of the specified length by extending
-    the sequence with the last element if necessary (or trimming it).
+    This function returns a partition sequence of length ``max_iterations``.  If the input
+    sequence is too long, the function truncates it.  If the input is too short, the function
+    extends it by repeating its last element.
     """
     partition_sequence = np.array(partition_sequence)
     current_length = partition_sequence.size
@@ -230,8 +217,7 @@ def gen_partition_sequence(partition_sequence, max_iterations):
 
 def gen_full_indices(recon_shape, use_ror_mask=True):
     """
-    Generates a full array of voxels in the region of reconstruction.
-    This is useful for computing forward projections.
+    This function returns the indices of every pixel in the region of reconstruction.
     """
     partition = gen_pixel_partition(recon_shape, num_subsets=1, use_ror_mask=use_ror_mask)
     return partition[0]
@@ -239,42 +225,35 @@ def gen_full_indices(recon_shape, use_ror_mask=True):
 
 def gen_weights(sinogram, weight_type):
     """
-    Compute optional weights used in MBIR reconstruction based on the noise model.
-
-    The weights should be proportional to the inverse variance of the noise for
-    each sinogram entry.  They can be used to improve reconstruction quality.
-
-    The weights are computed where the input is: a numpy sinogram yields numpy
-    weights, and a torch tensor yields a tensor on the same device.  A sinogram
-    already placed on the devices is rejected, because the arithmetic here
-    reads host arrays and single tensors only.  Compute the weights from the
-    host sinogram first, then place both at once with
-    ``prepare_sino_for_devices``.
+    This function computes weights for MBIR reconstruction from a noise model.  The weights are
+    proportional to the inverse noise variance of each sinogram entry.  A numpy sinogram gives
+    numpy weights.  A tensor sinogram gives a tensor on the same device.
 
     Args:
-        sinogram (ndarray or tensor): 3D array of shape
-            (num_views, num_det_rows, num_det_channels).  A sinogram in sharded form is not accepted.
-        weight_type (str): The type of noise model to use for weighting.  One of:
-            - 'unweighted': Use uniform weights (all ones).
-            - 'transmission': Use exponential decay, `exp(-sinogram)`.
-            - 'transmission_root': Use square-root decay, `exp(-sinogram / 2)`.
-            - 'emission': Use reciprocal decay, `1 / (abs(sinogram) + 0.1)`.
+        sinogram (ndarray or tensor): A 3D array of shape
+            (num_views, num_det_rows, num_det_channels).  The function does not accept a
+            sinogram that is already divided among the GPUs.  The weights are computed from the
+            sinogram in CPU memory.  Then ``prepare_sino_for_devices`` copies both arrays to the GPUs.
+        weight_type (str): The noise model.  It is one of the following:
+            - 'unweighted': All weights are one.
+            - 'transmission': The weights are `exp(-sinogram)`.
+            - 'transmission_root': The weights are `exp(-sinogram / 2)`.
+            - 'emission': The weights are `1 / (abs(sinogram) + 0.1)`.
 
     Returns:
-        ndarray or tensor: weights with the same shape as the input, in the
-        input's form and place.
+        ndarray or tensor: The weights.  They have the same shape, type, and device as the
+        sinogram.
 
     Raises:
-        ValueError: If `sinogram` is in sharded form.
-        Exception: If `weight_type` is not one of the supported options.
+        ValueError: If ``sinogram`` is already divided among the GPUs.
+        Exception: If ``weight_type`` is not one of the supported options.
 
     Note:
-        For transmission noise models, sinogram values should not be excessively
-        large (e.g., > 5), as this corresponds to near-zero transmission, which
-        is not physically meaningful in typical X-ray imaging.
+        For the transmission noise models, a sinogram value above about 5 means that the
+        transmission is near zero.  Such values are not physically meaningful in typical
+        X-ray imaging.
     """
-    # A placed sinogram would fall through to the numpy branch below and give
-    # a wrong answer with no error, so it is refused here.
+    # Without this check, a divided sinogram would give a wrong answer with no error below.
     if isinstance(sinogram, _sharding.Shards):
         raise ValueError(
             'gen_weights does not accept a sinogram that has been placed on '
@@ -297,17 +276,15 @@ def gen_weights(sinogram, weight_type):
 
 def estimate_background_cluster_boundaries(sinogram):
     """
-    Estimate background cluster left and right boundaries from the sinogram
-    histogram.  This function assumes that the background takes on values near
-    zero.
+    This function estimates the left and right boundaries of the background cluster in the
+    sinogram histogram.  The function assumes that the background values are near zero.
 
     Args:
-        sinogram (ndarray): 3D array with shape
-            (num_views, num_det_rows, num_det_channels).
+        sinogram (ndarray): A 3D array with shape (num_views, num_det_rows, num_det_channels).
 
     Returns:
-        left_boundary (float): value of the left boundary of the background cluster.
-        right_boundary (float): value of the right boundary of the background cluster.
+        left_boundary (float): The left boundary of the background cluster.
+        right_boundary (float): The right boundary of the background cluster.
     """
     hist, edges = np.histogram(np.asarray(sinogram).ravel(), bins=400)
     centers = 0.5 * (edges[:-1] + edges[1:])
@@ -325,8 +302,7 @@ def estimate_background_cluster_boundaries(sinogram):
     else:
         peak_idx = min(peak_indices, key=lambda i: abs(centers[i] - 0.0))
 
-    # The background cluster ends where the histogram falls to a tenth of the
-    # peak height.
+    # The background cluster ends where the histogram falls to one tenth of the peak height.
     cutoff = 0.1 * hist[peak_idx]
 
     left_boundary_idx = peak_idx
@@ -341,60 +317,54 @@ def estimate_background_cluster_boundaries(sinogram):
 
 def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, beta=1.0, gamma=3.0):
     """
-    Generates the weights used for reducing metal artifacts in MBIR reconstruction.
-
-    This function computes sinogram weights that help to reduce metal artifacts.
-    More specifically, it computes weights with the form:
+    This function computes sinogram weights that reduce metal artifacts:
 
         weights = exp( -(sinogram/beta) * ( 1 + gamma * delta(metal) ) )
 
-    delta(metal) denotes a binary mask indicating the sino entries that contain projections of metal.
-    Providing ``init_recon`` yields better metal artifact reduction.
-    If not provided, the metal segmentation is generated directly from the sinogram.
+    where delta(metal) is 1 for sinogram entries that contain projections of metal.  An
+    ``init_recon`` gives better metal artifact reduction.  Without ``init_recon``, the function
+    finds the metal directly in the sinogram.
 
     Args:
-        ct_model (TomographyModel): The model used to forward project the metal mask.  It is used
-            only when ``init_recon`` is given.
-        sinogram (ndarray): 3D array containing sinogram with shape (num_views, num_det_rows, num_det_channels).
-        init_recon (ndarray, optional): An initial reconstruction used to identify metal voxels. If not provided, Otsu's method is used to directly segment sinogram into metal regions.
-        metal_threshold (float, optional): Values in ``init_recon`` above ``metal_threshold`` are classified as metal. If not provided, Otsu's method is used to segment ``init_recon``.
-        beta (float, optional): Scalar value in range :math:`>0`.
-            A larger ``beta`` improves the noise uniformity, but too large a value may increase the overall noise level.
-        gamma (float, optional): Scalar value in range :math:`>=0`.
-            A larger ``gamma`` reduces the weight of sinogram entries with metal, but too large a value may reduce image quality inside the metal regions.
+        ct_model (TomographyModel): The model that forward projects the metal mask.  The
+            function uses it only when ``init_recon`` is given.
+        sinogram (ndarray): A 3D sinogram with shape (num_views, num_det_rows, num_det_channels).
+        init_recon (ndarray, optional): An initial reconstruction used to find the metal voxels.
+            If it is not given, Otsu's method segments the sinogram directly.
+        metal_threshold (float, optional): Values in ``init_recon`` above ``metal_threshold``
+            are metal.  If it is not given, Otsu's method segments ``init_recon``.
+        beta (float, optional): A scalar greater than 0.  A larger ``beta`` makes the noise
+            more uniform.  Too large a value can increase the overall noise level.
+        gamma (float, optional): A scalar greater than or equal to 0.  A larger ``gamma``
+            reduces the weight of sinogram entries with metal.  Too large a value can reduce
+            image quality inside the metal regions.
 
     Returns:
-        (ndarray): Weights used in reconstruction, with the same array shape as ``sinogram``
+        (ndarray): The weights, with the same shape as ``sinogram``.
 
     Raises:
-        TypeError: If ``sinogram`` or ``init_recon`` is in the divided device form.
+        TypeError: If ``sinogram`` or ``init_recon`` is already divided among the GPUs.
 
     Note:
-        Only the ``init_recon`` branch uses the devices.  On that branch, and
-        on a model whose device layout is still automatic, this call also
-        decides the layout before it forward projects, and every later
-        reconstruction on the model reuses it.  The decision runs the memory
-        check, so the call can raise
-        ``MemoryPreflightError`` for a problem
-        too large for the available devices.  The Otsu branch works on the
-        host throughout and leaves the layout alone.
+        Suppose that ``init_recon`` is given and that the user has not chosen the GPUs of the
+        model.  Then this call chooses the GPUs, and later reconstructions with the model use
+        them.  The call can also raise ``MemoryPreflightError`` if the problem is too large for
+        the available GPUs.
     """
-    # The thresholding and the exponential below run on whole host arrays, so
-    # a divided array is refused here.
     _sharding.reject_shards('gen_weights_mar', sinogram=sinogram,
                             init_recon=init_recon)
 
     import mbirtorch.preprocess as mtp
 
-    # With no init_recon, the distorted sinogram entries are found by Otsu
-    # thresholding with three classes: metal, non-metal, and background.
+    # Without init_recon, Otsu's method splits the sinogram into three classes: metal,
+    # non-metal, and background.
     if init_recon is None:
         print("init_recon is not provided. Automatically determine distorted sinogram entries with Otsu's method.")
         [bk_thresh_sino, metal_thresh_sino] = mtp.multi_threshold_otsu(sinogram, classes=3)
         print("Distorted sinogram threshold = ", metal_thresh_sino)
         delta_metal = (np.asarray(sinogram) > metal_thresh_sino).astype(np.float32)
 
-    # With an init_recon, they are found by forward projecting the metal mask.
+    # With init_recon, the function forward projects the metal mask.
     else:
         if metal_threshold is None:
             print("Metal_threshold calculated with Otsu's method.")
@@ -402,13 +372,10 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
 
         print("metal_threshold = ", metal_threshold)
         metal_mask = (np.asarray(init_recon) > metal_threshold).astype(np.float32)
-        # This branch is the only one that reaches a device, so the model's
-        # layout is settled here before the projection places anything.
+        # This call chooses the GPUs before the projection copies anything to them.
         ct_model._apply_device_policy()
         metal_mask_projected = ct_model.forward_project(metal_mask)
 
-        # In delta_metal, 1 marks a distorted sinogram entry and 0 marks the
-        # rest.
         delta_metal = (np.asarray(metal_mask_projected) > 0.0).astype(np.float32)
 
     weights = np.exp(-np.asarray(sinogram) * (1 + gamma * delta_metal) / beta)

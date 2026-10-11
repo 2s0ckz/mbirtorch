@@ -1,26 +1,24 @@
-"""mbirtorch: model-based iterative reconstruction for computed tomography, in PyTorch.
+"""This package performs model-based iterative reconstruction (MBIR) for computed tomography.
 
-The package reconstructs volumes from tomographic measurements for several
-scanner geometries.  The public API takes numpy arrays and returns numpy
-arrays by default; pass ``output_sharded=True`` to get the device tensor
-instead.  All available GPUs are used automatically.
+mbirtorch is written in PyTorch and supports several scanner geometries.  By default, the
+public functions take and return numpy arrays.  With ``output_sharded=True``, a function returns
+the tensor on the GPUs instead.  mbirtorch uses all available GPUs automatically.
 """
 
 __version__ = "0.1.2"
 
-# The torch.compile caches are pinned under ~/.mbirtorch, so compiled code survives a process.
-# These settings take effect only if mbirtorch is imported before torch compiles anything.
+# These lines put the torch.compile caches under ~/.mbirtorch.  They take effect only if
+# mbirtorch is imported before torch compiles anything.
 import os as _os
 
 _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
                        _os.path.expanduser("~/.mbirtorch/torch_cache"))
 _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
-# Triton caches its kernels separately from inductor, so that cache is pinned too.
+# Triton keeps a separate cache for its kernels, so this line puts that cache there too.
 _os.environ.setdefault("TRITON_CACHE_DIR",
                        _os.path.expanduser("~/.mbirtorch/triton_cache"))
 
-# A warning when torch has one host thread on a machine with more cores, which a shell
-# variable set to one causes and which slows every host-side operation of the package.
+# This call warns when torch uses one CPU thread on a machine with more cores.
 from ._host_threads import warn_if_threads_unused as _warn_if_threads_unused
 _warn_if_threads_unused()
 
@@ -53,8 +51,7 @@ from .utilities import (gen_shepp_logan_3d, clear_cache,
 from .memory_stats import get_memory_stats
 from .resources import estimate_resources
 
-# __all__ is the declared public surface, and autodoc documents exactly these names.
-# The other imported names remain importable, but they are not promised as public API.
+# autodoc documents exactly the names in __all__.
 __all__ = [
     "ParallelBeamModel", "ConeBeamModel", "TranslationModel",
     "MultiAxisParallelModel", "TomographyModel", "QGGMRFDenoiser",
@@ -71,23 +68,23 @@ __all__ = [
     "stitch_arrays", "get_ct_model", "copy_ct_model", "save_volume_as_gif",
     "MACE4DModel", "temporal_filter_matrix", "apply_temporal_filter",
     "gen_demo_data", "gen_demo_data_4d", "gen_shepp_logan_3d_reference",
-    # These hsnt and vcls names resolve lazily through __getattr__.
+    # Python imports these names on first access through __getattr__.
     "hyper_denoise", "dehydrate", "rehydrate", "import_hsnt_data_hdf5",
     "create_hsnt_metadata", "export_hsnt_data_hdf5", "generate_hyper_data",
     "synthetic_material_basis", "gen_material_phantom", "generate_hyper_sinogram",
     "get_opt_views", "show_image_with_projection_rays",
 ]
 
-# Lazy exports (PEP 562) resolve on first attribute access, so importing mbirtorch does
-# not pull in matplotlib or the preprocess, hsnt and vcls dependencies.
+# Python imports these names on first access (PEP 562).  As a result, importing mbirtorch
+# does not import matplotlib or the dependencies of preprocess, hsnt, and vcls.
 _VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer",
                    "GeometryScene", "GeometryFigure", "geometry_viewer",
                    "SliceViewer4D", "VolumeStack4D", "slice_viewer4d")
 
 _LAZY_MODULES = ("preprocess", "hsnt", "vcls", "mace")
 
-# Each package level name is mapped to the module that defines it.  A new
-# public function in one of those modules needs a line here.
+# This dict maps each package-level name to the module that defines it.  A new public
+# function in one of these modules needs a line here.
 _LAZY_NAMES = {
     'hyper_denoise': 'hsnt', 'dehydrate': 'hsnt', 'rehydrate': 'hsnt',
     'import_hsnt_data_hdf5': 'hsnt', 'create_hsnt_metadata': 'hsnt',
@@ -99,10 +96,9 @@ _LAZY_NAMES = {
     'compute_cov_matrix': 'vcls', 'compute_vcl': 'vcls',
     'compute_opt_angle_subset': 'vcls', 'get_2d_subsampling_indices': 'vcls',
     'show_image_with_projection_rays': 'vcls', 'reorder_by_priority': 'vcls',
-    # The blue noise pattern is a 382 KB array literal, loaded on first use.
+    # The blue noise pattern is a 382 KB array that is loaded on first use.
     'bn256': 'bn256',
-    # The one call function mace() is reached as mbirtorch.mace.mace.  It is
-    # not exported at package level.
+    # The function mace() is available as mbirtorch.mace.mace, not at the package level.
     'MACE': 'mace', 'Task': 'mace', 'ForwardProxAgent': 'mace',
     'QGGMRFDenoiserAgent': 'mace', 'HyperplaneAgent': 'mace',
     'resolve_device_pool': 'mace',
@@ -110,8 +106,8 @@ _LAZY_NAMES = {
     'temporal_filter_matrix': 'mace4d', 'apply_temporal_filter': 'mace4d',
 }
 
-# Editors and type checkers do not call __getattr__, so the lazy names are listed below as
-# imports that never execute.  tests/test_lazy_exports.py checks them against the tables above.
+# These imports are for editors and type checkers only.  tests/test_lazy_exports.py checks
+# them.
 if TYPE_CHECKING:
     from . import preprocess, hsnt, vcls, mace
     from .view_utils import (SliceViewer, VolumeStack, slice_viewer,
@@ -138,7 +134,7 @@ def __getattr__(name):
     if name in _VIEWER_EXPORTS:
         from . import view_utils
         value = getattr(view_utils, name)
-        globals()[name] = value  # Later accesses skip this hook.
+        globals()[name] = value  # Later accesses do not call __getattr__.
         return value
     if name in _LAZY_MODULES:
         value = importlib.import_module('.' + name, __name__)

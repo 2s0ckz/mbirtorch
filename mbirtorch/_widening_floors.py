@@ -1,88 +1,13 @@
-"""Per-geometry, per-count SPEED floors for the automatic device count.
+"""This module holds a table of minimum problem sizes for multi-GPU reconstruction.
+For each model type and device count, the table gives the smallest problem size at which
+the automatic device choice uses that many devices.
 
-The automatic device-count policy
-(:meth:`TomographyModel._apply_device_policy`) picks the widest device count
-whose modeled peak memory fits.  Fitting is not the same as being faster:
-widening a small problem was measured 13x slower on parallel beam and 5.1x
-slower on a sparse-view shape.  A floor is the problem size, in SINOGRAM
-ELEMENTS (``prod(sinogram_shape)``), at or above which a device count is
-worth using.  Below its floor a count is not admitted by the automatic path
--- not removed from the search, only pushed behind every admitted count, so
-capacity still wins when nothing admitted fits.  A count of 1 is always
-admitted.
-
-Sinogram elements is the size metric because the decision site knows the
-sinogram shape before any array is placed, and because measurement chose it:
-on a sparse-view problem whose sinogram elements and recon voxels point at
-different sizes, widening to two devices was a 1.87x regression, which is
-what the sinogram count predicts.
-
-Each count's floor is the size at which it overtakes the best SMALLER
-ADMITTED count, not where it overtakes one device: the parallel n=4 floor is
-where n=4 overtakes n=2.  Where the measurement brackets the crossing point
-between two tested sizes, the floor takes the larger, because the risk is
-lopsided -- widening too early has cost multiples, while holding a
-just-large-enough problem at a smaller count costs a few percent.
-
-The table is COARSE by rule (ruled 2026-08-19).  A count is admitted at the
-smallest measured class where it wins by at least :data:`ADMISSION_MARGIN`,
-and a thinner win rounds the floor up one class.  The margin is what
-survives a different GPU, a different shape in the same class, and
-run-to-run drift; the earlier rule admitted any win wider than the cell's
-warm spread, which shipped admissions as thin as 1.02x.  Where parallel and
-cone measure the same floor at a count, the table carries one shared row
-for the pair rather than two values that agree by coincidence, and the
-rows' notes name the sharing (the n=4 rows share today; the n=2 rows split
-when the sorted forward kernel moved parallel's crossover).
-
-``elements=None`` -- a "sentinel" row, as the refusal message and the tests
-call it -- records a count with no admission SIZE at or below the largest
-size tested.  It is not a permanent refusal: it excludes that count
-everywhere until a refresh finds an admission size, and it carries
-``largest_tested`` so the refresh knows where to start.  Two rows are in
-that state today, both the denoiser's: splitting lost at every size
-probed.  Four more rows were sentinels until 2026-08-20 -- both multiaxis
-and both translation rows -- held down by a torch recompile mechanism the
-projection remedy removed; their notes and multigpu_findings.md sections
-1.36 through 1.38 carry that history.  In every sentinel case the
-automatic path holds those models to fewer devices and only capacity
-widens them.
-A count with no row inherits the row of the next MEASURED count
-above it (n=3 is governed by the n=4 floor, as is any count above 4), and a
-model declaring no ``_floor_family`` gets the parallel floors, with the
-reason string and the verbose-2 log both saying so.
-
-The nightly runs validate none of this: every one of them, n=1 included, pins
-the count through ``MBIRTORCH_NUM_DEVICES``, and a pin bypasses the guard by
-construction.  The chosen-count tests in ``tests/test_device_policy.py`` are
-the standing coverage -- the only place the ordering rule runs end to end.
-
-MAINTENANCE.  These are measurements, only as good as the projection code
-they were taken against, and a table that no longer matches that code still
-governs and still runs.  The first guard consultation in a process hashes the
-projection-cost inputs against :data:`BLESSED_COST_HASHES`, and
-:func:`stale_note` names whatever moved on every automatic device selection
-until it stops moving; ``tests/test_widening_floors.py`` prints the same
-report, warns, and PASSES, because out-of-date numbers are a reason to
-re-measure rather than a reason to stop a reconstruction or a test run.  Two
-things do fail hard: :data:`TABLE_CHECKSUM` binds the floors, the recorded
-hashes and :data:`STALE_SINCE` into one unit, so hand-editing a hash to
-silence the note is caught, and the provenance checks (dates, brackets,
-floors rising with the count) are assertions.
-``dev_scripts/refresh_widening_floors.py`` is the SOLE writer of those three
-constants, and pasting its output is the one thing that clears the note.  The
-cost inputs are named PER FAMILY (:data:`FAMILY_COST_INPUTS`), so the note
-says which families' floors a change touched, and the refresh tool's
-``--families`` mode re-measures exactly those.  If code that determines
-projection cost MOVES (a new driver function in ``tomography_model``,
-batching logic moving to a new file), add it to :data:`FAMILY_COST_INPUTS`
-under every family it prices in the same change and re-record the hashes:
-the check covers only what it names.
-
-Set the environment variable named in :data:`GUARD_ENV_VAR` to ``0`` to turn
-the guard off and restore the pure capacity order.  An explicit
-``configure_devices`` call and ``MBIRTORCH_NUM_DEVICES`` bypass it anyway: a
-count the caller named is not the library's to second-guess.
+The problem size is the number of sinogram elements, ``prod(sinogram_shape)``.  Below
+the minimum size, mbirtorch uses that device count only when no other count fits in
+memory.  mbirtorch always allows one device.  A device count with no table row uses the
+row of the next larger measured count.  A row with ``elements=None`` has no measured
+minimum size.  The sizes are measured, and the program
+``dev_scripts/refresh_widening_floors.py`` writes them.
 """
 
 import hashlib
@@ -90,64 +15,50 @@ import inspect
 import os
 from collections import namedtuple
 
-#: Set to '0' (or 'false'/'no'/'off') to disable the speed guard entirely.
+#: Setting this environment variable to '0', 'false', 'no', or 'off' turns off the minimum
+#: size check.
 GUARD_ENV_VAR = 'MBIRTORCH_WIDENING_GUARD'
 _GUARD_OFF_VALUES = ('0', 'false', 'no', 'off')
 
-#: The family a model with no ``_floor_family`` is governed by.
+#: The model type used for a model that has no ``_floor_family`` attribute.
 DEFAULT_FAMILY = 'parallel'
 
-#: The hardware and the run protocol every row below was measured under.
+#: The hardware and the run settings used to measure every row of the table.
 MEASURED_GPU = 'NVIDIA H100 80GB HBM3 (4 per node)'
 MEASURED_CONFIG = ('warm median of 3 seeded 3-iteration VCD recons, cold '
                    'pass discarded, package-default subset schedule, Triton '
                    'kernels on, torch.compile auto')
 
-#: These floors are validated at MEASURED_CONFIG only.  A different iteration
-#: count or a different subset schedule moves the per-subset host-sync cost
-#: that sets these crossovers, so it falls outside what was measured: the
-#: floors are still applied there, but they were not validated there.  A
-#: workload that runs at a different configuration should re-measure rather
-#: than assume.
+#: The sizes were measured only with MEASURED_CONFIG.  Other iteration counts and
+#: subset schedules were not measured.
 MEASUREMENT_CAVEAT = ('validated at MEASURED_CONFIG only; a different '
                       'iteration count or subset schedule is outside the '
                       'measured envelope')
 
-#: The coarse admission rule's margin (ruled 2026-08-19).  A device count's
-#: floor is the smallest measured class where it beats the best smaller
-#: admitted count by at least this factor; a thinner win rounds the floor up
-#: one class.  A win must also clear 1.0 by more than the cell's warm spread,
-#: which keeps one noisy cell from moving a floor.  The refresh tool applies
-#: both conditions when it reads a floor off a run's speedups.
+#: The minimum speedup for a device count.  A count is allowed at the smallest measured
+#: size where it is faster than the best smaller allowed count by this factor.  The
+#: speedup must also exceed the run-to-run spread.
 ADMISSION_MARGIN = 1.15
 
-#: Where a crossover was pinned down: the largest problem size at which the
-#: count under test LOST, the smallest at which it WON, and the speedups
-#: measured there against the comparison count.  A side is None when no such
-#: size was measured; ``winning_cell is None`` is what makes ``elements``
-#: None.  A "cell" here is one measured (views, rows, channels) sinogram
-#: shape.
+#: The two measured shapes on either side of a minimum size, with their speedups.
+#: ``losing_cell`` is the largest (views, rows, channels) shape where the count was slower.
+#: ``winning_cell`` is the smallest shape where the count was faster.  Either shape is
+#: None when it was not measured.  If ``winning_cell`` is None, then ``elements`` is None.
 Bracket = namedtuple('Bracket', ('losing_cell', 'losing_speedup',
                                  'winning_cell', 'winning_speedup'))
 
-#: One row of the table.  ``elements`` is the floor in sinogram elements, or
-#: None when no admission size was measured.  ``cell`` is the (views, rows,
-#: channels) sinogram shape the floor was read off; ``against`` is the count
-#: the crossover was taken against (the best smaller ADMITTED count);
-#: ``spread`` is the widest spread among the warm repeats the row was read
-#: from, which is the run-to-run noise the crossover had to clear.
+#: One table row.  ``elements`` is the minimum size in sinogram elements, or None when
+#: no minimum size was measured.  ``cell`` is the sinogram shape where the minimum size
+#: was measured.  ``against`` is the device count used for comparison.  ``spread`` is the
+#: run-to-run spread of the time.
 Floor = namedtuple('Floor', ('family', 'count', 'elements', 'cell', 'against',
                              'bracket', 'spread', 'gpu', 'config', 'measured',
                              'commit', 'largest_tested', 'note'))
 
 # ── the measured table ───────────────────────────────────────────────────────
-# The measured shapes, each named for its view count.  For the projection
-# families these are sinogram shapes; for the denoiser the same tuples are
-# IMAGE shapes, because its sinogram shape is its image shape.
-#     384-class  (384, 336, 288)     =    37,158,912 elements
-#     512-class  (512, 448, 384)     =    88,080,384 elements
-#     768-class  (768, 672, 576)     =   297,271,296 elements
-#    1024-class  (1024, 1008, 992)   = 1,023,934,464 elements
+# Shapes are (views, rows, channels).  The notes name each shape by its view count:
+# 384-class (384, 336, 288), 512-class (512, 448, 384), 768-class (768, 672, 576), and
+# 1024-class (1024, 1008, 992).  For the denoiser, the shapes are image shapes.
 FLOORS = {
     ('cone', 2): Floor(
         family='cone', count=2, elements=88_080_384, cell=(512, 448, 384),
@@ -298,15 +209,9 @@ FLOORS = {
              'scans the n=2 note names'),
 }
 
-# ── the cost inputs the floors were measured against, named per family ───────
-#: The inputs every projection family's cost runs through: the projector
-#: assembly, the cross-device transfer primitives the multi-device drivers
-#: are built from, the utility module that holds ``padded_kernel_width``, and
-#: the three TomographyModel methods that drive the multi-device projections.
-#: A method entry is hashed over its source; a file entry is hashed WHOLE,
-#: deliberately -- the module-level chunk constants and budget class
-#: attributes these files carry are exactly the kind of tuning that moves a
-#: crossover without touching any named function.
+# ── the code the sizes were measured against ─────────────────────────────────
+#: The files and methods that determine the projection time of every model type.  The
+#: hash of a method covers its source code.  The hash of a file covers the whole file.
 _SHARED_COST_INPUTS = (
     'projectors.py', '_sharding.py', '_utils.py',
     'TomographyModel._sparse_forward_project_sharded',
@@ -314,15 +219,9 @@ _SHARED_COST_INPUTS = (
     'TomographyModel._sparse_back_project_sharded',
 )
 
-#: What prices each family's floors, so staleness is detected PER FAMILY and
-#: a refresh can be scoped to the families whose costs actually moved.  On
-#: top of the shared set, each projection family adds its geometry body file,
-#: and the three kernel families add their kernel files -- ``triton_cone.py``
-#: appears in all three because it hosts the shared kernel helpers (the
-#: Triton language shims and the compiled-launch key set) that
-#: ``triton_parallel.py`` and ``triton_multiaxis.py`` import.  The denoiser
-#: runs no projector at all, so its set is its own two modules and none of
-#: the shared set.
+#: The files and methods that determine the projection time of each model type.
+#: ``triton_cone.py`` holds functions that the other kernel files import.  The
+#: denoiser uses no projector.
 FAMILY_COST_INPUTS = {
     'parallel': _SHARED_COST_INPUTS + ('triton_parallel.py', 'triton_cone.py',
                                        'parallel_beam.py'),
@@ -334,8 +233,7 @@ FAMILY_COST_INPUTS = {
     'denoiser': ('denoising.py', 'qggmrf.py'),
 }
 
-#: Every distinct cost input across the families, split by how it is hashed.
-#: Derived from the partition above so the two views cannot drift apart.
+#: Every file and method above, separated into files and methods.
 _ALL_COST_INPUTS = sorted({name for names in FAMILY_COST_INPUTS.values()
                            for name in names})
 COST_INPUT_FILES = tuple(name for name in _ALL_COST_INPUTS
@@ -343,47 +241,8 @@ COST_INPUT_FILES = tuple(name for name in _ALL_COST_INPUTS
 COST_INPUT_METHODS = tuple(name.split('.', 1)[1] for name in _ALL_COST_INPUTS
                            if name.startswith('TomographyModel.'))
 
-#: sha256 of each cost input as of the measurements above -- the recorded
-#: ("blessed") values the live check compares against.  Re-record them with
-#: ``python dev_scripts/refresh_widening_floors.py --bless``.  Recorded
-#: 2026-08-20 with the mg48 full refresh on the recompile-remedied tree:
-#: ``projectors.py`` is the one input that moved (the remedy raises
-#: torch's per-function recompile budget on the compiling thread), it
-#: sits in the SHARED input set, and that is why the refresh was the full
-#: one -- every family re-measured rather than carried.  Every other
-#: input is unchanged since mg40 recorded it.
-#:
-#: Re-recorded later the same day for a documentation pass that edited
-#: comments and one docstring in ``denoising.py``,
-#: ``multiaxis_parallel.py`` and ``translation_model.py``.  No executable
-#: line moved in any of the three, so the mg48 measurements above still
-#: describe the code these hashes cover.
-#:
-#: Re-recorded 2026-08-22 with the mg56 full refresh (job 15435735) on
-#: the multiaxis-kernel tree, commit c024ec9.  Eight inputs had moved
-#: since mg48: the multiaxis kernel work (``triton_multiaxis.py`` joined
-#: the multiaxis family's inputs and ``multiaxis_parallel.py`` gained the
-#: kernel selection) and six files from earlier commits (``_sharding.py``,
-#: ``cone_beam.py``, ``denoising.py``, ``parallel_beam.py``,
-#: ``qggmrf.py``, ``translation_model.py``).  Every family was
-#: re-measured rather than carried, which is what makes recording all of
-#: these honest.
-#:
-#: Re-recorded 2026-08-24 for the multiaxis forward kernel's row-bound
-#: change (mg62, mg63 and mg64; multigpu_findings.md section 1.51 in the
-#: plans repository).  NOTHING WAS RE-MEASURED for this one, and the
-#: reason is that the change cannot move a cost at any cell the floors
-#: were measured at.  Two inputs moved.  ``triton_multiaxis.py`` now
-#: passes the padded detector row count as its forward kernel's row-mask
-#: bound; that is a no-op wherever the row count is already a multiple of
-#: 16, which both multiaxis floor cells are (448 rows at 88,080,384
-#: elements and 1,008 at 1,023,934,464), and it was measured as a no-op
-#: at the first of them, 307.0 ms before against 307.1 ms after.  Sizes
-#: whose row count is NOT a multiple of 16 did get faster, by about 3.2,
-#: so a crossover for such a size may have moved; the ladder has never
-#: included one, so no recorded floor describes it either way.
-#: ``_utils.py`` moved for a comment and a docstring, with no executable
-#: line changed.
+#: The sha256 of each file and method at the time the sizes were measured.
+#: ``refresh_widening_floors.py --bless`` prints new values.
 BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         'f73fa28f32d2393fac3f06139d8ddeccc55260fceb28bbca7f102334839fb5a4',
@@ -417,54 +276,36 @@ BLESSED_COST_HASHES = {
         '79c4aaaa071c03567f505978a65ed9a183908d6c11342b59ac5668fb10ad0d55',
 }
 
-#: A hand-written staleness date, or None -- currently None, from the
-#: 2026-08-10 refresh run.  A refresh ALWAYS writes None here, because
-#: :func:`stale_note` detects a changed cost input by itself and a
-#: hand-written date adds nothing.  The field stays because
-#: :data:`TABLE_CHECKSUM` binds it, and because someone may still want to
-#: record a reason to re-measure that no hash can see -- new hardware, a
-#: changed subset schedule.
+#: A date that marks the sizes as needing a new measurement, or None.  The refresh
+#: program writes None.  A person may set a date, for example after a hardware change.
 STALE_SINCE = None
 
-#: sha256 binding FLOORS, BLESSED_COST_HASHES and STALE_SINCE together.
-#: These three move as one unit or not at all -- editing a hash by hand to
-#: green the test leaves this behind, and the test says so.  Recomputed and
-#: printed by ``refresh_widening_floors.py --bless``.
+#: The sha256 of FLOORS, BLESSED_COST_HASHES, and STALE_SINCE together.  A hand edit to
+#: any of them makes a test fail.  ``refresh_widening_floors.py --bless`` prints this value.
 TABLE_CHECKSUM = 'e564710cec9ba7d789f059de69d700ec0c6d74c8b5525d70c78a0e2a3fbaca32'
 
 
-# ── the env knob ─────────────────────────────────────────────────────────────
+# ── the environment variable ─────────────────────────────────────────────────
 def guard_enabled():
-    """Whether the speed guard is consulted.  Read per call, like the other
-    environment knobs, so a test or a script can turn it off around one
-    block without reimporting anything."""
+    """This function returns True when the minimum size check is on.  The function
+    reads the environment variable on each call."""
     return os.environ.get(GUARD_ENV_VAR, '').strip().lower() \
         not in _GUARD_OFF_VALUES
 
 
-# ── staleness, detected rather than declared ─────────────────────────────────
-#: The live check for changed cost inputs, computed once per process on the
-#: first guard consultation and cached here: ``(changed_names, failure)``.
-#: None means it has not run yet.  A test that changes what the check would
-#: see resets this to None first.
+# ── the check for changed code ───────────────────────────────────────────────
+#: The saved result of the hash check, ``(changed_names, failure)``.  The value is None
+#: before the first check.
 _DRIFT_CHECK = None
 
-#: The one command that clears a staleness note, named in every note that
-#: reports one.
+#: The program that measures new sizes.  Every notice names this program.
 _REFRESH_COMMAND = 'dev_scripts/refresh_widening_floors.py'
 
 
 def _drift_check():
-    """The cost inputs that no longer hash to their recorded values, as
-    ``(names, failure)``, computed once per process.
-
-    Hashing three files and two method sources is milliseconds, but the guard
-    is consulted on every automatic device selection, so it is done once and
-    cached.  A check that CANNOT run -- a file moved mid-refactor, a method
-    renamed out from under :data:`COST_INPUT_METHODS` -- returns its failure
-    for the log instead of raising: saying the measurements need refreshing
-    must never be able to break a reconstruction, which is the whole reason
-    the note replaced a hard failure.
+    """This function returns ``(names, failure)``.  ``names`` lists the files and methods
+    whose hash has changed.  ``failure`` is an error message when the check could not run.
+    The function runs the check once per process and saves the result.
     """
     global _DRIFT_CHECK
     if _DRIFT_CHECK is None:
@@ -477,22 +318,10 @@ def _drift_check():
 
 
 def stale_note():
-    """The one-line notice for the device-selection log that the floors need
-    re-measuring, or None.
-
-    Either of two things puts a note here, and they are reported together
-    when both hold:
-
-      * A projection-cost input no longer matches its recorded hash, so the
-        floors were measured against code that has since changed.  This is
-        the ordinary path and it needs no human in it: the note names the
-        inputs that moved.
-      * :data:`STALE_SINCE` -- a hand-written date, kept for reasons to
-        re-measure that no hash can see.
-
-    A check that could not run says so rather than implying freshness.  The
-    note is advisory in every case: the floors still govern, and a real
-    refresh is what clears it.
+    """This function returns a one-line notice for the device log, or None.  The notice
+    says that the sizes need a new measurement.  The function returns a notice when the
+    projection code changed, when :data:`STALE_SINCE` is set, or when the check could not
+    run.  mbirtorch still uses the sizes in all these cases.
     """
     drifted, failure = _drift_check()
     parts = []
@@ -517,9 +346,10 @@ def stale_note():
                                                          _REFRESH_COMMAND)
 
 
-# ── the metric ───────────────────────────────────────────────────────────────
+# ── the size measure ─────────────────────────────────────────────────────────
 def sinogram_elements(sinogram_shape):
-    """``prod(sinogram_shape)`` -- the floors' metric, as an int."""
+    """This function returns ``prod(sinogram_shape)`` as an int.  The table measures
+    problem size with this number."""
     total = 1
     for extent in sinogram_shape:
         total *= int(extent)
@@ -532,7 +362,7 @@ def _millions(elements):
 
 # ── the lookup ───────────────────────────────────────────────────────────────
 def families():
-    """Every family the table has rows for."""
+    """This function returns every model type that has rows in the table."""
     return sorted({family for family, _count in FLOORS})
 
 
@@ -541,13 +371,10 @@ def _measured_counts(family):
 
 
 def governing_floor(family, count):
-    """The table row that governs ``count`` in ``family``, or None when the
-    family has no measured rows at all.
-
-    A count with no row of its own inherits the next MEASURED count ABOVE it
-    -- the conservative direction, since floors rise with the count.  A count
-    above every measured one inherits the largest measured row for the same
-    reason.
+    """This function returns the table row that applies to ``count`` devices for the model
+    type ``family``.  A count with no row uses the row of the next larger measured count.  If
+    no larger count was measured, the function returns the row of the largest count.  The
+    function returns None when the table has no rows for ``family``.
     """
     counts = _measured_counts(family)
     if not counts:
@@ -557,19 +384,18 @@ def governing_floor(family, count):
 
 
 def admitted(family, count, sino_elements):
-    """Whether the AUTOMATIC path may widen to ``count`` devices at this
-    problem size, and the sentence explaining the verdict.
+    """This function decides whether the automatic device choice may use ``count``
+    devices at this problem size.  The function returns the decision and the reason.
 
     Args:
-        family (str or None): ``'parallel'``, ``'cone'``, or None for a model
-            that declares no ``_floor_family``; None takes the parallel
-            floors.
-        count (int): the device count under test.
-        sino_elements (int): ``prod(sinogram_shape)``.
+        family (str or None): The model type, such as ``'parallel'`` or ``'cone'``.  None
+            means that the model has no ``_floor_family`` attribute, and then the function
+            uses the rows for ``'parallel'``.
+        count (int): The device count to check.
+        sino_elements (int): The problem size, ``prod(sinogram_shape)``.
 
     Returns:
-        (bool, str): admitted, and the reason -- phrased for the run log's
-        device line when it is a refusal.
+        (bool, str): True if the count is allowed, and the reason as text for the log.
     """
     resolved = DEFAULT_FAMILY if family is None else family
     substituted = ('' if family is not None else
@@ -606,12 +432,8 @@ def admitted(family, count, sino_elements):
 
 
 def fallback_reason(family, count, sino_elements):
-    """The note for a count the capacity search settles on DESPITE its floor.
-
-    An excluded count is only ever reached after every admitted count has
-    been refused, so choosing one is capacity overriding speed.  The run log
-    says which happened rather than leaving the count looking like a plain
-    rejection.
+    """This function returns the log note for a device count that mbirtorch chose below
+    its minimum size.  mbirtorch makes this choice only when no allowed count fits in memory.
     """
     resolved = DEFAULT_FAMILY if family is None else family
     floor = governing_floor(resolved, count)
@@ -628,14 +450,10 @@ def fallback_reason(family, count, sino_elements):
                                             if floor else count))
 
 
-# ── the table's own invariants ───────────────────────────────────────────────
+# ── checks on the table ──────────────────────────────────────────────────────
 def monotone_violations():
-    """Families whose FINITE floors fall as the count rises.
-
-    A higher count doing MORE work per device than a lower one at the same
-    size is not something the measurements have ever shown, and it would make
-    the two-group ordering incoherent, so the table asserts against it.
-    """
+    """This function returns the model types whose measured minimum size decreases
+    as the device count increases.  The module asserts that there are none."""
     bad = []
     for family in families():
         finite = [(count, FLOORS[(family, count)].elements)
@@ -653,14 +471,10 @@ assert not monotone_violations(), \
     + '; '.join(monotone_violations())
 
 
-# ── the cost-input hashes and the three-way binding ──────────────────────────
+# ── the hashes and the checksum ──────────────────────────────────────────────
 def cost_input_hashes():
-    """sha256 of every projection-cost input, keyed as in
-    :data:`BLESSED_COST_HASHES`.
-
-    The model class is imported lazily: this module is imported BY
-    ``tomography_model``, so a module-level import would be circular.
-    """
+    """This function returns the sha256 of every file and method that determines the
+    projection time.  The keys are the same as in :data:`BLESSED_COST_HASHES`."""
     from .tomography_model import TomographyModel
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -676,9 +490,8 @@ def cost_input_hashes():
 
 
 def stale_cost_inputs():
-    """The cost inputs whose hash no longer matches the recorded one, as
-    ``[(name, recorded, actual), ...]``.  Empty means the floors still
-    describe the code they were measured against."""
+    """This function returns the files and methods whose hash differs from the recorded
+    hash.  The result is a list of ``(name, recorded, actual)`` tuples."""
     actual = cost_input_hashes()
     stale = []
     for name in sorted(set(actual) | set(BLESSED_COST_HASHES)):
@@ -690,28 +503,24 @@ def stale_cost_inputs():
 
 
 def _families_priced_by(input_names):
-    """The floor families whose cost-input sets contain any of these names."""
+    """This function returns the model types whose list in :data:`FAMILY_COST_INPUTS`
+    includes any of the given names."""
     moved = set(input_names)
     return sorted(family for family, names in FAMILY_COST_INPUTS.items()
                   if moved & set(names))
 
 
 def stale_families():
-    """The floor families whose recorded cost inputs no longer hash to their
-    recorded values.  Empty means every family's rows still describe the code
-    they were measured against.  The refresh tool's family-scoped mode
-    measures exactly this set by default, and refuses to carry a family that
-    appears here."""
+    """This function returns the model types whose recorded hashes no longer match
+    the code.  By default, the refresh program measures these model types again and
+    replaces their rows."""
     return _families_priced_by(name for name, _want, _got
                                in stale_cost_inputs())
 
 
 def table_checksum():
-    """sha256 over the three things a refresh writes together: the floors,
-    the recorded cost-input hashes, and the staleness date.
-
-    Hand-editing one of them -- the cheap way to green the hash test -- moves
-    this and fails a different assertion, which is the point.
+    """This function returns the sha256 of FLOORS, BLESSED_COST_HASHES, and STALE_SINCE
+    together.  A hand edit to any of them makes a test fail.
     """
     payload = '\n'.join([repr(sorted(FLOORS.items())),
                          repr(sorted(BLESSED_COST_HASHES.items())),
@@ -720,13 +529,9 @@ def table_checksum():
 
 
 def bless_lines(stale_since=None):
-    """The paste-ready replacement for the three bound constants.
-
-    ``stale_since`` is None for every refresh: a changed cost input is
-    detected live, so a re-record that follows a real measurement leaves
-    :data:`STALE_SINCE` unset and the note clears itself.  The parameter
-    remains for a human recording a reason to re-measure that no hash can
-    see.
+    """This function returns new source text for BLESSED_COST_HASHES, STALE_SINCE, and
+    TABLE_CHECKSUM.  A person pastes the text into this module.  ``stale_since`` is None
+    after a refresh.  A person may pass a date instead.
     """
     hashes = cost_input_hashes()
     lines = ['BLESSED_COST_HASHES = {']

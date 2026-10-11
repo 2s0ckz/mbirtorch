@@ -1,29 +1,15 @@
-"""Per-processor memory statistics.
+"""This module reports memory statistics for each processor.
 
-``get_memory_stats`` returns one dict per processor with the bytes in use,
-the peak, and the limit, printed in GB.  The device numbers come from each
-torch backend's own allocator introspection (torch.cuda / torch.mps) and the
-host numbers from psutil.  Backends differ in what they can report, so the
-per-device dicts carry the keys their backend actually tracks (the printer
-iterates whatever is present):
+``get_memory_stats`` returns one dict for each processor.  The keys of the dict depend on the
+type of processor:
 
-- CUDA: ``bytes_in_use`` (allocated), ``peak_bytes_in_use`` (its high-water
-  mark), ``reserved_bytes`` (the caching allocator's pool, the analog of
-  jax's pool-vs-in-use distinction), ``peak_reserved_bytes`` (the pool's
-  high-water mark; both peaks reset together via
-  torch.cuda.reset_peak_memory_stats), ``cache_bytes`` (the pool beyond the
-  arrays in use -- outside tools such as nvidia-smi see only the pool plus
-  the CUDA context, so this split is only visible from inside the process),
-  and ``bytes_limit`` (the device's total memory).
-- MPS: ``bytes_in_use`` (current allocated), ``driver_bytes_in_use`` (the
-  Metal driver's total footprint), and ``bytes_limit`` (the recommended
-  working-set maximum).  MPS does not track a peak.
-- CPU: the psutil convention is deliberate -- ``bytes_in_use`` is the
-  unique set size (USS), ``peak_bytes_in_use`` the resident set size (RSS),
-  and ``bytes_limit`` the currently available physical memory.
-
-There is no inventory of live arrays here, because torch keeps no registry of
-them (torch.cuda.memory_summary is the closest native deep-dive tool).
+- CUDA: ``bytes_in_use``, ``peak_bytes_in_use``, ``reserved_bytes`` (the memory that PyTorch
+  holds), ``peak_reserved_bytes``, ``cache_bytes`` (the held memory that no array uses), and
+  ``bytes_limit`` (the total memory of the GPU).
+- MPS: ``bytes_in_use``, ``driver_bytes_in_use`` (the total memory of the Metal driver), and
+  ``bytes_limit`` (the recommended maximum).  MPS does not record a peak.
+- CPU: ``bytes_in_use`` is the unique set size, ``peak_bytes_in_use`` is the resident set
+  size, and ``bytes_limit`` is the available physical memory.
 """
 
 import os
@@ -33,18 +19,17 @@ import torch
 
 
 def get_memory_stats(print_results=True, file=None):
-    """Collect (and optionally print) memory statistics per processor.
+    """This function collects the memory use of each processor and optionally prints it.
 
     Args:
-        print_results (bool, optional): If True (default), print a formatted
-            GB summary of each processor's stats.
-        file (file-like, optional): destination for the printout (None means
-            stdout), e.g. an io.StringIO for routing into a logger.
+        print_results (bool, optional): If True, the function prints the statistics of each
+            processor in GB.  Defaults to True.
+        file (file-like, optional): The stream that receives the printout, such as an
+            ``io.StringIO``.  None means stdout.  Defaults to None.
 
     Returns:
-        list of dict: one dict per processor (devices first, then 'CPU'),
-        each with an 'id' plus the byte counts described in the module
-        docstring.
+        list of dict: One dict for each processor.  The GPUs come first and the CPU comes last.
+        Each dict holds an ``'id'`` and the byte counts described in the module docstring.
     """
     memory_stats_per_processor = []
 
@@ -56,7 +41,7 @@ def get_memory_stats(print_results=True, file=None):
             memory_stats['peak_bytes_in_use'] = torch.cuda.max_memory_allocated(i)
             memory_stats['reserved_bytes'] = torch.cuda.memory_reserved(i)
             memory_stats['peak_reserved_bytes'] = torch.cuda.max_memory_reserved(i)
-            # This is the memory held for reuse but not in any array.
+            # This is memory that PyTorch holds for reuse but that no array uses.
             memory_stats['cache_bytes'] = (memory_stats['reserved_bytes']
                                            - memory_stats['bytes_in_use'])
             memory_stats['bytes_limit'] = torch.cuda.get_device_properties(i).total_memory
@@ -73,8 +58,8 @@ def get_memory_stats(print_results=True, file=None):
     current_process = psutil.Process(os.getpid())
     memory_info = current_process.memory_full_info()
     memory_stats['id'] = 'CPU'
-    # For the CPU, bytes_in_use is the unique set size and peak_bytes_in_use
-    # is the resident set size.  This assignment is intentional.
+    # For the CPU, bytes_in_use is the unique set size, and peak_bytes_in_use is the
+    # resident set size.
     memory_stats['bytes_in_use'] = memory_info.uss
     memory_stats['peak_bytes_in_use'] = memory_info.rss
     memory_stats['bytes_limit'] = psutil.virtual_memory().available

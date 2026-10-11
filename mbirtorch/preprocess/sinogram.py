@@ -1,4 +1,5 @@
-"""Building a sinogram from the object, blank, and dark scans."""
+"""This module computes a sinogram from the object, blank, and dark scans.  It also provides
+functions that downsample and crop the scans and that remove zinger pixels from a sinogram."""
 
 import warnings
 
@@ -14,32 +15,29 @@ __all__ = ['scan_to_sino', 'crop_view_data', 'correct_zinger_pixels']
 
 
 def _reference_scan_to_host(scan):
-    """Bring a blank or dark scan to a host numpy array.  A numpy input is returned unchanged.
-
-    The reference scans are reduced on the host with numpy functions, and those functions do not
-    work correctly on a torch tensor."""
+    """This function returns a blank or dark scan as a numpy array in host memory.  The callers
+    average these scans with numpy."""
     return scan.detach().cpu().numpy() if torch.is_tensor(scan) else scan
 
 
 def _put_in_slice(array, flat_indices, value):
     """
-    Similar to numpy.put(array, flat_indices, value), which would produce array.flat[flat_indices] = value.
-    However, this function requires that array have an extra leading dimension, and that the value for a given
-    index is copied across that dimension.  Roughly, array[:, flat_indices] = value
-
-    The input is not modified; a new tensor is returned.
+    This function returns a copy of ``array`` with ``array[:, flat_indices] = value``.  The
+    entries of ``flat_indices`` are flat indices into ``array.shape[1:]``.
 
     Args:
-        array (tensor): Tensor of dimension n+1
-        flat_indices (array of int): Indices obtained using ravel_multi_index using array.shape[1:]
-        value (float or tensor): Values to be copied in.  Must be able to broadcast to array.shape[1:]
+        array (tensor): A tensor with n+1 dimensions.
+        flat_indices (array of int): The flat indices that ``ravel_multi_index`` returns for
+            ``array.shape[1:]``.
+        value (float or tensor): The values to copy in.  The values must broadcast to
+            ``array.shape[1:]``.
 
     Returns:
-        tensor
+        tensor: The modified copy of ``array``.
     """
     array_shape = array.shape
     flat_indices = torch.as_tensor(np.asarray(flat_indices), dtype=torch.int64, device=array.device)
-    # Clip out of range indices.  A clipped position receives the same value as an in-range write.
+    # Out-of-range indices are clipped to the last index.
     flat_indices = torch.clamp(flat_indices, 0, int(np.prod(array_shape[1:])) - 1)
     array = array.reshape(array_shape[0], -1).clone()
     array[:, flat_indices] = value
@@ -48,33 +46,28 @@ def _put_in_slice(array, flat_indices, value):
 
 
 def _box3x3_sum(x):
-    """Sum over each 3x3 (row, channel) window of every view, zero padded at the detector edges.
-
-    ``x`` has shape (num_views, num_det_rows, num_det_channels).  The window spans the two detector
-    axes."""
+    """This function returns the sum over each 3x3 window of (row, channel) pixels in each view.
+    The sum treats pixels outside the detector edges as zero."""
     return F.avg_pool2d(x.unsqueeze(1), kernel_size=3, stride=1, padding=1,
                         count_include_pad=True).squeeze(1) * 9.0
 
 
 def _interpolate_fill_pass(sino):
-    """Replace each NaN pixel with the mean of its finite 3x3 neighbors within the same view.
-
-    Finite pixels are unchanged.  A NaN with no finite neighbor stays NaN and is filled on a later
-    pass."""
+    """This function replaces each NaN pixel with the mean of its finite 3x3 neighbors in
+    the same view.  A NaN with no finite neighbor stays NaN."""
     is_nan = torch.isnan(sino)
     valid = (~is_nan).to(sino.dtype)
     filled = torch.where(is_nan, torch.zeros((), dtype=sino.dtype, device=sino.device), sino)
     neighbor_sum = _box3x3_sum(filled)
     neighbor_count = _box3x3_sum(valid)
-    neighbor_mean = neighbor_sum / torch.clamp(neighbor_count, min=1.0)   # avoid 0/0 where no valid neighbor
+    neighbor_mean = neighbor_sum / torch.clamp(neighbor_count, min=1.0)  # The clamp avoids 0/0.
     return torch.where(is_nan & (neighbor_count > 0), neighbor_mean, sino)
 
 
 def _fill_nan_pixels(sino, num_passes=3):
-    """Fill every NaN pixel with the mean of its finite 3x3 neighbors within the same view.
-
-    Each of the ``num_passes`` passes fills the NaN region inward by one pixel.  A pixel that is
-    still NaN after the last pass is set to 0, and the function warns."""
+    """This function fills each NaN pixel with the mean of its finite 3x3 neighbors in the same
+    view.  It repeats this fill ``num_passes`` times.  If a pixel is still NaN at the end, the
+    function sets it to 0 and issues a warning."""
     for _ in range(num_passes):
         sino = _interpolate_fill_pass(sino)
     num_residual = int(torch.sum(torch.isnan(sino)).item())
@@ -86,32 +79,30 @@ def _fill_nan_pixels(sino, num_passes=3):
 
 
 def _zinger_fill(sino, zinger_threshold, num_passes=3):
-    """Mark zinger pixels (``value < zinger_threshold``) and non-finite values NaN, then fill them from
-    their finite 3x3 in-view neighbors.  ``zinger_threshold`` is a precomputed scalar."""
+    """This function sets zinger pixels and non-finite values to NaN.  A zinger pixel is a pixel
+    with ``value < zinger_threshold``.  The function then fills the NaN pixels from their finite
+    3x3 neighbors in the same view."""
     nan = torch.tensor(float('nan'), dtype=sino.dtype, device=sino.device)
-    sino = torch.where(torch.isfinite(sino), sino, nan)        # +-inf / NaN -> NaN
-    sino = torch.where(sino < zinger_threshold, nan, sino)     # flag zingers
+    sino = torch.where(torch.isfinite(sino), sino, nan)        # This sets +inf, -inf, and NaN to NaN.
+    sino = torch.where(sino < zinger_threshold, nan, sino)     # This sets the zinger pixels to NaN.
     return _fill_nan_pixels(sino, num_passes)
 
 
 def _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean, flat_indices):
-    """Per-view-batch transmission kernel (pure device-tensor op).
-
-    Computes ``-log`` of the dark-corrected, blank-normalized object scan, sets shared defective
-    pixels to NaN, and interpolates the NaNs.  ``blank_minus_dark = |blank_mean - dark_mean|`` is
-    precomputed by the caller (it does not vary across batches).
+    """This function computes the sinogram for one batch of views.  The sinogram is
+    ``-log(|obj - dark| / |blank - dark|)``.  The function sets the defective pixels to NaN in
+    every view, and it then fills all NaN pixels from their neighbors.
     """
     device = obj_batch.device
     blank_minus_dark = torch.as_tensor(np.asarray(blank_minus_dark, dtype=np.float32), device=device)
     dark_scan_mean = torch.as_tensor(np.asarray(dark_scan_mean, dtype=np.float32), device=device)
     obj_batch = torch.abs(obj_batch - dark_scan_mean)
-    # A non-positive ratio becomes NaN, so the fill below removes it along with the defective pixels.
+    # A non-positive ratio becomes NaN, so the fill below removes it.
     ratio = obj_batch / blank_minus_dark
     nan = torch.tensor(float('nan'), dtype=ratio.dtype, device=device)
     sino_batch = torch.where(ratio > 0, -torch.log(torch.where(ratio > 0, ratio, torch.ones_like(ratio))), nan)
     if flat_indices is not None:
         sino_batch = _put_in_slice(sino_batch, flat_indices, float('nan'))
-    # Any remaining non-finite value also becomes NaN, so the fill removes it too.
     sino_batch = torch.where(torch.isfinite(sino_batch), sino_batch, nan)
     return _fill_nan_pixels(sino_batch)
 
@@ -119,49 +110,37 @@ def _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean, flat_indic
 def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_array=(), batch_size=90,
                               devices=None):
     """
-    Compute sinogram from object, blank, and dark scans.
-
-    This function computes a sinogram by taking the negative logarithm of the normalized transmission image:
-    `-log((obj - dark) / (blank - dark))`. It supports correction for defective pixels.
-
-    The invalid sinogram entries are defined as:
-    - Any values resulting in `inf` or `NaN`
-    - Any indices listed in the `defective_pixel_array` (if provided)
-
-    Accepted forms: the scans may be NumPy arrays or torch tensors (a tensor blank or dark scan is
-    brought to the host and reduced with NumPy).  The result is always a NumPy array on the host.
-    Any GPU use is internal -- the views are moved to a device one batch at a time and each batch's
-    result is brought back.  An array in the divided device form (a ``Shards`` container, as
-    produced by the multi-GPU projectors) is not accepted; gather it to the host first with
-    ``shards.gather()``.
+    This function computes the sinogram ``-log(|obj - dark| / |blank - dark|)`` from the object,
+    blank, and dark scans.  The function fills ``inf`` values, ``NaN`` values, and the listed
+    defective pixels from their neighbors.  It returns the sinogram as a numpy array in host
+    memory.
 
     Args:
         obj_scan (numpy array or tensor):
             A 3D object scan of shape (num_views, num_det_rows, num_det_channels).
         blank_scan (ndarray or tensor):
             A 3D blank scan of shape (num_blank_scans, num_det_rows, num_det_channels).
-            If `num_blank_scans > 1`, a pixel-wise mean will be computed.
+            If ``num_blank_scans > 1``, the function averages the blank scans pixel by pixel.
         dark_scan (ndarray or tensor):
             A 3D dark scan of shape (num_dark_scans, num_det_rows, num_det_channels).
-            If `num_dark_scans > 1`, a pixel-wise mean will be computed.
+            If ``num_dark_scans > 1``, the function averages the dark scans pixel by pixel.
         defective_pixel_array (ndarray or tuple, optional):
-            An array of defective pixel indices, one (row_idx, channel_idx) pair per row;
-            these pixels are treated as defective in every view.
-            Defaults to the empty tuple `()`, meaning no known defective pixels; invalid pixels
-            are then inferred from `NaN` or `inf` values alone. Do not pass `None`.
+            An array of defective pixel indices, with one (row_idx, channel_idx) pair per row.
+            The function treats these pixels as defective in every view.  Defaults to the empty
+            tuple ``()``.  The value ``None`` is not accepted.
         batch_size (int):
-            Number of views to process in each GPU batch.
+            The number of views to process in each GPU batch.
         devices (sequence or None):
-            devices to spread the views over.  None (default) uses all visible CUDA devices,
-            capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the default device when
-            there are none.
+            The devices that process the views.  If None (the default), the function uses all
+            visible CUDA devices, up to ``MBIRTORCH_NUM_DEVICES`` if that variable is set.  If
+            there are no CUDA devices, it uses the default device.
 
     Returns:
         numpy.ndarray:
             The computed sinogram, with shape (num_views, num_det_rows, num_det_channels).
 
     Raises:
-        TypeError: If any of the scans is in the divided device form.
+        TypeError: If any of the scans is a ``Shards`` container.
     """
     _pipeline.reject_shards('compute_sino_transmission', obj_scan=obj_scan, blank_scan=blank_scan,
                            dark_scan=dark_scan, defective_pixel_array=defective_pixel_array)
@@ -189,8 +168,8 @@ def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_a
 
 
 def _downsample_obj_kernel(obj_batch, flat_indices, new_size1, new_size2, block_shape):
-    """Per-view-batch object-scan downsample kernel (pure device-tensor op): set defective pixels to
-    NaN, crop to a block-divisible size, and block-average with nanmean."""
+    """This function downsamples one batch of object scan views by averaging blocks of pixels.
+    It leaves the defective pixels out of the averages."""
     if flat_indices is not None:
         obj_batch = _put_in_slice(obj_batch, flat_indices, float('nan'))
     obj_batch = obj_batch[:, 0:new_size1, 0:new_size2]
@@ -199,18 +178,15 @@ def _downsample_obj_kernel(obj_batch, flat_indices, new_size1, new_size2, block_
 
 
 def _downsample_blank_dark(blank_scan, dark_scan, downsample_factor, defective_pixel_array=()):
-    """Downsample the blank and dark scans on the host.
-
-    Defective pixels are set to NaN, the scans are cropped to a size divisible by the downsample
-    factor, and each block is averaged.  The blank and dark scans have the detector dimensions of
-    the object scan, so the block parameters that :func:`_downsample_obj_kernel` needs are computed
-    here as well.
+    """This function downsamples the blank and dark scans in host memory by averaging blocks of
+    pixels.  It also computes the block parameters that :func:`_downsample_obj_kernel` needs.
 
     Returns:
-        (blank_scan, dark_scan, defective_pixel_array, obj_flat_indices, new_size1, new_size2, block_shape)
+        (blank_scan, dark_scan, defective_pixel_array, obj_flat_indices, new_size1, new_size2,
+        block_shape)
     """
-    # Set defective pixels to NaN for use with nanmean.  The blank and dark scans may have
-    # different numbers of views, so each is looped over its own leading dimension.
+    # The defective pixels are set to NaN so that nanmean leaves them out.  The blank and dark
+    # scans may have different numbers of views.
     if len(defective_pixel_array) > 0:
         flat_indices = np.ravel_multi_index(defective_pixel_array.T, blank_scan.shape[1:]).astype(np.int64)
         for i in range(blank_scan.shape[0]):
@@ -220,7 +196,7 @@ def _downsample_blank_dark(blank_scan, dark_scan, downsample_factor, defective_p
     else:
         flat_indices = None
 
-    # Crop the scan if the size is not divisible by downsample_factor.
+    # The scans are cropped to a size divisible by downsample_factor.
     new_size1 = downsample_factor[0] * (blank_scan.shape[1] // downsample_factor[0])
     new_size2 = downsample_factor[1] * (blank_scan.shape[2] // downsample_factor[1])
 
@@ -230,7 +206,6 @@ def _downsample_blank_dark(blank_scan, dark_scan, downsample_factor, defective_p
     block_shape = (blank_scan.shape[1] // downsample_factor[0], downsample_factor[0],
                    blank_scan.shape[2] // downsample_factor[1], downsample_factor[1])
 
-    # A block of all NaNs gives NaN.
     blank_scan = np.stack([
         np.nanmean(scan.reshape(block_shape), axis=(1, 3))
         for scan in blank_scan
@@ -241,53 +216,46 @@ def _downsample_blank_dark(blank_scan, dark_scan, downsample_factor, defective_p
         for scan in dark_scan
     ], axis=0)
 
-    # A downsampled pixel is defective when every pixel in its block was bad.
-    nan_mask = np.isnan(blank_scan).any(axis=0)  # Combine across all views
+    # A downsampled pixel is defective when every pixel in its block was defective.
+    nan_mask = np.isnan(blank_scan).any(axis=0)
     defective_pixel_array = np.argwhere(nan_mask)
     if len(defective_pixel_array) == 0:
         defective_pixel_array = ()
 
-    # flat_indices stays on the host.  The kernel moves it to the device of each batch.
     return blank_scan, dark_scan, defective_pixel_array, flat_indices, new_size1, new_size2, block_shape
 
 
 def downsample_view_data(obj_scan, blank_scan, dark_scan, downsample_factor, defective_pixel_array=(), batch_size=90,
                          devices=None):
     """
-    Performs down-sampling of the scan images in the detector plane.
-    This is done for the object, blank_scan, and dark_scan data,
-    and the defective_pixel_array is updated to reflect the new pixel grid.
-
-    Accepted forms: the scans may be NumPy arrays or torch tensors, and the returned scans are
-    always NumPy arrays on the host.  Any GPU use is internal -- the object scan's views are moved
-    to a device one batch at a time and each batch's result is brought back.  An array in the
-    divided device form (a ``Shards`` container, as produced by the multi-GPU projectors) is not
-    accepted; gather it to the host first with ``shards.gather()``.
+    This function downsamples the object, blank, and dark scans in the detector plane.  It also
+    converts the defective pixel array to the new pixel grid.  The scans may be numpy arrays or
+    tensors.  The function returns numpy arrays in host memory.
 
     Args:
-        obj_scan (ndarray): A stack of sinograms. 3D NumPy array of shape (num_views, num_det_rows, num_det_channels).
-        blank_scan (ndarray): Blank scan(s). 3D NumPy array of shape (num_blank_views, num_det_rows, num_det_channels).
-        dark_scan (ndarray): Dark scan(s). 3D NumPy array of shape (num_dark_views, num_det_rows, num_det_channels).
-        downsample_factor (tuple of int): Two integers defining the down-sample factor. Must be ≥ 1 in each dimension.
-        defective_pixel_array (ndarray): Array of shape (num_defective_pixels, 2) indicating defective pixel coordinates.
-        batch_size (int): Number of views to include in one batch. Controls memory usage.
-        devices (sequence or None): devices to spread the views over.  None (default) uses all
-            visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the
-            default device when there are none.
-
-    Notes:
-        This function supports both singleton blank/dark scans (shape (1, H, W)) and multi-view scans
-        (shape (N, H, W), where N > 1). Downsampling is applied independently to each view.
+        obj_scan (ndarray): The object scan, with shape (num_views, num_det_rows,
+            num_det_channels).
+        blank_scan (ndarray): The blank scans, with shape (num_blank_views, num_det_rows,
+            num_det_channels).
+        dark_scan (ndarray): The dark scans, with shape (num_dark_views, num_det_rows,
+            num_det_channels).
+        downsample_factor (tuple of int): Two integers, each at least 1.
+        defective_pixel_array (ndarray): The defective pixel coordinates, with shape
+            (num_defective_pixels, 2).
+        batch_size (int): The number of views in one batch.  A smaller batch uses less memory.
+        devices (sequence or None): The devices that process the views.  If None (the default),
+            the function uses all visible CUDA devices, up to ``MBIRTORCH_NUM_DEVICES`` if that
+            variable is set.  If there are no CUDA devices, it uses the default device.
 
     Returns:
         tuple:
-        - **obj_scan** (numpy.ndarray): Downsampled object scan. Shape (num_views, new_rows, new_cols).
-        - **blank_scan** (numpy.ndarray): Downsampled blank scan(s). Shape (num_blank_views, new_rows, new_cols).
-        - **dark_scan** (numpy.ndarray): Downsampled dark scan(s). Shape (num_dark_views, new_rows, new_cols).
-        - **defective_pixel_array** (numpy.ndarray): Updated defective pixel coordinates. Shape (N_def, 2).
+        - **obj_scan** (numpy.ndarray): Shape (num_views, new_rows, new_cols).
+        - **blank_scan** (numpy.ndarray): Shape (num_blank_views, new_rows, new_cols).
+        - **dark_scan** (numpy.ndarray): Shape (num_dark_views, new_rows, new_cols).
+        - **defective_pixel_array** (numpy.ndarray): The new coordinates, shape (N_def, 2).
 
     Raises:
-        TypeError: If any of the scans is in the divided device form.
+        TypeError: If any of the scans is a ``Shards`` container.
     """
     _pipeline.reject_shards('downsample_view_data', obj_scan=obj_scan, blank_scan=blank_scan,
                            dark_scan=dark_scan, defective_pixel_array=defective_pixel_array)
@@ -312,25 +280,27 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
                  downsample_factor=(1, 1), det_rotation=0.0,
                  batch_size=90, devices=None):
     """
-    Compute the sinogram from the object, blank, and dark scans.
-
-    The views are downsampled by block averaging, each is converted to ``-log(|obj - dark| /
-    |blank - dark|)`` with the blank and dark scans averaged over their views, the defective and
-    non-positive pixels are filled from their neighbors, and the detector rotation is removed.  A
-    step is skipped at its default.  Takes numpy arrays or tensors and returns a numpy array.
+    This function computes the sinogram from object, blank, and dark scans.  It downsamples
+    the views, computes ``-log(|obj - dark| / |blank - dark|)``, fills defective and
+    non-positive pixels, and removes the detector rotation.  The result is a numpy array.
 
     Args:
-        obj_scan (numpy array or tensor): Object scan, shape (num_views, num_det_rows, num_det_channels).
-        blank_scan (numpy array or tensor): Blank scan or scans, shape (num_blank, num_det_rows, num_det_channels).
-        dark_scan (numpy array or tensor): Dark scan or scans, shape (num_dark, num_det_rows, num_det_channels).
-        defective_pixel_array (numpy.ndarray or tuple, optional): The (row, col) coordinates of the
-            defective pixels, shape (num_defective, 2), or () for none.  Defaults to ().
-        downsample_factor (tuple[int, int], optional): Detector (row, channel) downsampling.  Defaults to (1, 1).
-        det_rotation (float, optional): Detector rotation in radians.  Defaults to 0.0.
-        batch_size (int, optional): Views processed at a time.  Defaults to 90.
-        devices (sequence or None, optional): Devices to spread the views over.  None uses all visible
-            CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when it is set, or the default device
-            when there are none.  Defaults to None.
+        obj_scan (numpy array or tensor): The object scan, with shape (num_views, num_det_rows,
+            num_det_channels).
+        blank_scan (numpy array or tensor): The blank scans, with shape (num_blank,
+            num_det_rows, num_det_channels).
+        dark_scan (numpy array or tensor): The dark scans, with shape (num_dark, num_det_rows,
+            num_det_channels).
+        defective_pixel_array (numpy.ndarray or tuple, optional): The (row, col) coordinates of
+            the defective pixels, shape (num_defective, 2), or () for none.  Defaults to ().
+        downsample_factor (tuple[int, int], optional): The downsampling factors along the
+            detector rows and channels.  Defaults to (1, 1).
+        det_rotation (float, optional): The detector rotation in radians.  Defaults to 0.0.
+        batch_size (int, optional): The number of views processed at a time.  Defaults to 90.
+        devices (sequence or None, optional): The devices that process the views.  If None, the
+            function uses all visible CUDA devices, up to ``MBIRTORCH_NUM_DEVICES`` if that
+            variable is set.  If there are no CUDA devices, it uses the default device.  Defaults
+            to None.
 
     Returns:
         numpy.ndarray: The sinogram, shape (num_views, num_det_rows, num_det_channels) after
@@ -352,7 +322,6 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
     dark_scan_mean = np.mean(dark_scan, axis=0, keepdims=True)
     blank_minus_dark = np.abs(blank_scan_mean - dark_scan_mean)
 
-    # The defective pixel indices are raveled against the detector grid the kernel sees.
     trans_det_shape = blank_scan.shape[1:]
     if len(defective_pixel_array) > 0:
         defective_pixel_array = np.asarray(defective_pixel_array)
@@ -363,7 +332,7 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
 
     do_rotation = det_rotation != 0.0
 
-    # Each view batch runs one fused kernel that downsamples, converts to transmission, and rotates.
+    # For each batch of views, one function downsamples, computes the sinogram, and rotates.
     def fused_kernel(obj_batch):
         if do_downsample:
             obj_batch = _downsample_obj_kernel(obj_batch, obj_flat_indices, new_size1, new_size2, block_shape)
@@ -380,28 +349,31 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
 
 def crop_view_data(obj_scan, blank_scan, dark_scan, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, defective_pixel_array=()):
     """
-    Crop the object, blank, and dark scans and update the defective pixel list to match.
-
-    The same number of pixels is cropped from the left and the right, so the detector center is
-    kept.  Defective pixels outside the crop are dropped and the rest are re-indexed to the cropped
-    scans.
+    This function crops the object, blank, and dark scans, and it updates the defective pixel
+    list.  The function crops the same number of pixels from the left and from the right.
 
     Args:
-        obj_scan (numpy.ndarray): Object scan, shape (num_views, num_det_rows, num_det_channels).
-        blank_scan (numpy.ndarray): Blank scan or scans, shape (num_blank, num_det_rows, num_det_channels).
-        dark_scan (numpy.ndarray): Dark scan or scans, shape (num_dark, num_det_rows, num_det_channels).
-        crop_pixels_sides (int, optional): Pixels to crop from each side.  Defaults to 0.
-        crop_pixels_top (int, optional): Pixels to crop from the top (low row indices).  Defaults to 0.
-        crop_pixels_bottom (int, optional): Pixels to crop from the bottom (high row indices).  Defaults to 0.
-        defective_pixel_array (numpy.ndarray or tuple, optional): The (row, col) coordinates of the
-            defective pixels, shape (num_defective, 2), or () for none.  Defaults to ().
+        obj_scan (numpy.ndarray): The object scan, with shape (num_views, num_det_rows,
+            num_det_channels).
+        blank_scan (numpy.ndarray): The blank scans, with shape (num_blank, num_det_rows,
+            num_det_channels).
+        dark_scan (numpy.ndarray): The dark scans, with shape (num_dark, num_det_rows,
+            num_det_channels).
+        crop_pixels_sides (int, optional): The number of pixels to crop from each side.
+            Defaults to 0.
+        crop_pixels_top (int, optional): The number of pixels to crop from the top, which has
+            the low row indices.  Defaults to 0.
+        crop_pixels_bottom (int, optional): The number of pixels to crop from the bottom, which
+            has the high row indices.  Defaults to 0.
+        defective_pixel_array (numpy.ndarray or tuple, optional): The (row, col) coordinates of
+            the defective pixels, shape (num_defective, 2), or () for none.  Defaults to ().
 
     Returns:
-        tuple: ``(obj_scan, blank_scan, dark_scan, defective_pixel_array)``, cropped.
+        tuple: The cropped ``(obj_scan, blank_scan, dark_scan, defective_pixel_array)``.
 
     Raises:
-        AssertionError: If a crop is negative, the top and bottom crops together reach the detector
-            height, or twice the side crop reaches the detector width.
+        AssertionError: If a crop is negative, if the top and bottom crops together reach the
+            detector height, or if twice the side crop reaches the detector width.
     """
     assert (0 <= crop_pixels_sides < obj_scan.shape[2] // 2 and
             0 <= crop_pixels_top and 0 <= crop_pixels_bottom and crop_pixels_top + crop_pixels_bottom < obj_scan.shape[1]), \
@@ -428,8 +400,9 @@ def crop_view_data(obj_scan, blank_scan, dark_scan, crop_pixels_sides=0, crop_pi
 
 
 def _zinger_threshold(sino, zinger_pixel_ratio, max_views_to_use=20):
-    """Zinger-detection threshold = ``-zinger_pixel_ratio * RMS(sino over its support)``, estimated
-    from a subsample of at most ``max_views_to_use`` views.  Returns a negative Python float."""
+    """This function returns the zinger threshold ``-zinger_pixel_ratio * RMS(sino)`` as a
+    negative float.  It computes the RMS over the sinogram entries above the background, and it
+    uses at most ``max_views_to_use`` views."""
     sino_sub = mt.TomographyModel.subsample_views(sino, max_views_to_use)
     sino_indicator = np.asarray(mt.TomographyModel._get_sino_indicator(sino_sub))
     typical_sino_value = float(np.average(np.asarray(sino_sub) ** 2, None, sino_indicator) ** 0.5)
@@ -439,33 +412,36 @@ def _zinger_threshold(sino, zinger_pixel_ratio, max_views_to_use=20):
 def correct_zinger_pixels(sino, zinger_pixel_ratio=0.1, num_passes=3, batch_size=90, devices=None,
                           max_views_to_use=20):
     """
-    Replace the zinger pixels of a sinogram with the mean of their neighbors.
+    This function replaces the zinger pixels of a sinogram with the mean of their
+    neighbors.
 
     A zinger is a pixel whose value is below ``-zinger_pixel_ratio`` times the RMS value of the
-    sinogram.  The RMS value is estimated from ``max_views_to_use`` views, so the background offset
-    must already be removed; see :func:`correct_background_offset`.  Zingers and non-finite pixels
-    are replaced by the mean of their finite 3x3 neighbors in the same view, in ``num_passes``
-    passes, so a cluster up to that radius is filled.  A pixel still unfilled is set to 0 with a
-    warning.  Takes a numpy array or a tensor and returns a numpy array.
+    sinogram.  For this reason, the background offset must be removed before this function is
+    called.  The function :func:`correct_background_offset` removes the offset.  This function fills
+    the zingers and the non-finite pixels from their finite 3x3 neighbors, and it repeats the fill
+    ``num_passes`` times.  If a pixel is still not filled, the function sets it to 0 and issues a
+    warning.
 
     Args:
-        sino (numpy array or tensor): Sinogram with its background offset removed, shape (num_views,
-            num_det_rows, num_det_channels).
-        zinger_pixel_ratio (float, optional): The detection ratio.  Defaults to 0.1.
-        num_passes (int, optional): Fill passes.  Defaults to 3.
-        batch_size (int, optional): Views processed at a time.  Defaults to 90.
-        devices (sequence or None, optional): Devices to spread the views over.  None uses all visible
-            CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when it is set, or the default device
-            when there are none.  Defaults to None.
-        max_views_to_use (int, optional): Views sampled for the RMS estimate.  Defaults to 20.
+        sino (numpy array or tensor): The sinogram with its background offset removed, with
+            shape (num_views, num_det_rows, num_det_channels).
+        zinger_pixel_ratio (float, optional): The ratio that sets the zinger threshold.
+            Defaults to 0.1.
+        num_passes (int, optional): The number of fill passes.  Defaults to 3.
+        batch_size (int, optional): The number of views processed at a time.  Defaults to 90.
+        devices (sequence or None, optional): The devices that process the views.  If None, the
+            function uses all visible CUDA devices, up to ``MBIRTORCH_NUM_DEVICES`` if that
+            variable is set.  If there are no CUDA devices, it uses the default device.  Defaults
+            to None.
+        max_views_to_use (int, optional): The number of views sampled to estimate the RMS
+            value.  Defaults to 20.
 
     Returns:
-        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+        numpy.ndarray: The corrected sinogram, with the same shape as ``sino``.
     """
     _pipeline.reject_shards('correct_zinger_pixels', sino=sino)
 
-    # The threshold is computed once on the whole sinogram, so the result does not depend on the
-    # number of devices.
+    # The threshold is computed once, so the result does not depend on the number of devices.
     zinger_threshold = _zinger_threshold(sino, zinger_pixel_ratio, max_views_to_use)
     kernel = lambda b: _zinger_fill(b, zinger_threshold, num_passes)
     return _pipeline.map_view_batches(sino, kernel, batch_size,

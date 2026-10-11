@@ -1,16 +1,9 @@
 """
-Shared private helpers for reading Xradia/Zeiss OLE-based scan files (``.xrm``, ``.txrm``, ``.txm``).
-
-These low-level readers are used by both :mod:`mbirtorch.preprocess.zeiss` (Ultra/Versa rotational CT) and
-:mod:`mbirtorch.preprocess.zeiss_tct` (translation CT).  They were extracted verbatim from those two
-modules, which previously carried byte-identical copies, so the OLE-parsing layer lives in one place.
-
-``read_metadata`` is intentionally NOT shared here: the two readers parse metadata differently (zeiss
-resolves ReferenceData/MultiReferenceData; zeiss_tct is scalar), so each module keeps its own.
-``read_xrm`` / ``read_xrm_dir`` therefore take that ``read_metadata`` as an injected argument.
-
-Notes:
-    Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
+This module contains private functions that read Xradia/Zeiss scan files in the OLE format
+(``.xrm``, ``.txrm``, ``.txm``).  The modules :mod:`mbirtorch.preprocess.zeiss` and
+:mod:`mbirtorch.preprocess.zeiss_tct` use these functions.  Each of those modules passes its own
+``read_metadata`` function.  Portions of this module are adapted from the DXchange library:
+https://github.com/data-exchange/dxchange
 """
 import os
 import struct
@@ -24,7 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 def _check_read(fname):
-    """Check that ``fname`` has a recognized extension and return its absolute path."""
+    """This function checks that ``fname`` is a string with a recognized extension and returns its
+    absolute path.
+
+    If the check fails, the function logs an error but does not raise one.
+    """
     known_extensions = {
         '.edf', '.tiff', '.tif', '.h5', '.hdf', '.npy', '.nc',
         '.xrm', '.txrm', '.txm', '.xmt', '.nxs'
@@ -43,22 +40,20 @@ def _check_read(fname):
 
 def get_index_in_list(input_list, target):
     """
-    Find the index of target in the given list.
-    Return -1 if not present.
+    This function returns the index of ``target`` in ``input_list``, or -1 if ``target`` is not in the list.
     """
     if target in input_list:
         idx = input_list.index(target)
     else:
-        idx = -1  # or None
+        idx = -1
 
     return idx
 
 
 def _get_ole_data_type(metadata, datatype=None):
-    """Return the numpy dtype of the image data in a Zeiss OLE file.
+    """This function returns the numpy dtype of the image data in a Zeiss OLE file.
 
-    The OLE type code is taken from ``datatype``, or from ``metadata["data_type"]``
-    when ``datatype`` is None.
+    The function uses ``datatype`` if it is given and ``metadata["data_type"]`` otherwise.
     """
     if datatype is None:
         datatype = metadata["data_type"]
@@ -71,7 +66,8 @@ def _get_ole_data_type(metadata, datatype=None):
 
 
 def _read_ole_struct(ole, label, struct_fmt):
-    """Return the struct stored under ``label`` as a tuple, or None if it is absent."""
+    """This function returns the struct stored under ``label`` as a tuple, or None if the label is
+    absent."""
     value = None
     if ole.exists(label):
         stream = ole.openstream(label)
@@ -81,7 +77,7 @@ def _read_ole_struct(ole, label, struct_fmt):
 
 
 def _read_ole_value(ole, label, struct_fmt):
-    """Return the scalar stored under ``label``, or None if it is absent."""
+    """This function returns the scalar stored under ``label``, or None if the label is absent."""
     value = _read_ole_struct(ole, label, struct_fmt)
     if value is not None:
         value = value[0]
@@ -89,7 +85,7 @@ def _read_ole_value(ole, label, struct_fmt):
 
 
 def _read_ole_arr(ole, label, struct_fmt):
-    """Return the array stored under ``label``, or None if it is absent."""
+    """This function returns the array stored under ``label``, or None if the label is absent."""
     arr = _read_ole_struct(ole, label, struct_fmt)
     if arr is not None:
         arr = np.array(arr)
@@ -97,7 +93,10 @@ def _read_ole_arr(ole, label, struct_fmt):
 
 
 def _read_ole_image(ole, label, metadata, datatype=None):
-    """Return the image stored under ``label``, shape (num_det_rows, num_det_channels)."""
+    """This function returns the image stored under ``label``.
+
+    The image has shape (num_det_rows, num_det_channels).
+    """
     stream = ole.openstream(label)
     data = stream.read()
     data_type = _get_ole_data_type(metadata, datatype)
@@ -110,7 +109,8 @@ def _read_ole_image(ole, label, metadata, datatype=None):
 
 
 def _read_ole_str(ole, label):
-    """Return the strings stored under ``label`` as a list, or None if it is absent."""
+    """This function returns the strings stored under ``label`` as a list, or None if the label is
+    absent."""
     str = None
     if ole.exists(label):
         stream = ole.openstream(label)
@@ -120,31 +120,27 @@ def _read_ole_str(ole, label):
 
 
 def _log_imported_data(fname, arr):
-    """Log the shape and dtype of the data read from ``fname``."""
+    """This function logs the shape and dtype of the data read from ``fname``."""
     logger.debug('Data shape & type: %s %s', arr.shape, arr.dtype)
     logger.info('Data successfully imported: %s', fname)
 
 
 def read_xrm(fname, read_metadata, *, normalize_to_float32=True):
     """
-    Read a single Xradia ``.xrm`` radiograph and its metadata.
-
-    Notes:
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
+    This function reads one Xradia ``.xrm`` radiograph and its metadata.  Portions of this
+    function are adapted from the DXchange library.
 
     Args:
-        fname (str): String defining the path of file or file name.
-        read_metadata (callable): The per-reader metadata parser, called as ``read_metadata(ole) -> dict``.
-            It is injected because the zeiss and zeiss_tct readers extract metadata differently (zeiss
-            resolves ReferenceData/MultiReferenceData; zeiss_tct is scalar), so each passes its own.
-        normalize_to_float32 (bool, optional): If True, convert the image to float32 and normalize integer
-            data to ``[0, 1]`` (see :func:`mbirtorch.preprocess._loader_utils._normalize_to_float32`).  If False,
-            return the raw image; ``read_xrm_dir`` uses False and normalizes once at the stack level.
-            Defaults to True.
+        fname (str): The path of the file.
+        read_metadata (callable): The function that parses the metadata.  ``read_xrm`` calls
+            ``read_metadata(ole)``, which returns a dict.
+        normalize_to_float32 (bool, optional): If True, convert the image to float32 and
+            normalize integer data to ``[0, 1]``.  If False, return the raw image.  Defaults to
+            True.
 
     Returns:
-        np.ndarray: Output 2D image with shape (num_det_rows, num_det_channels).
-        dict: Output metadata.
+        np.ndarray: The 2D image with shape (num_det_rows, num_det_channels).
+        dict: The metadata.
     """
     fname = _check_read(fname)
     try:
@@ -180,25 +176,24 @@ def read_xrm(fname, read_metadata, *, normalize_to_float32=True):
 
 def read_xrm_dir(dir_path, read_metadata):
     """
-    Read all .xrm files in a directory (filesystem order), stack into (num_views, num_det_rows, num_det_cols),
-    and concatenate selected metadata.
+    This function reads all .xrm files in a directory and stacks them into one array.
 
-    Notes:
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
+    The function reads the files in the order the file system lists them.  It collects the
+    positions, shifts, and angles of every file into lists in the metadata.  The other metadata
+    come from the first file.  Portions of this function are adapted from the DXchange library.
 
     Args:
-        dir_path (str): Path to the directory to be read.
-        read_metadata (callable): The per-reader metadata parser, called as ``read_metadata(ole) -> dict``
-            (injected; see :func:`read_xrm`).
+        dir_path (str): The path of the directory.
+        read_metadata (callable): The function that parses the metadata (see :func:`read_xrm`).
 
     Returns:
-        np.ndarray: Output 3D image with shape (num_views, num_det_rows, num_det_channels).
-        dict: Output metadata
+        np.ndarray: The 3D array with shape (num_views, num_det_rows, num_det_channels).
+        dict: The metadata.
     """
     dir_path = Path(dir_path)
     files = [p for p in dir_path.iterdir() if p.is_file()]
 
-    # Each projection is read raw.  The whole stack is normalized once at the end.
+    # This function reads each projection without normalization and normalizes the whole stack at the end.
     proj0, md0 = read_xrm(str(files[0]), read_metadata, normalize_to_float32=False)
     num_views = len(files)
     num_det_rows, num_det_channels = proj0.shape
@@ -216,8 +211,7 @@ def read_xrm_dir(dir_path, read_metadata):
     metadata['z_positions'] = [z0]
     metadata['x_shifts'] = [md0['x_shifts'][0]]
     metadata['y_shifts'] = [md0['y_shifts'][0]]
-    # A scan with no OLE 'Angles' stream has no rotation angles.  read_metadata
-    # returns 'thetas' as None in that case, and metadata['thetas'] stays None.
+    # If the scan has no OLE 'Angles' stream, then 'thetas' is None.
     collect_thetas = md0.get('thetas') is not None
     metadata['thetas'] = [md0['thetas'][0]] if collect_thetas else None
 

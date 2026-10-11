@@ -1,22 +1,11 @@
-"""Geometry calibration from the sinogram.
+"""This module estimates the scan geometry from the sinogram.
 
 ``estimate_det_channel_offset`` estimates the detector channel offset, which sets the center of
-rotation, from the sinogram alone.  It returns one number and changes nothing; the caller sets it
-with ``set_params``.
-
-``fit_det_alignment`` fits each view to the forward projection of a first reconstruction and so
-finds the detector offsets, the detector rotation, and the per-view shifts.  It needs a
-reconstruction, which is the costly part.  It returns values for the model and corrections for the
-data, and ``correct_det_alignment`` resamples the views with those corrections.
-``align_sino_views`` is deprecated in favor of the two.
-
-The order of preprocessing matters.  Run in this order:
- 1. defective-pixel interpolation, background offset correction, and stripe removal
- 2. ``estimate_det_channel_offset``
- 3. ``fit_det_alignment`` and ``correct_det_alignment``.
-Stripe removal comes first because a gain stripe sits at a fixed channel, and a geometry estimate
-would take it for a feature of the object.  The reprojection fit comes last because a wrong
-``det_channel_offset`` looks like a per-view shift, which aligning first would partly remove.
+rotation, from the sinogram alone.  ``fit_det_alignment`` fits each view to the reprojection of a
+first reconstruction.  It estimates the detector offsets, the detector rotation, and the shift of
+each view.  ``correct_det_alignment`` applies the corrections to each view.  The steps run in
+this order: stripe removal and other corrections, ``estimate_det_channel_offset``,
+``fit_det_alignment``, and ``correct_det_alignment``.
 """
 
 import concurrent.futures
@@ -37,20 +26,21 @@ from .corrections import _resample_views
 __all__ = ['estimate_det_channel_offset', 'fit_det_alignment', 'correct_det_alignment',
            'align_sino_views']
 
-# This many views of the full sinogram are read per step when a band of rows is read.
+# The number of views read at one time when a group of detector rows is read.
 _READ_VIEW_BATCH = 64
 
-_NUM_COARSE = 11                      # candidates scored on the coarse grid of a search
-_NUM_ROWS = 16                        # detector rows compared, before the cone-beam limit
+_NUM_COARSE = 11                      # Number of points on the coarse grid of a search.
+_NUM_ROWS = 16                        # Largest number of detector rows compared.
 
-# A scan covers a full rotation when no gap between neighboring view angles exceeds both this
-# many times the median gap and this many radians.  A scan over a half rotation is refused.
+# A scan covers a full rotation if every gap between neighboring view angles is at most
+# _MAX_GAP_RATIO times the median gap or at most _MAX_GAP radians.
 _MAX_GAP_RATIO = 3.0
 _MAX_GAP = math.radians(5.0)
 
-# A view whose correlation with its reprojection, after the fit, is below this is a failed fit.
+# The fit of a view fails if its final correlation with its reprojection is below this value.
 _ECC_MIN_CORRELATION = 0.2
-# The fit of a view stops after this many iterations or when the correlation gains less than this.
+# The fit of a view stops after _ECC_MAX_ITERATIONS iterations, or when the correlation
+# increases by less than _ECC_EPS.
 _ECC_MAX_ITERATIONS = 200
 _ECC_EPS = 1e-6
 
@@ -58,7 +48,7 @@ _ECC_EPS = 1e-6
 # ── geometry checks ───────────────────────────────────────────────────────────────────────────────
 
 def _geometry_kind(ct_model):
-    """Classify a model as 'parallel', 'cone', 'multiaxis', or 'other'."""
+    """This function classifies a model as 'parallel', 'cone', 'multiaxis', or 'other'."""
     if isinstance(ct_model, ConeBeamModel):
         return 'cone'
     if isinstance(ct_model, MultiAxisParallelModel):
@@ -69,7 +59,8 @@ def _geometry_kind(ct_model):
 
 
 def _is_helical(ct_model):
-    """True for a cone-beam model with any nonzero per-view axial shift."""
+    """This function returns True if the model is a cone-beam model in which some view has a
+    nonzero axial shift."""
     if not isinstance(ct_model, ConeBeamModel):
         return False
     z_shifts = np.asarray(ct_model.get_params('view_params_array'))[:, 1]
@@ -77,13 +68,15 @@ def _is_helical(ct_model):
 
 
 def _view_angles(ct_model):
-    """The view angles in radians of a parallel or cone model, as a float64 array."""
+    """This function returns the view angles of a parallel-beam or cone-beam model, in radians,
+    as a float64 array."""
     required, _, _ = ct_model.get_all_params()
     return np.asarray(required['angles'], dtype=np.float64).ravel()
 
 
 def _angular_gaps(angles):
-    """The gaps between neighboring distinct view angles on the circle, in radians."""
+    """This function returns the gaps in radians between neighboring distinct view angles on the
+    circle."""
     wrapped = np.unique(np.mod(angles, 2 * np.pi))
     if wrapped.size < 2:
         return np.array([2 * np.pi])
@@ -91,10 +84,10 @@ def _angular_gaps(angles):
 
 
 def _unsuitable_reason(ct_model):
-    """Why the opposite-view comparison cannot serve this scan, or None when it can.
+    """This function returns the reason why the comparison of opposite views cannot be used for
+    this scan, or None if it can be used.
 
-    The comparison needs a parallel or cone-beam scan over a full rotation, so that every view has
-    an opposite view at the same axial position.
+    The comparison requires a parallel-beam or cone-beam scan over a full rotation.
     """
     kind = _geometry_kind(ct_model)
     if kind == 'other':
@@ -113,8 +106,10 @@ def _unsuitable_reason(ct_model):
 # ── reading a band of rows ────────────────────────────────────────────────────────────────────────
 
 def _read_band(sino, view_indices, row_window, device):
-    """The rows ``row_window`` of the views ``view_indices``, as a float32 host array of shape
-    ``(len(view_indices), rows, channels)``."""
+    """This function returns the detector rows ``row_window`` of the views ``view_indices``.
+
+    The result is a float32 array in host memory with shape ``(len(view_indices), rows, channels)``.
+    """
     row_lo, row_hi = row_window
     view_indices = np.asarray(view_indices, dtype=np.int64)
     out = np.empty((view_indices.size, row_hi - row_lo, sino.shape[2]), dtype=np.float32)
@@ -129,24 +124,18 @@ def _read_band(sino, view_indices, row_window, device):
 # ── the opposite-view comparison ──────────────────────────────────────────────────────────────────
 
 class _ConjugatePairs:
-    """The data behind an opposite-view score.
+    """This class is used to pair each ray with the opposite ray, for the comparison of
+    opposite views.
 
-    An instance holds a band of detector rows around the central plane of the scan, from every
-    view, and, for each view and channel, which view holds the opposite ray.  The opposite of the
-    ray at view angle ``beta`` and fan angle ``gamma`` lies at view angle ``beta + pi - 2 * gamma``
-    and fan angle ``-gamma``, in the sign conventions of ``cone_beam._cone_pixel_xy_mag``.
-    Parallel beam is the case ``gamma = 0``.  The partner view is interpolated linearly between the
-    two views nearest that angle.  Every view is a reference, so each unordered pair is compared
-    from both sides and the interpolation errors of the two sides cancel.
-
-    The fan angle of a channel depends on the channel offset, so the partners are computed once at
-    ``pairing_offset``, and a candidate offset ``d`` channels away moves a channel's partner angle
-    by ``2 d delta / sdd``.
+    The class reads a group of detector rows around the central plane from every view.  For each
+    view and channel, it finds the views that hold the opposite ray.  The opposite of the ray at
+    view angle ``beta`` and fan angle ``gamma`` has view angle ``beta + pi - 2 * gamma`` and fan
+    angle ``-gamma``.
 
     Args:
-        ct_model: a parallel or cone model.
-        pairing_offset (float or None): the channel offset in ALU that the fan angles are computed
-            at.  None is the model's current value.
+        ct_model: A parallel-beam or cone-beam model.
+        pairing_offset (float or None): The channel offset in ALU used to compute the fan
+            angles.  If None, the class uses the current value in the model.
     """
 
     def __init__(self, ct_model, pairing_offset=None):
@@ -161,9 +150,8 @@ class _ConjugatePairs:
         self.row_window = self._band_rows(ct_model)
         self.device = ct_model.torch_device
 
-        # These are the opposite ray's view angles, one per view and per channel.  A reference ray
-        # at fan angle -gamma(u) has its opposite at beta + pi + 2 gamma(u), where
-        # u = (m - c) delta + d for mirrored column m.
+        # target is the view angle of the opposite ray for each view and channel:
+        # beta + pi - 2 gamma(u), with u = (m - c) delta + d for channel m.
         angles = _view_angles(ct_model)
         center_channel = (self.num_channels - 1) / 2.0
         u = (np.arange(self.num_channels) - center_channel) * self.delta + self.pairing_offset
@@ -185,13 +173,13 @@ class _ConjugatePairs:
 
     @staticmethod
     def _band_rows(ct_model):
-        """The rows ``(lo, hi)`` of the band around the scan's central plane."""
+        """This method returns the range ``(lo, hi)`` of detector rows around the central plane
+        of the scan."""
         num_det_rows = int(ct_model.get_params('sinogram_shape')[1])
         delta_det_row, det_row_offset = ct_model.get_params(['delta_det_row', 'det_row_offset'])
         num_rows = _NUM_ROWS
         if isinstance(ct_model, ConeBeamModel):
-            # Opposite rays through a point off the central plane reach the detector at different
-            # heights.  The band keeps that difference within one row.
+            # The rows are limited so that opposite rays through a point stay within one row.
             min_mag, _ = ct_model.pixel_magnification_bounds()
             source_detector_dist, source_iso_dist = ct_model.get_params(
                 ['source_detector_dist', 'source_iso_dist'])
@@ -200,8 +188,7 @@ class _ConjugatePairs:
                 half = max(1, math.floor(source_iso_dist / (2.0 * support_radius)))
                 num_rows = min(num_rows, 2 * half + 1)
         num_rows = max(1, min(num_rows, num_det_rows))
-        # The central plane reaches the row where the detector height v is zero, and the band is
-        # centered there.
+        # The rows are centered on the row where the detector height v is zero.
         central_row = (num_det_rows - 1) / 2.0 + det_row_offset / delta_det_row
         lo = int(round(central_row - (num_rows - 1) / 2.0))
         lo = max(0, min(lo, num_det_rows - num_rows))
@@ -209,8 +196,12 @@ class _ConjugatePairs:
 
     @staticmethod
     def _partners(angles, target):
-        """For each target angle, the two views that bracket it on the circle and the weight of the
-        second.  Returns three arrays of the target's shape."""
+        """This method finds, for each target angle, the two views on either side of it on the
+        circle.
+
+        It returns three arrays with the shape of ``target``: the first view, the second view,
+        and the interpolation weight of the second view.
+        """
         wrapped = np.mod(angles, 2 * np.pi)
         order = np.argsort(wrapped)
         sorted_angles = wrapped[order]
@@ -225,21 +216,25 @@ class _ConjugatePairs:
         return order[low], order[high], weight.astype(np.float32)
 
     def bands(self, sino):
-        """The band of every view and the band of the partner views."""
+        """This method returns the selected detector rows of every view and of every partner view.
+
+        A partner view is a view that holds an opposite ray.
+        """
         return (_read_band(sino, np.arange(self.num_views), self.row_window, self.device),
                 _read_band(sino, self.partner_indices, self.row_window, self.device))
 
     def pairs(self, bands):
-        """The band of every view, and the mirrored opposite ray of every element of it.
+        """This method returns the selected rows of every view and the opposite ray of each
+        element, mirrored in the channel direction.
 
         Args:
-            bands (tuple of ndarray): the view and partner bands from :meth:`bands`.
+            bands (tuple of ndarray): The rows of the views and of the partner views, from
+                :meth:`bands`.
 
         Returns:
-            tuple of ndarray: ``(views, opposites)``, each of shape ``(num_views, num_rows,
-            num_channels)`` in float32.  Element ``[i, r, n]`` of ``opposites`` is the measurement
-            of the ray opposite to element ``[i, r, n]`` of ``views``, placed at the mirrored
-            channel.  The two agree up to a shift of twice the channel offset.
+            tuple of ndarray: ``(views, opposites)``.  Each array is float32 with shape
+            ``(num_views, num_rows, num_channels)``.  The two arrays agree up to a shift of twice
+            the channel offset.
         """
         views, partners = bands
         mirrored = partners[:, :, ::-1]
@@ -253,16 +248,14 @@ class _ConjugatePairs:
         return views, opposites
 
 def _search_minimum(score_fn, bounds, tolerance):
-    """Find the minimum of a scalar score over ``bounds``.
+    """This function finds the minimum of a scalar score over ``bounds``.
 
-    A coarse pass evaluates ``_NUM_COARSE`` equally spaced candidates, which shows whether the
-    curve has one minimum.  A golden-section search then narrows the bracket around the coarse
-    minimum until it is shorter than ``tolerance``.
+    The function first evaluates the score on a coarse grid.  It then refines the minimum with a
+    golden-section search to ``tolerance``.
 
     Returns:
-        tuple: ``(best, notes)``.  ``notes`` is a list of strings describing anything the caller
-        should warn about: a coarse minimum at an edge of the bounds, or more than one local
-        minimum on the coarse curve.
+        tuple: ``(best, notes)``.  ``notes`` is a list of warnings.  A warning is added if the
+        coarse minimum is at an edge of the bounds, or if there is more than one local minimum.
     """
     lo, hi = float(bounds[0]), float(bounds[1])
     if not hi > lo:
@@ -281,8 +274,6 @@ def _search_minimum(score_fn, bounds, tolerance):
     a = float(coarse[max(best - 1, 0)])
     b = float(coarse[min(best + 1, _NUM_COARSE - 1)])
 
-    # The golden-section search runs on [a, b].  Each step drops the worse end and
-    # keeps one interior point.
     ratio = (math.sqrt(5.0) - 1.0) / 2.0
     x1 = b - ratio * (b - a)
     x2 = a + ratio * (b - a)
@@ -304,17 +295,18 @@ def _search_minimum(score_fn, bounds, tolerance):
 
 # ── the channel offset ────────────────────────────────────────────────────────────────────────────
 
-_HP_SIGMA_CHANNELS = 15.0      # width of the blur removed from each profile, as in align_sino_views
-_HP_SEARCH_FRACTION = 0.25     # half-width of the integer shift search, as a fraction of the detector
-_HP_MIN_PEAK = 0.2             # a correlation peak below this is reported as weak
-_HP_MAX_SPREAD = 1.0           # per-view peaks further than this many channels from the global one
+_HP_SIGMA_CHANNELS = 15.0      # Width in channels of the blur removed from each profile.
+_HP_SEARCH_FRACTION = 0.25  # Half-width of the shift search, as a fraction of the detector width.
+_HP_MIN_PEAK = 0.2             # A correlation peak below this value causes a warning.
+_HP_MAX_SPREAD = 1.0           # A median spread of the per-view peaks above this many channels causes a warning.
 
 
 def _high_pass_profiles(band):
-    """One high-passed profile per view from a band of rows: the rows are averaged, the mean is
-    removed, and a Gaussian blur of ``_HP_SIGMA_CHANNELS`` along the channels is subtracted.  The
-    blur extends each end value past the edge, which keeps the ends of a short profile from
-    biasing the estimate, as reflecting the profile does."""
+    """This function computes one high-pass filtered profile for each view.
+
+    The profile is the average over the detector rows.  The function subtracts the mean of the
+    profile and a Gaussian blur of width ``_HP_SIGMA_CHANNELS`` channels.
+    """
     from scipy.ndimage import gaussian_filter1d
     profile = band.astype(np.float64).mean(axis=1)
     profile -= profile.mean(axis=1, keepdims=True)
@@ -322,13 +314,15 @@ def _high_pass_profiles(band):
 
 
 def _overlap_correlation(views, opposites, shifts):
-    """The normalized correlation between every view and its opposite moved by each integer shift,
-    over the channels the two cover in common.
+    """This function computes the normalized correlation between every view and its opposite
+    view at each integer shift.
+
+    The correlation uses only the channels that overlap after the shift.
 
     Returns:
-        tuple: ``(global_curve, per_view_curves)``.  ``global_curve[k]`` sums the products over
-        every view before normalizing, so views with more content weigh more.
-        ``per_view_curves[v, k]`` normalizes each view on its own.
+        tuple: ``(global_curve, per_view_curves)``.  ``global_curve`` sums the products over all
+        views and then normalizes the sum.  ``per_view_curves`` holds a separately normalized
+        curve for each view.
     """
     num_views, num_channels = views.shape
     num = np.empty((num_views, shifts.size))
@@ -347,13 +341,11 @@ def _overlap_correlation(views, opposites, shifts):
 
 
 def _fractional_correlation(views, opposites, shift_int, fraction):
-    """The global normalized correlation at the shift ``shift_int + fraction``.
+    """This function computes the normalized correlation over all views at the shift
+    ``shift_int + fraction``.
 
-    The opposites are moved by the integer part by indexing, over the channels the two cover in
-    common.  The fraction is then split: the views move by half of it one way and the opposites
-    by half the other way, both resampled by a cubic spline, so that the two sides are blurred
-    alike and the correlation does not favor whole-channel shifts.  Three channels at each end,
-    where the resampling has no neighbors, are left out.
+    The function shifts the views and the opposite views each by half the fraction, in opposite
+    directions.  In this way the interpolation blurs both arrays equally.
     """
     from scipy.ndimage import shift as ndshift
     num_channels = views.shape[1]
@@ -364,14 +356,19 @@ def _fractional_correlation(views, opposites, shift_int, fraction):
 
 
 def _estimate_offset_by_correlation(ct_model, sino, pairing_offset=None):
-    """One pass of the channel offset estimate: the correlation of high-passed profiles of each view
-    and its mirrored opposite, searched over integer shifts and refined to a fraction of a channel.
+    """This function computes one estimate of the channel offset.
+
+    The function correlates the high-pass filtered profile of each view with the mirrored profile
+    of its opposite view at integer shifts.  It then refines the best shift to a fraction of a
+    channel.
 
     Returns:
-        dict: ``offset`` in ALU; ``shift`` in channels, which is twice the offset; ``peak``, the
-        correlation at the peak; ``parabola`` and ``refined``, the two sub-pixel estimates of the
-        shift; ``spread``, the median distance of the per-view peaks from the global one in
-        channels; and ``curve`` and ``shifts``, the global correlation curve.
+        dict: The dict has these entries.  ``offset`` is the offset in ALU.  ``shift`` is the
+        shift in channels, which is twice the offset.  ``peak`` is the correlation at the peak.
+        ``parabola`` and ``refined`` are two sub-pixel estimates of the shift.  ``spread`` is the
+        median distance in channels between the peak of each view and the refined shift.
+        ``curve`` and ``shifts`` give the correlation curve over all views.  ``kind`` is the
+        geometry type.
     """
     problem = _ConjugatePairs(ct_model, pairing_offset=pairing_offset)
     views, opposites = problem.pairs(problem.bands(sino))
@@ -379,9 +376,8 @@ def _estimate_offset_by_correlation(ct_model, sino, pairing_offset=None):
     delta = problem.delta
     center = int(round(2.0 * problem.model_offset / delta))
     half = int(round(_HP_SEARCH_FRACTION * problem.num_channels))
-    # The window of integer shifts is centered on the model's value.  A peak at an edge of the
-    # window means the window is in the wrong place, so it moves to center on the peak, a few
-    # times at most, and the overlap never drops below half the detector.
+    # The shift search range is centered on the model value.  If the peak is at an edge of the
+    # range, the range moves to center on the peak, at most four times.
     limit = problem.num_channels // 2
     for _ in range(4):
         shifts = np.arange(max(center - half, -limit), min(center + half, limit) + 1)
@@ -406,28 +402,23 @@ def _estimate_offset_by_correlation(ct_model, sino, pairing_offset=None):
 
 
 def estimate_det_channel_offset(ct_model, sino):
-    """Estimate the detector channel offset of a scan over a full rotation.
+    """This function estimates the detector channel offset of a scan over a full rotation.
 
-    The estimate is the value of ``det_channel_offset`` at which each view agrees with its opposite
-    view.  In a full rotation every ray is measured twice, once from each side, so a view and its
-    mirrored opposite view are the same up to a shift of twice the channel offset.  The function
-    finds that shift by correlating high-passed profiles of the two, taken from a band of rows at
-    the central plane, and refines it to a fraction of a channel.
-
-    The scan must be a parallel or cone-beam scan over a full rotation.  For any other scan, such
-    as a short scan, a helical scan, or a multiaxis scan, the function warns and returns the
-    model's current value.  It also warns when the opposite views match weakly.
+    In a full rotation, a view and its mirrored opposite view agree up to a shift of twice the
+    channel offset.  The function finds this shift by correlating the two views near the central
+    plane.  If the scan is not a parallel-beam or cone-beam scan over a full rotation, the
+    function issues a warning and returns the current value in the model.
 
     Args:
-        ct_model (TomographyModel): the model of the scan.  Not modified.
-        sino (ndarray or tensor): the sinogram.  Not modified.
+        ct_model (TomographyModel): The model of the scan.  The function does not modify it.
+        sino (ndarray or tensor): The sinogram.  The function does not modify it.
 
     Returns:
-        float: the estimate in ALU, to set with ``ct_model.set_params(det_channel_offset=...)``.
+        float: The estimate in ALU.  Set it with ``ct_model.set_params(det_channel_offset=...)``.
 
     Example:
-        >>> det_channel_offset = mtp.estimate_det_channel_offset(ct_model, sino)  # from the sinogram alone
-        >>> ct_model.set_params(det_channel_offset=det_channel_offset)  # update the model
+        >>> det_channel_offset = mtp.estimate_det_channel_offset(ct_model, sino)
+        >>> ct_model.set_params(det_channel_offset=det_channel_offset)
     """
     reason = _unsuitable_reason(ct_model)
     if reason is not None:
@@ -453,21 +444,23 @@ def estimate_det_channel_offset(ct_model, sino):
 
 def _sino_high_pass_filtering(sino, sigma_row=3.0, sigma_col=15.0, subtract_view_mean=True):
     """
-    High-pass filter for 3D cone-beam sinogram.
+    This function applies a high-pass filter to each view of a 3D sinogram.
+
+    The filter subtracts a Gaussian blur from each view.  Outside the view, the blur uses the
+    nearest edge value.
 
     Args:
-        sino (numpy array or tensor): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
-        sigma_row (float, optional): Gaussian sigma along detector rows (vertical). Use smaller value than sigma_col.
-        Defaults to 3.0.
-        sigma_col (float, optional): Gaussian sigma along detector channels (horizontal). Defaults to 15.0.
-        subtract_view_mean (bool, optional): If True, subtract per-view mean (DC offset removal). Defaults to True.
-
-    The blur replicates the edge value outside the view.  A reflected border would make the
-    high-passed copy of a shifted view differ from the shifted high-passed view near the edges,
-    which biases a fit between the two toward too small a shift.
+        sino (numpy array or tensor): The 3D sinogram, with shape (num_views, num_det_rows,
+            num_det_channels).
+        sigma_row (float, optional): The Gaussian sigma along the detector rows (vertical).  It
+            should be smaller than sigma_col.  Defaults to 3.0.
+        sigma_col (float, optional): The Gaussian sigma along the detector channels
+            (horizontal).  Defaults to 15.0.
+        subtract_view_mean (bool, optional): If True, the function subtracts the mean of each
+            view.  Defaults to True.
 
     Returns:
-        filtered_sino (numpy array): High-pass filtered sinogram, same shape as input.
+        filtered_sino (numpy array): The filtered sinogram, with the same shape as the input.
     """
     import cv2
 
@@ -500,12 +493,11 @@ def _sino_high_pass_filtering(sino, sigma_row=3.0, sigma_col=15.0, subtract_view
 
 
 def _fit_views(ct_model, sino, recon_direct, rotation):
-    """Fit each view to its reprojection and return the fitted transforms about the detector center.
+    """This function fits each view to its reprojection.
 
-    Returns ``(angles, shifts, failed)``: the rotation of each view in radians, in the convention
-    of ``correct_det_rotation``; the sampling offset of each view in pixels as ``(row, channel)``,
-    which is where a view's content sits relative to the reprojection once the rotation about the
-    detector center is taken out; and a boolean mask of the views whose fit failed, which hold zero.
+    It returns ``(angles, shifts, failed)``.  ``angles`` holds the rotation of each view in
+    radians.  ``shifts`` holds the (row, channel) offset of each view in pixels, for a rotation
+    about the detector center.  ``failed`` is a boolean mask of the views whose fit failed.
     """
     import cv2
 
@@ -526,8 +518,7 @@ def _fit_views(ct_model, sino, recon_direct, rotation):
     failed = np.zeros(num_views, dtype=bool)
 
     def fit_view(v):
-        # Each thread writes only its own index v.  OpenCV releases the Python lock during the
-        # fit, so the views run in parallel on the host's cores.
+        # Each thread writes only to index v.  OpenCV releases the Python lock during the fit.
         template = np.ascontiguousarray(filtered_sino_from_recon[v], dtype=np.float32)
         view = np.ascontiguousarray(filtered_sino[v], dtype=np.float32)
         warp = np.eye(2, 3, dtype=np.float32)
@@ -539,9 +530,8 @@ def _fit_views(ct_model, sino, recon_direct, rotation):
         if not correlation >= _ECC_MIN_CORRELATION:
             failed[v] = True
             return
-        # The warp maps a reprojection pixel (x, y) to the view pixel that holds the same content:
-        # view(R p + t) = reprojection(p), with R the rotation about the image corner.  Rewritten
-        # about the detector center, the translation becomes t + (R - I) center.
+        # OpenCV rotates about the image corner.  For a rotation about the detector center, the
+        # translation is t + (R - I) center.
         theta = math.atan2(warp[1, 0], warp[0, 0]) if rotation else 0.0
         t = np.array([warp[1, 2], warp[0, 2]], dtype=np.float64)        # (row, channel)
         rot = np.array([[math.cos(theta), math.sin(theta)], [-math.sin(theta), math.cos(theta)]])
@@ -554,43 +544,37 @@ def _fit_views(ct_model, sino, recon_direct, rotation):
 
 
 def fit_det_alignment(ct_model, sino, recon_direct, rotation=False):
-    """Fit each view to the reprojection of a first reconstruction for the detector offsets and rotation.
+    """This function estimates the detector offsets and rotation by fitting each view to the
+    reprojection of a first reconstruction.
 
-    Each view is compared with the forward projection of ``recon_direct``.  The transform that
-    aligns the two, a 2D shift and optionally a rotation about the detector center, is fit per view
-    on high-passed copies of both.  The median over views of the fitted offsets is the global value
-    of each offset parameter.  Each view's deviation from the median, and its rotation, are
-    corrections for the data.
-
-    Returns the two as dicts.  ``model_params`` holds values to set on the model with
-    ``set_params``: ``det_channel_offset`` and ``det_row_offset``, in ALU.  ``view_params`` holds
-    one array of length ``num_views`` per key, to apply to the data with
-    :func:`correct_det_alignment`: ``det_channel_offset`` and ``det_row_offset`` are the amount by
-    which each view's offset exceeds the model value, in ALU, and, when ``rotation`` is True,
-    ``det_rotation`` is the rotation to remove from each view, in radians, in the convention of
-    :func:`~mbirtorch.preprocess.correct_det_rotation`.
-
-    A view whose fit does not converge, or whose correlation with its reprojection stays weak, is
-    reported in a warning.  It is left out of the medians and gets a zero deviation and the median
-    rotation.  There is no warning on the spread of the per-view values, since per-view motion is
-    what the per-view values are for.
+    The model offsets are the medians of the fitted offsets over the views.  The data corrections
+    are the difference of each view from the median, and the rotation of each view.  If the fit
+    of a view fails, the function names the view in a warning.  The function leaves this view
+    out of the medians.  The view gets no offset correction, and its rotation is the median
+    rotation.
 
     Args:
-        ct_model (TomographyModel): The model of the scan.  It is not changed.
-        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
-        recon_direct (numpy array or tensor): A first reconstruction of ``sino``, such as the output
-            of :meth:`~mbirtorch.TomographyModel.recon_direct`.
-        rotation (bool, optional): Fit a rotation about the detector center as well as a shift.
-            Defaults to False.
+        ct_model (TomographyModel): The model of the scan.  The function does not change it.
+        sino (numpy array or tensor): The sinogram, with shape
+            (num_views, num_det_rows, num_det_channels).
+        recon_direct (numpy array or tensor): A first reconstruction of ``sino``, such as the
+            output of :meth:`~mbirtorch.TomographyModel.recon_direct`.
+        rotation (bool, optional): If True, the function also fits a rotation about the detector
+            center.  Defaults to False.
 
     Returns:
-        tuple: ``(model_params, view_params)``, the two dicts described above.
+        tuple: ``(model_params, view_params)``.  ``model_params`` holds ``det_channel_offset``
+        and ``det_row_offset`` in ALU.  Set these values with ``set_params``.  ``view_params``
+        holds arrays of length ``num_views`` for :func:`correct_det_alignment`.  These arrays are
+        the differences of each view from ``det_channel_offset`` and ``det_row_offset``, in ALU.
+        If ``rotation`` is True, ``view_params`` also holds ``det_rotation`` in radians.
 
     Example:
-        >>> recon_direct = ct_model.recon_direct(sino)  # reconstruct object
-        >>> model_params, view_params = mtp.fit_det_alignment(ct_model, sino, recon_direct, rotation=True)
-        >>> ct_model.set_params(**model_params)  # update offset parameters
-        >>> sino = mtp.correct_det_alignment(ct_model, sino, view_params)  # correct per-view jitter and rotation
+        >>> recon_direct = ct_model.recon_direct(sino)
+        >>> model_params, view_params = mtp.fit_det_alignment(ct_model, sino, recon_direct,
+        ...                                                    rotation=True)
+        >>> ct_model.set_params(**model_params)
+        >>> sino = mtp.correct_det_alignment(ct_model, sino, view_params)
     """
     angles, shifts, failed = _fit_views(ct_model, sino, recon_direct, rotation)
     num_views = len(angles)
@@ -603,8 +587,7 @@ def fit_det_alignment(ct_model, sino, recon_direct, rotation=False):
 
     delta_row, delta_channel = (float(d) for d in ct_model.get_params(['delta_det_row', 'delta_det_channel']))
     row_offset, channel_offset = (float(d) for d in ct_model.get_params(['det_row_offset', 'det_channel_offset']))
-    # A view whose content sits s pixels higher than the reprojection has an offset s * pitch
-    # larger than the model's.
+    # If the data are s pixels higher than the reprojection, the offset is s * pitch larger.
     row_values = row_offset + shifts[:, 0] * delta_row
     channel_values = channel_offset + shifts[:, 1] * delta_channel
     good = ~failed
@@ -618,36 +601,33 @@ def fit_det_alignment(ct_model, sino, recon_direct, rotation=False):
 
 
 def correct_det_alignment(ct_model, sino, view_params, batch_size=30, devices=None):
-    """Resample each view of a sinogram by the per-view corrections from :func:`fit_det_alignment`.
+    """This function resamples each view of a sinogram with the corrections from
+    :func:`fit_det_alignment`.
 
-    Each view is rotated about the detector center by its ``det_rotation`` and moved by its
-    ``det_channel_offset`` and ``det_row_offset`` deviations, converted from ALU to pixels with the
-    model's pixel pitches, in one bicubic resampling.  A sample from outside the detector takes the
-    nearest edge value.  Any key may be left out, and a missing key means no correction of that kind.
-    The model supplies only the pixel pitches and is not changed.
+    The function rotates each view about the detector center and shifts it, in one bicubic
+    resampling.  A sample outside the detector takes the nearest edge value.  If a key is missing
+    from ``view_params``, the function makes no correction of that kind.
 
     Args:
-        ct_model (TomographyModel): The model of the scan.
-        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
-        view_params (dict): Arrays of length ``num_views`` under any of the keys
-            ``det_channel_offset`` and ``det_row_offset`` (ALU) and ``det_rotation`` (radians), as
-            :func:`fit_det_alignment` returns them.
-        batch_size (int, optional): Views resampled at a time.  Defaults to 30.
-        devices (sequence or None, optional): The first of these is the device used.  None uses the
-            first CUDA device, or the default device when there is none.  Defaults to None.
+        ct_model (TomographyModel): The model of the scan.  The function uses its pixel pitches.
+        sino (numpy array or tensor): The sinogram, with shape
+            (num_views, num_det_rows, num_det_channels).
+        view_params (dict): Arrays of length ``num_views``, as :func:`fit_det_alignment` returns
+            them.  The keys can be ``det_channel_offset`` and ``det_row_offset``, in ALU, and
+            ``det_rotation``, in radians.
+        batch_size (int, optional): The number of views resampled at one time.  Defaults to 30.
+        devices (sequence or None, optional): The function uses the first device in this
+            sequence.  If None, the function uses the first CUDA device, or the default device if
+            there is no CUDA device.  Defaults to None.
 
     Returns:
-        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+        numpy.ndarray: The corrected sinogram, with the same shape as ``sino``.
 
     Example:
-        >>> recon_direct = ct_model.recon_direct(sino)  # reconstruct object
-        >>> model_params, view_params = mtp.fit_det_alignment(ct_model, sino, recon_direct, rotation=True)
-        >>> ct_model.set_params(**model_params)  # update offset parameters
-        >>> sino = mtp.correct_det_alignment(ct_model, sino, view_params)  # correct per-view jitter and rotation
-
-        To skip the per-view shifts and remove only each view's rotation:
-
-        >>> sino = mtp.correct_det_alignment(ct_model, sino, {'det_rotation': view_params['det_rotation']})
+        >>> sino = mtp.correct_det_alignment(ct_model, sino, view_params)
+        >>> # Remove only the rotation of each view:
+        >>> sino = mtp.correct_det_alignment(ct_model, sino,
+        ...                                  {'det_rotation': view_params['det_rotation']})
     """
     _pipeline.reject_shards('correct_det_alignment', sino=sino)
     sino = torch.as_tensor(np.asarray(sino)) if not isinstance(sino, torch.Tensor) else sino
@@ -679,10 +659,9 @@ def correct_det_alignment(ct_model, sino, view_params, batch_size=30, devices=No
 
 
 def _translate_views_bilinear(sino, shifts):
-    """Shift each view of a sinogram by its own (dy, dx) with bilinear interpolation, zero outside.
+    """This function shifts each view by its own (dy, dx) with bilinear interpolation.
 
-    Matches a linear scale-and-translate with unit scale: output(i, j) samples the input at
-    (i - dy, j - dx); samples outside the view are zero.
+    The output at (i, j) is the input at (i - dy, j - dx).  Samples outside the view are zero.
     """
     sino = torch.as_tensor(np.asarray(sino))
     shifts = np.asarray(shifts, dtype=np.float64)
@@ -716,30 +695,26 @@ def _translate_views_bilinear(sino, shifts):
 
 def align_sino_views(ct_model, sino, recon_direct):
     """
-    Shift each view of a sinogram to align it with the forward projection of a first reconstruction.
+    This function shifts each view of a sinogram to align it with the forward projection of a
+    first reconstruction.
 
-    Deprecated.  Use :func:`fit_det_alignment` and :func:`correct_det_alignment` instead, which also
-    put the global part of the shift into the model and can fit a detector rotation.  This function
-    warns and will be removed in a later release.
-
-    A 2D shift is estimated for each view by comparing it with the forward projection of
-    ``recon_direct``, and the view is shifted by that amount.  This corrects small per-view motion
-    of the object.  The whole shift of each view is applied to the data, and the model is left as it
-    is.
+    This function is deprecated.  Use :func:`fit_det_alignment` and
+    :func:`correct_det_alignment` instead.  The function does not change the model.
 
     Args:
         ct_model (TomographyModel): The model of the scan.
-        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
-        recon_direct (numpy array or tensor): A first reconstruction of ``sino``, such as the output
-            of :meth:`~mbirtorch.TomographyModel.recon_direct`.
+        sino (numpy array or tensor): The sinogram, with shape
+            (num_views, num_det_rows, num_det_channels).
+        recon_direct (numpy array or tensor): A first reconstruction of ``sino``, such as the
+            output of :meth:`~mbirtorch.TomographyModel.recon_direct`.
 
     Returns:
-        numpy.ndarray: The aligned sinogram, the shape of ``sino``.
+        numpy.ndarray: The aligned sinogram, with the same shape as ``sino``.
     """
     warnings.warn("align_sino_views is deprecated; use fit_det_alignment and correct_det_alignment.",
                   DeprecationWarning, stacklevel=2)
     model_params, view_params = fit_det_alignment(ct_model, sino, recon_direct, rotation=False)
-    # The model keeps its offsets, so each view's correction includes the global part.
+    # The model keeps its offsets, so the correction of each view also includes the change in the model offsets.
     for key in ('det_channel_offset', 'det_row_offset'):
         view_params[key] = view_params[key] + (model_params[key] - float(ct_model.get_params(key)))
     return correct_det_alignment(ct_model, sino, view_params)

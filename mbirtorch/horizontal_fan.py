@@ -1,46 +1,15 @@
-"""The shared horizontal-fan kernels and the hfan data contract.
+"""This module holds the horizontal fan projectors that all geometries use.
 
-Every geometry's horizontal fan applies the same trapezoid rule; the
-geometry enters ONLY through the HFAN DATA TUPLE
+Each geometry supplies the tuple (n_p, centers, W_p_c, weight_scale) for every view and pixel.
+n_p is the projected channel coordinate, and centers is n_p rounded to an int32.  W_p_c is the
+projected voxel width in channels, and weight_scale is a scale factor set by the geometry.
+Each detector channel n = center + offset near the projection is called a tap.  Tap n gets the
+trapezoid weight
 
-    (n_p, centers, W_p_c, weight_scale)
+    A = weight_scale * clip((W_p_c + 1) / 2 - |n_p - n|, 0, min(1, W_p_c)).
 
-computed per (view, pixel) by the geometry's own chain (parallel:
-_parallel_hfan_math; cone: _cone_horizontal_data, which also returns
-pixel_mag for its vertical fan): the continuous projected channel
-coordinate, its rounded center (int32 -- 32-bit indices halve the
-contract's bytes and match what GPU kernels prefer; the torch index ops
-upcast to int64 inside the compiled region, where the cast fuses), the
-projected voxel width in channel units, and the per-geometry weight
-scale.  The tap clip bound min(1, W_p_c) is DERIVED at the use site (one
-instruction), not carried.  The tap axis is NEVER materialized: taps
-expand inside the kernel loops, so the precomputed contract stays
-per-(view, pixel) at any psf width -- a future kernel path must not
-reintroduce a per-(view, tap, pixel) transient.
-
-The weight rule (identical across geometries): tap n = center + offset
-receives
-
-    A = weight_scale * clip((W_p_c + 1) / 2 - |n_p - n|, 0, min(1, W_p_c))
-
--- the trapezoid overlap of the projected voxel with detector cell n --
-zeroed outside the detector.  The weights reproduce the golden reference
-to <= 1.6e-6 rel-max.
-
-Torch semantics note: torch index ops assert on out-of-bounds indices
-rather than dropping or clamping them, so every tap here uses the
-zero-the-weight, clamp-the-index pattern: the weight is zeroed where the
-unclipped tap fell outside the detector, then the index is clamped in
-range.  This convention is load-bearing beyond correctness: a sorted/CSR
-consumer's static stream bound (taps per view == psf_width * P exactly)
-rests on no tap ever being dropped.
-
-Layout note: the forward fan produces CHANNEL-MAJOR partial views,
-(channels, cols), so the scatter writes contiguous rows rather than
-strided columns; the geometry BODY transposes to the
-sinogram's (rows, channels) layout on return.  The back fan likewise
-gathers from channel-major views (the body transposes each view batch up
-front).
+A tap outside the detector gets weight zero.  The code also clamps the index of that tap into
+range, because torch index operations fail on indices that are out of range.
 """
 
 import torch
@@ -49,21 +18,22 @@ _F32 = torch.float32
 
 
 def tap_weights(n_p, n, W_p_c, weight_scale, num_channels):
-    """The shared trapezoid weight for tap ``n``, with torch-safe OOB
-    handling (see the module docstring's zero-and-clamp note).
+    """This function returns the trapezoid weight for tap ``n`` and the tap index clamped
+    into range.  The weight is zero where the tap is outside the detector.
 
     Args:
-        n_p: continuous projected channel coordinate, (Vb, P).
-        n: integer tap channel (center + offset), (Vb, P) int64.
-        W_p_c: projected voxel width in channel units, (Vb, P) or
-            broadcastable.
-        weight_scale: geometry weight scale (e.g. in-plane voxel area /
-            footprint length), (Vb, P) or broadcastable.
-        num_channels (int): detector channel count.
+        n_p: (Vb, P) tensor.  The continuous projected channel coordinate.  Vb is the number of
+            views in the batch, and P is the number of pixels.
+        n: (Vb, P) int64 tensor.  The integer channel of the tap, equal to center + offset.
+        W_p_c: (Vb, P) tensor or a tensor that broadcasts to it.  The projected voxel width
+            in channels.
+        weight_scale: (Vb, P) tensor or a tensor that broadcasts to it.  The weight scale of
+            the geometry, for example the in-plane voxel area divided by the footprint length.
+        num_channels (int): The number of detector channels.
 
     Returns:
-        (A, n_clamped): weight (Vb, P) float32, zeroed where the unclipped
-        tap was out of range, and the in-range index (Vb, P) int64.
+        (A, n_clamped): A is the (Vb, P) float32 weight.  A is zero where the tap is outside the
+        detector.  n_clamped is the (Vb, P) int64 tap index clamped into range.
     """
     A = torch.clamp((W_p_c + 1.0) / 2.0 - (n_p - n.to(_F32)).abs(), min=0.0)
     A = torch.minimum(A, torch.clamp(W_p_c, max=1.0)) * weight_scale
@@ -72,29 +42,30 @@ def tap_weights(n_p, n, W_p_c, weight_scale, num_channels):
 
 
 def fan_forward_batch(hfan_data, values, num_channels, psf_radius):
-    """Forward horizontal fan for one view batch: bin weighted per-pixel rows
-    into their detector channels with a per-tap scatter-add loop.
+    """This function computes the forward horizontal fan projection for one batch of views.
+    For each pixel, the function multiplies the row of the pixel by the tap weights of the
+    pixel.  The function then adds these products into the detector channels.
 
     Args:
-        hfan_data: (n_p, centers, W_p_c, weight_scale) for this view batch;
-            n_p (Vb, P) float32, centers (Vb, P) int32.
-        values: (P, num_cols) rows to weight and bin (voxel cylinders,
-            broadcast over views -- parallel beam), or (Vb, P, num_cols)
-            per-view rows (a two-fan geometry's vertical-fan output -- cone).
-        num_channels (int, static): number of detector channels.
-        psf_radius (int, static): tap radius (psf_width = 2*psf_radius + 1).
+        hfan_data: The tuple (n_p, centers, W_p_c, weight_scale) for this batch of views.
+            n_p is a (Vb, P) float32 tensor, and centers is a (Vb, P) int32 tensor.
+        values: Either a (P, num_cols) tensor or a (Vb, P, num_cols) tensor.  Parallel beam
+            uses one set of rows for all views.  Cone beam uses the output of the vertical fan
+            projection, which has one set of rows for each view.
+        num_channels (int): The number of detector channels.
+        psf_radius (int): The number of taps on each side of the center.  The total number of
+            taps is 2*psf_radius + 1.
 
     Returns:
-        (Vb, num_channels, num_cols) CHANNEL-MAJOR partial views (contiguous
-        scatter rows; the geometry body transposes to the sinogram layout).
+        (Vb, num_channels, num_cols) tensor of partial views, with the channel axis before the
+        column axis.  The caller transposes these views into the sinogram axis order.
     """
     n_p, centers, W_p_c, weight_scale = hfan_data
     centers = centers.to(torch.int64)
     vb, num_pixels = n_p.shape
     num_cols = values.shape[-1]
     dev = values.device
-    # The accumulator is flat, so one index_add_ covers the whole batch.
-    # Row v*C + n holds view v, channel n.
+    # Row v*num_channels + n of the flat accumulator holds view v, channel n.
     acc = torch.zeros((vb * num_channels, num_cols), dtype=_F32, device=dev)
     row_base = torch.arange(vb, device=dev)[:, None] * num_channels
     for offset in range(-psf_radius, psf_radius + 1):
@@ -108,27 +79,24 @@ def fan_forward_batch(hfan_data, values, num_channels, psf_radius):
 
 def fan_back_batch(sino_batch_T, hfan_data, num_channels, psf_radius,
                    coeff_power=1, reduce_views=True):
-    """Back (adjoint) horizontal fan for one view batch: gather each pixel's
-    weighted channel rows (the per-tap gather + multiply-accumulate loop).
+    """This function computes the back projection, which is the adjoint of the horizontal fan
+    projection, for one batch of views.  For each pixel, the function reads the detector
+    channels near the projection of the pixel.  It then sums these channels with the tap
+    weights.
 
     Args:
-        sino_batch_T: (Vb, num_channels, num_rows) CHANNEL-MAJOR views (the
-            geometry body transposes up front so the per-pixel gather reads
-            contiguous rows -- the adjoint of the forward fan's channel-major
-            scatter).
-        hfan_data: as in :func:`fan_forward_batch`.
-        num_channels (int, static): number of detector channels.
-        psf_radius (int, static): tap radius.
-        coeff_power (int, static): weights raised to this power (2 = the
-            Hessian diagonal).
-        reduce_views (bool, static): True sums this batch's views (the
-            single-fan back projection, returning (P, num_rows)); False keeps
-            the view axis (a two-fan geometry feeds the per-view columns to
-            its vertical fan, returning (Vb, P, num_rows)).
+        sino_batch_T: (Vb, num_channels, num_rows) tensor of views, with the channel axis
+            before the row axis.
+        hfan_data: The same tuple as in :func:`fan_forward_batch`.
+        num_channels (int): The number of detector channels.
+        psf_radius (int): The number of taps on each side of the center.
+        coeff_power (int): The power applied to each weight.  A value of 2 gives the Hessian
+            diagonal.
+        reduce_views (bool): If True, the function sums over the views in the batch.  If False,
+            the function keeps the view axis.
 
     Returns:
-        (P, num_rows) with reduce_views, else (Vb, P, num_rows); the caller
-        accumulates batches.
+        (P, num_rows) tensor if ``reduce_views`` is True, and (Vb, P, num_rows) tensor otherwise.
     """
     n_p, centers, W_p_c, weight_scale = hfan_data
     centers = centers.to(torch.int64)

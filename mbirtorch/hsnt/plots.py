@@ -1,4 +1,4 @@
-"""Plots of a factorization for the command line."""
+"""This module draws plots of a factorization for the command line tool."""
 import os
 
 import numpy as np
@@ -8,8 +8,8 @@ _COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F
 
 
 def _short(source, n=60):
-    """The basename of a source label ('path' or 'path:group'), keeping the group; a drive letter's colon is left
-    alone because what follows it is a path."""
+    """This function returns the base name of a source label of the form 'path' or 'path:group'.
+    The returned name keeps the group, and it is shortened to at most ``n`` characters."""
     head, sep, tail = source.rpartition(":")
     if sep and tail.strip("/") and not any(c in tail.strip("/") for c in "/\\") and os.path.exists(head):
         s = os.path.basename(head) + ":" + tail.strip("/")
@@ -21,13 +21,14 @@ def _short(source, n=60):
 
 
 def plot_factorization(base, source, W4, H, bin_indices, max_views=4, wavelengths=None):
-    """Write <base>_spectra.png (the rows of H and the mean-pixel spectrum) and <base>_maps.png (the maps of at most
-    max_views views, evenly spaced). The spectra are drawn against the wavelengths (Angstrom) when they are given as
-    one finite, increasing value per column of H, else against the source bin indices. Uses matplotlib's object
-    interface, so the caller's pyplot state and backend are untouched.
+    """This function writes two PNG files that show a factorization.  The file
+    ``<base>_spectra.png`` shows the rows of ``H`` and the mean pixel spectrum.  The file
+    ``<base>_maps.png`` shows the component maps for at most ``max_views`` views.  The plots
+    use ``wavelengths`` (in Angstrom) on the horizontal axis when it is given, and
+    ``bin_indices`` otherwise.  This function does not change the caller's pyplot state.
 
     Returns:
-        list: the two paths.
+        list: The paths of the two files.
     """
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
