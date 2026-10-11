@@ -10,6 +10,7 @@ which code runs.
 """
 
 import os
+import threading
 
 import torch
 
@@ -39,8 +40,10 @@ _MULTIAXIS_BACK_RESULTS = {}
 _MULTIAXIS_FWD_RESULTS = {}
 
 # A kernel check builds its own small model, and that model asks this module which code to
-# use.  While any check runs, every check must answer that the torch code is used.
-_SELF_CHECK_ACTIVE = False
+# use.  While a check runs in a thread, every call in that thread answers that the torch code
+# is used.  Calls in other threads are not affected.  The lock lets only one check run at a time.
+_SELF_CHECK_STATE = threading.local()
+_SELF_CHECK_LOCK = threading.RLock()
 
 
 def triton_available():
@@ -165,10 +168,10 @@ def multiaxis_forward_kernel_usable(model):
 def _kernel_usable(model, cache, self_check):
     """This function returns (usable, reason) from three checks in order.
 
-    First, no kernel check may be running.  Second, :func:`triton_available` must pass.
+    First, no kernel check may be running in this thread.  Second, :func:`triton_available` must pass.
     Third, the kernel check for this device must pass.  The function caches the third check.
     """
-    if _SELF_CHECK_ACTIVE:
+    if getattr(_SELF_CHECK_STATE, 'active', False):
         result = (False, 'kernel self-check in progress (its own probe model '
                          'uses the torch bodies)')
     else:
@@ -177,9 +180,10 @@ def _kernel_usable(model, cache, self_check):
             result = (False, probe_reason)
         else:
             device_key = str(model.torch_device)
-            if device_key not in cache:
-                cache[device_key] = self_check(device_key)
-            result = cache[device_key]
+            with _SELF_CHECK_LOCK:
+                if device_key not in cache:
+                    cache[device_key] = self_check(device_key)
+                result = cache[device_key]
     return result
 
 
@@ -273,8 +277,7 @@ def _cone_back_self_check(device_key):
 
     The function never raises an error.
     """
-    global _SELF_CHECK_ACTIVE
-    _SELF_CHECK_ACTIVE = True
+    _SELF_CHECK_STATE.active = True
     try:
         from .cone_beam import _cone_back_view_batch
         from .triton_cone import _cone_back_view_batch_triton
@@ -301,7 +304,7 @@ def _cone_back_self_check(device_key):
         result = (False, f'cone back self-check failed to run: '
                          f'{type(e).__name__}: {e}')
     finally:
-        _SELF_CHECK_ACTIVE = False
+        _SELF_CHECK_STATE.active = False
     return result
 
 
@@ -310,8 +313,7 @@ def _cone_forward_self_check(device_key):
 
     The function never raises an error.
     """
-    global _SELF_CHECK_ACTIVE
-    _SELF_CHECK_ACTIVE = True
+    _SELF_CHECK_STATE.active = True
     try:
         from .cone_beam import _cone_forward_view_batch
         from .triton_cone import _cone_forward_view_batch_triton
@@ -342,7 +344,7 @@ def _cone_forward_self_check(device_key):
         result = (False, f'cone forward self-check failed to run: '
                          f'{type(e).__name__}: {e}')
     finally:
-        _SELF_CHECK_ACTIVE = False
+        _SELF_CHECK_STATE.active = False
     return result
 
 
@@ -351,8 +353,7 @@ def _parallel_back_self_check(device_key):
 
     The function never raises an error.
     """
-    global _SELF_CHECK_ACTIVE
-    _SELF_CHECK_ACTIVE = True
+    _SELF_CHECK_STATE.active = True
     try:
         from .parallel_beam import _parallel_back_view_batch
         from .triton_parallel import _parallel_back_view_batch_triton
@@ -386,7 +387,7 @@ def _parallel_back_self_check(device_key):
         result = (False, f'parallel back self-check failed to run: '
                          f'{type(e).__name__}: {e}')
     finally:
-        _SELF_CHECK_ACTIVE = False
+        _SELF_CHECK_STATE.active = False
     return result
 
 
@@ -395,8 +396,7 @@ def _parallel_forward_self_check(device_key):
 
     The function never raises an error.
     """
-    global _SELF_CHECK_ACTIVE
-    _SELF_CHECK_ACTIVE = True
+    _SELF_CHECK_STATE.active = True
     try:
         from .parallel_beam import _parallel_forward_view_batch
         from .triton_parallel import _parallel_forward_view_batch_triton
@@ -426,7 +426,7 @@ def _parallel_forward_self_check(device_key):
         result = (False, f'parallel forward self-check failed to run: '
                          f'{type(e).__name__}: {e}')
     finally:
-        _SELF_CHECK_ACTIVE = False
+        _SELF_CHECK_STATE.active = False
     return result
 
 
@@ -435,8 +435,7 @@ def _multiaxis_back_self_check(device_key):
 
     The function never raises an error.
     """
-    global _SELF_CHECK_ACTIVE
-    _SELF_CHECK_ACTIVE = True
+    _SELF_CHECK_STATE.active = True
     try:
         from .multiaxis_parallel import _multiaxis_back_view_batch
         from .triton_multiaxis import _multiaxis_back_view_batch_triton
@@ -471,7 +470,7 @@ def _multiaxis_back_self_check(device_key):
         result = (False, f'multiaxis back self-check failed to run: '
                          f'{type(e).__name__}: {e}')
     finally:
-        _SELF_CHECK_ACTIVE = False
+        _SELF_CHECK_STATE.active = False
     return result
 
 
@@ -480,8 +479,7 @@ def _multiaxis_forward_self_check(device_key):
 
     The function never raises an error.
     """
-    global _SELF_CHECK_ACTIVE
-    _SELF_CHECK_ACTIVE = True
+    _SELF_CHECK_STATE.active = True
     try:
         from .multiaxis_parallel import _multiaxis_forward_view_batch
         from .triton_multiaxis import _multiaxis_forward_view_batch_triton
@@ -513,7 +511,7 @@ def _multiaxis_forward_self_check(device_key):
         result = (False, f'multiaxis forward self-check failed to run: '
                          f'{type(e).__name__}: {e}')
     finally:
-        _SELF_CHECK_ACTIVE = False
+        _SELF_CHECK_STATE.active = False
     return result
 
 
