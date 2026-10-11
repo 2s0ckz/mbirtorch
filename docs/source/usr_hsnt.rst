@@ -33,7 +33,9 @@ the spectra one per component and bin.  ``rehydrate`` returns the same quantity 
 attenuation.  When the number of components is not given, it is estimated by likelihood-ratio tests.  The components
 span the materials' spectra but need not be the materials themselves.  Data too large for the device are fitted by
 chunks of pixels.  Given a ``subspace_basis``, ``dehydrate`` fits only the maps, so a large scan can be dehydrated
-piece by piece against spectra fitted on part of it.
+piece by piece against spectra fitted on part of it.  Given a ``sample_mask``, ``dehydrate`` fits only the pixels
+inside the mask and sets the maps to zero outside it.  With ``check_mask=True``, it warns when the pixels outside hold
+more attenuation than noise explains.
 
 .. autofunction:: dehydrate
 .. autofunction:: rehydrate

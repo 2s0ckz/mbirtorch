@@ -8,6 +8,10 @@ from ..utilities import _to_host
 
 # These keywords belong to the MBIRJAX version of dehydrate, which used scikit-learn.  mbirtorch rejects them.
 _L2_KEYWORDS = ("safety_factor", "beta_loss", "max_iter", "tolerance", "batch_size", "random_state")
+# check_mask flags an outside pixel when twice its gain in log likelihood exceeds this chi-square quantile.
+_MASK_CHECK_LEVEL = 0.999
+# check_mask warns when the share of flagged outside pixels exceeds this value.
+_MASK_CHECK_WARN = 0.01
 
 
 def _reject_unknown_keywords(name, kwargs):
@@ -74,7 +78,8 @@ def _to_transmission(data, dataset_type):
 
 def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_basis=None, spectra="mle", dose=None,
               penalty="auto", max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
-              compile_mode="auto", mode="auto", chunk_pixels=None, max_passes=5, verbose=1, **kwargs):
+              compile_mode="auto", mode="auto", chunk_pixels=None, max_passes=5, sample_mask=None, check_mask=False,
+              verbose=1, **kwargs):
     """This function factors the attenuation of a hyperspectral dataset as X = W H by maximum
     likelihood.  The factors satisfy W >= 0 and H >= 0.
 
@@ -115,6 +120,15 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
             Defaults to None, in which case this function sets it from the available memory.
         max_passes (int, optional): The number of passes over the chunks when streaming.
             Defaults to 5.
+        sample_mask (numpy.ndarray or torch.Tensor, optional): A boolean array that is True
+            where the sample may be.  It must broadcast to the leading axes of the data.  An
+            image of shape (rows, cols) applies to every view, and an array of shape (views,
+            rows, cols) gives each view its own region.  This function sets W to zero outside
+            the mask and fits only the pixels inside it.  All views share the spectra.  The rank
+            estimate uses every pixel.  Defaults to None.
+        check_mask (bool, optional): When it is True and ``sample_mask`` is given, this
+            function also fits the pixels outside the mask, and it warns when more of them hold
+            attenuation than noise explains.  Defaults to False.
         verbose (int, optional): 0 prints nothing, 1 prints a summary, and 2 also prints the
             rank search.  Defaults to 1.
 
@@ -134,9 +148,12 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         raise ValueError(f"chunk_pixels must be a positive number of pixels, got {chunk_pixels}")
     if int(max_passes) < 0:
         raise ValueError(f"max_passes must be at least 0, got {max_passes}")
-    T, shape = _to_transmission(data, dataset_type)
+    T_all, shape = _to_transmission(data, dataset_type)
     device = _default_device(device)
     lead = shape[:-1]
+    mask = _sample_mask(sample_mask, lead)
+    T = T_all if mask is None else np.ascontiguousarray(T_all[mask])
+    pixels = f"{T.shape[0]}" if mask is None else f"{T.shape[0]} of {T_all.shape[0]} (sample_mask)"
     if subspace_basis is not None:
         from ._fit import _fit_fixed_basis
         H = _check_basis(subspace_basis, shape[-1], num_materials, spectra)
@@ -145,21 +162,90 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         if verbose >= 1:
             print("dehydrate(): ")
             print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given subspace_basis)")
-            print("   -Pixels: ", T.shape[0], f"; maps for the given basis ({rep['chunks']} chunk(s))")
-        return [W.reshape(*lead, H.shape[0]), H, dataset_type]
-    note = f"rank {num_materials} given"
-    if num_materials is None:
-        num_materials, note, _ = _estimate_rank(T, spatial_shape=_spatial_shape(lead), device=device, max_rank=max_rank,
-                                                verbose=max(0, verbose - 1))
-    W, H, rep = _fit(T, int(num_materials), spectra=spectra, dose=dose, penalty=penalty, device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps, rel_tol=rel_tol,
-                     max_passes=int(max_passes), compile_mode=compile_mode)
-    subspace_data = W.reshape(*lead, int(num_materials))
+            print("   -Pixels: ", pixels, f"; maps for the given basis ({rep['chunks']} chunk(s))")
+    else:
+        note = f"rank {num_materials} given"
+        if num_materials is None:
+            num_materials, note, _ = _estimate_rank(T_all, spatial_shape=_spatial_shape(lead), device=device,
+                                                    max_rank=max_rank, verbose=max(0, verbose - 1))
+        W, H, rep = _fit(T, int(num_materials), spectra=spectra, dose=dose, penalty=penalty, device=device, mode=mode,
+                         chunk_pixels=chunk_pixels, max_steps=max_steps, rel_tol=rel_tol, max_passes=int(max_passes),
+                         compile_mode=compile_mode)
+        if verbose >= 1:
+            solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
+            print("dehydrate(): ")
+            print("   -Spectral dimension: ", shape[-1], " -> rank: ", int(num_materials), f"({note})")
+            print("   -Pixels: ", pixels, f"; spectra: {spectra} ({solve})")
+    if mask is not None:
+        if check_mask and not mask.all():
+            _check_outside(T, W, np.ascontiguousarray(T_all[~mask]), H, dose, device, mode, chunk_pixels, max_steps,
+                           rel_tol, compile_mode, verbose)
+        W_all = np.zeros((T_all.shape[0], W.shape[1]), dtype=np.float32)
+        W_all[mask] = W
+        W = W_all
+    return [W.reshape(*lead, H.shape[0]), H, dataset_type]
+
+
+def _sample_mask(sample_mask, lead):
+    """This function converts ``sample_mask`` to a flat boolean array over the pixels, in the C
+    order of the leading axes.  It returns None when ``sample_mask`` is None."""
+    if sample_mask is None:
+        return None
+    m = np.asarray(_to_host(sample_mask))
+    if m.dtype != bool:
+        if not np.isin(m, (0, 1)).all():
+            raise ValueError("sample_mask must be boolean (or hold only 0 and 1)")
+        m = m.astype(bool)
+    try:
+        m = np.broadcast_to(m, tuple(lead))
+    except ValueError:
+        raise ValueError(f"sample_mask of shape {m.shape} does not broadcast to the leading axes "
+                         f"{tuple(lead)}") from None
+    if not m.any():
+        raise ValueError("sample_mask is False everywhere: there are no pixels to fit")
+    return np.ascontiguousarray(m).reshape(-1)
+
+
+def _check_outside(T_in, W_in, T_out, H, dose, device, mode, chunk_pixels, max_steps, rel_tol, compile_mode, verbose):
+    """This function checks whether the pixels outside ``sample_mask`` hold attenuation.
+
+    It fits each outside pixel to the spectra H and computes the gain in log likelihood over
+    W = 0, in counts.  It uses ``dose`` when it is given.  Otherwise it uses the effective dose of
+    the fit inside the mask, as the rank estimate does.  When the mask is correct, twice the gain
+    is at most a chi-square variable with rank degrees of freedom.  This function flags the pixels
+    above the _MASK_CHECK_LEVEL quantile of that variable, and it warns when the flagged share
+    exceeds _MASK_CHECK_WARN.  It returns the flagged share."""
+    import torch
+    from scipy.stats import chi2
+    from ._fit import _fit_fixed_basis
+    from ._loss import _nnal_prep, _nnal_rowwise
+    from .outputs import _CHUNK_ELEMENTS
+    from .rank import _loss_and_residual
+    if dose is None:
+        resid = _loss_and_residual(torch.from_numpy(T_in), torch.from_numpy(W_in), torch.from_numpy(H))[1]
+        dose = 1.0 / max(resid, np.finfo(np.float64).tiny)
+    W_out, _, _ = _fit_fixed_basis(T_out, H, device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps,
+                                   rel_tol=rel_tol, compile_mode=compile_mode)
+    R, K = H.shape
+    Hd = torch.as_tensor(H, device=device)
+    rows = max(1, _CHUNK_ELEMENTS // K)
+    gains = []
+    for i in range(0, T_out.shape[0], rows):
+        Tc = torch.from_numpy(T_out[i:i + rows]).to(device)
+        prep = _nnal_prep(Tc)
+        X = torch.from_numpy(W_out[i:i + rows]).to(device) @ Hd
+        gains.append((_nnal_rowwise(torch.zeros_like(X), Tc, prep, 1, dtype=torch.float64)
+                      - _nnal_rowwise(X, Tc, prep, 1, dtype=torch.float64)).cpu())
+    gain = float(dose) * torch.cat(gains).numpy()
+    share = float(np.mean(2 * gain > chi2.ppf(_MASK_CHECK_LEVEL, R)))
+    chance = 100 * (1 - _MASK_CHECK_LEVEL)
     if verbose >= 1:
-        solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
-        print("dehydrate(): ")
-        print("   -Spectral dimension: ", shape[-1], " -> rank: ", int(num_materials), f"({note})")
-        print("   -Pixels: ", T.shape[0], f"; spectra: {spectra} ({solve})")
-    return [subspace_data, H, dataset_type]
+        print(f"   -Outside the sample_mask: {T_out.shape[0]} pixels.  {100 * share:.3g}% hold more attenuation "
+              f"than noise explains, and {chance:.3g}% would by chance.")
+    if share > _MASK_CHECK_WARN:
+        warnings.warn(f"{100 * share:.3g}% of the pixels outside the sample_mask hold more attenuation than noise "
+                      f"explains, and {chance:.3g}% would by chance.  The sample may extend beyond the mask.")
+    return share
 
 
 def _check_basis(subspace_basis, bins, num_materials, spectra):
