@@ -272,7 +272,8 @@ class ParallelBeamModel(TomographyModel):
         """
         # This call chooses the GPUs and checks memory for a direct reconstruction before any allocation.
         self._apply_device_policy(workload='direct')
-        sinogram = self._shard_sinogram(sinogram)
+        # The filter places the sinogram on the devices.  This method keeps no reference to the
+        # device sinogram during the back projection.
         filtered_sinogram = self.fbp_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
         recon = self._back_project(filtered_sinogram, output_sharded=True)

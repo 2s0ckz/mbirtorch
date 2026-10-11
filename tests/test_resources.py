@@ -38,10 +38,10 @@ def _small_model(geometry):
 
 @pytest.mark.filterwarnings('ignore:Cone angle')
 def test_memory_matches_the_cluster_check():
-    # The reconstruction check on 4 H100 GPUs on Gautschi reported these needs on 2026-10-10, without weights.
+    # The reconstruction check on 4 H100 GPUs on Gautschi reported the 'recon' needs on 2026-10-10, without weights.
     model = _hexagonal_scan_model()
     assert resources._gpu_memory_gib(model, 4, 'recon', weights=False) == pytest.approx(151.54, abs=0.01)
-    assert resources._gpu_memory_gib(model, 4, 'direct', weights=False) == pytest.approx(111.76, abs=0.01)
+    assert resources._gpu_memory_gib(model, 4, 'direct', weights=False) == pytest.approx(92.18, abs=0.01)
     parts, _ = resources._cone_split_parts(model)
     assert [p.get_params('sinogram_shape')[1] for p in parts] == [1643, 1391]
     assert [p.get_params('recon_shape')[2] for p in parts] == [1647, 1393]

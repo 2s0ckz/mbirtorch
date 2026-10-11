@@ -667,13 +667,13 @@ def estimate_peak_device_bytes(plan):
         p_full = plan.num_pixels_full
         base_terms = [workspace_term]
         base = list(workspace_term[1])
-        # _shard_sinogram copies the sinogram to the devices at the start.  The filter writes
-        # a second array of the same shape, and the back projection reads that array.
+        # The filter copies the sinogram to the devices and writes a filtered array of the same
+        # shape.  The later steps hold only the filtered sinogram.  A sinogram that the caller
+        # placed on the devices is already excluded from the available memory.
         held_arrays = [
-            ('sinogram', per_dev(sino_dev)),
             ('filtered sinogram', per_dev(sino_dev)),
         ]
-        filter_terms = held_arrays + [
+        filter_terms = [('sinogram', per_dev(sino_dev))] + held_arrays + [
             ('filter row weights', per_dev(filter_row_weights)),
             ('filter row batch', per_dev(filter_row_batch)),
         ]
