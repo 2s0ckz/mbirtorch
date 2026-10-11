@@ -1152,8 +1152,14 @@ def _model_view_batch_bytes(model, n_devices):
 
     def view_batch_bytes(direction, num_pixels, band_cols):
         body = fwd_body if direction == 'forward' else back_body
-        return projector_functions.view_batch_bytes(
+        view_batch, bytes_per_view = projector_functions.view_batch_bytes(
             body, num_pixels, band_cols, args, n_devices=n_devices)
+        # A kernel with a ``_view_peak_bytes`` attribute states its peak memory per view
+        # separately from the cost that sets the view batch size.
+        peak_bytes = getattr(body, '_view_peak_bytes', None)
+        if peak_bytes is not None:
+            bytes_per_view = peak_bytes(num_pixels, band_cols, args)
+        return view_batch, bytes_per_view
     return view_batch_bytes
 
 

@@ -307,6 +307,23 @@ _multiaxis_back_view_batch_triton._view_batch_cost = \
     _multiaxis_back_view_batch_cost
 
 
+def _multiaxis_back_view_peak_bytes(num_pixels, num_band_rows, args):
+    """This function returns the peak memory in bytes that one view of a batch uses in the
+    back projection kernel.  The memory estimate uses this value.  The view batch size uses
+    :func:`_multiaxis_back_view_batch_cost` instead.
+
+    At its peak, the geometry code holds six arrays with one 4 byte entry for each
+    view and pixel.  Each view therefore uses 24 bytes per pixel.  Each view also uses
+    its copy of the sinogram view.
+    """
+    # With zero pixels, the cost function returns the bytes of the sinogram view alone.
+    plane_bytes = _multiaxis_back_view_batch_cost(0, num_band_rows, args)[0]
+    return 24 * int(num_pixels) + plane_bytes
+
+
+_multiaxis_back_view_batch_triton._view_peak_bytes = _multiaxis_back_view_peak_bytes
+
+
 @_jit
 def _multiaxis_forward_kernel(n_p_ptr, centers_ptr, m0_ptr,
                               w_p_c_ptr, weight_scale_ptr,
@@ -520,3 +537,20 @@ def _multiaxis_forward_view_batch_cost(num_pixels, band_len, args):
 
 _multiaxis_forward_view_batch_triton._view_batch_cost = \
     _multiaxis_forward_view_batch_cost
+
+
+def _multiaxis_forward_view_peak_bytes(num_pixels, band_len, args):
+    """This function returns the peak memory in bytes that one view of a batch uses in the
+    forward projection kernel.  The memory estimate uses this value.  The view batch size uses
+    :func:`_multiaxis_forward_view_batch_cost` instead.
+
+    At its peak, the geometry code holds six arrays with one 4 byte entry for each
+    view and pixel.  Each view therefore uses 24 bytes per pixel.  Each view also uses
+    its output view.
+    """
+    # With zero pixels, the cost function returns the bytes of the sinogram view alone.
+    plane_bytes = _multiaxis_forward_view_batch_cost(0, band_len, args)[0]
+    return 24 * int(num_pixels) + plane_bytes
+
+
+_multiaxis_forward_view_batch_triton._view_peak_bytes = _multiaxis_forward_view_peak_bytes

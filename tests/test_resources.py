@@ -45,7 +45,7 @@ def test_memory_matches_the_cluster_check():
     parts, _ = resources._cone_split_parts(model)
     assert [p.get_params('sinogram_shape')[1] for p in parts] == [1643, 1391]
     assert [p.get_params('recon_shape')[2] for p in parts] == [1647, 1393]
-    assert resources._gpu_memory_gib(parts[0], 4, 'recon', weights=False) == pytest.approx(83.93, abs=0.01)
+    assert resources._gpu_memory_gib(parts[0], 4, 'recon', weights=False) == pytest.approx(83.92, abs=0.01)
 
 
 def test_cone_split_parts_match_a_real_split():

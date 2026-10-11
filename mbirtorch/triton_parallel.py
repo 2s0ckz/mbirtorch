@@ -257,6 +257,23 @@ _parallel_back_view_batch_triton._view_batch_cost = \
     _parallel_back_view_batch_cost
 
 
+def _parallel_back_view_peak_bytes(num_pixels, band_rows, args):
+    """This function returns the peak memory in bytes that one view of a batch uses in the
+    back projection kernel.  The memory estimate uses this value.  The view batch size uses
+    :func:`_parallel_back_view_batch_cost` instead.
+
+    At its peak, ``_parallel_hfan_math`` holds five arrays with one 4 byte entry for
+    each view and pixel.  Each view therefore uses 20 bytes per pixel.  Each view also uses
+    its copy of the sinogram view.
+    """
+    # With zero pixels, the cost function returns the bytes of the sinogram view alone.
+    plane_bytes = _parallel_back_view_batch_cost(0, band_rows, args)[0]
+    return 20 * int(num_pixels) + plane_bytes
+
+
+_parallel_back_view_batch_triton._view_peak_bytes = _parallel_back_view_peak_bytes
+
+
 @_jit
 def _parallel_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                              weight_scale_ptr, values_ptr, out_ptr,
@@ -545,3 +562,23 @@ def _parallel_forward_view_batch_cost(num_pixels, num_value_cols, args):
 
 _parallel_forward_view_batch_triton._view_batch_cost = \
     _parallel_forward_view_batch_cost
+
+
+def _parallel_forward_view_peak_bytes(num_pixels, num_value_cols, args):
+    """This function returns the peak memory in bytes that one view of a batch uses in the
+    forward projection kernel.  The memory estimate uses this value.  The view batch size uses
+    :func:`_parallel_forward_view_batch_cost` instead.
+
+    The kernel that sorts the pixels peaks at 28 bytes per pixel in each view.  At that point
+    it holds ``n_p`` and ``centers``, the sort order as int64 and int32 arrays, the two sorted
+    arrays, and the output sinogram view.  The kernel that loops over the channel taps peaks at 20 bytes
+    per pixel inside ``_parallel_hfan_math``.  Each view also uses its output sinogram view.
+    """
+    pixel_bytes = 28 if sorted_forward_enabled() else 20
+    # With zero pixels, the cost function returns the bytes of the sinogram view alone.
+    plane_bytes = _parallel_forward_view_batch_cost(0, num_value_cols, args)[0]
+    return pixel_bytes * int(num_pixels) + plane_bytes
+
+
+_parallel_forward_view_batch_triton._view_peak_bytes = \
+    _parallel_forward_view_peak_bytes

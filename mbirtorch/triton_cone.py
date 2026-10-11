@@ -335,6 +335,23 @@ def _cone_back_view_batch_cost(num_pixels, num_band_rows, args):
 _cone_back_view_batch_triton._view_batch_cost = _cone_back_view_batch_cost
 
 
+def _cone_back_view_peak_bytes(num_pixels, num_band_rows, args):
+    """This function returns the peak memory in bytes that one view of a batch uses in the
+    back kernel.  The memory estimate uses this value.  The view batch size uses
+    :func:`_cone_back_view_batch_cost` instead.
+
+    At its peak, ``_cone_horizontal_data`` holds 11 arrays with one 4 byte entry for
+    each view and pixel.  Each view therefore uses 44 bytes per pixel.  Each view also uses
+    its copy of the sinogram plane.
+    """
+    # With zero pixels, the cost function returns the bytes of the sinogram view alone.
+    plane_bytes = _cone_back_view_batch_cost(0, num_band_rows, args)[0]
+    return 44 * int(num_pixels) + plane_bytes
+
+
+_cone_back_view_batch_triton._view_peak_bytes = _cone_back_view_peak_bytes
+
+
 @_jit
 def _cone_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                          m0_ptr, w_p_r_ptr, pixel_mag_ptr, z_offset_ptr,
@@ -528,3 +545,19 @@ def _cone_forward_view_batch_cost(num_pixels, band_len, args):
 
 _cone_forward_view_batch_triton._view_batch_cost = \
     _cone_forward_view_batch_cost
+
+
+def _cone_forward_view_peak_bytes(num_pixels, band_len, args):
+    """This function returns the peak memory in bytes that one view of a batch uses in the
+    forward kernel.  The memory estimate uses this value.  The view batch size uses
+    :func:`_cone_forward_view_batch_cost` instead.
+
+    Each view uses 44 bytes per pixel inside ``_cone_horizontal_data``, as in
+    :func:`_cone_back_view_peak_bytes`.  Each view also uses its output plane.
+    """
+    # With zero pixels, the cost function returns the bytes of the sinogram view alone.
+    plane_bytes = _cone_forward_view_batch_cost(0, band_len, args)[0]
+    return 44 * int(num_pixels) + plane_bytes
+
+
+_cone_forward_view_batch_triton._view_peak_bytes = _cone_forward_view_peak_bytes
