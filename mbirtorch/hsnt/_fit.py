@@ -34,7 +34,7 @@ def _device_memory(device):
     the device, and ``name`` is the name of the device.  The string ``remark`` notes how the budget
     was measured, and it is empty when there is nothing to note."""
     if device.startswith("cuda"):
-        from .._memory_ledger import device_budget_bytes
+        from .._memory_estimate import device_budget_bytes
         torch.cuda.empty_cache()
         budget, total = device_budget_bytes(device), torch.cuda.get_device_properties(device).total_memory
         remark = ""

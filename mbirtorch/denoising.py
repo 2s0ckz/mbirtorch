@@ -13,11 +13,11 @@ import itertools
 import numpy as np
 import torch
 
-from . import _memory_ledger, _sharding
+from . import _memory_estimate, _sharding
 
 from . import qggmrf as _qggmrf
 from . import vcd_utils
-from ._memory_ledger import image_ell1, stack_ell1
+from ._memory_estimate import image_l1_norm, stack_l1_norm
 from ._utils import _AUTO_REGULARIZATION_PARAM_NAMES, Param, recon_param_names
 from .projectors import maybe_compile
 from .tomography_model import TomographyModel
@@ -75,7 +75,7 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
                         fm_constant, qggmrf_params, image_shape):
     """This function performs one VCD subset update for the identity forward model.  The
     function changes ``flat_image`` and ``flat_error_image`` in place.  It returns
-    (flat_image, flat_error_image, ell1, alpha), where ``ell1`` is the L1 norm of the update.
+    (flat_image, flat_error_image, l1, alpha), where ``l1`` is the L1 norm of the update.
     The tests in tests/test_denoiser.py compare against stored values, so the order of
     operations must not change."""
     prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_at_indices(
@@ -109,8 +109,8 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
 
     cur_error_image = cur_error_image - alpha * delta_sinogram
     flat_error_image.index_copy_(0, pixel_indices, cur_error_image)
-    ell1_for_subset = torch.sum(torch.abs(delta_recon_at_indices))
-    return flat_image, flat_error_image, ell1_for_subset, alpha
+    l1_for_subset = torch.sum(torch.abs(delta_recon_at_indices))
+    return flat_image, flat_error_image, l1_for_subset, alpha
 
 
 def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
@@ -125,8 +125,8 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
     (num_volumes, num_pixels, num_slices).
 
     Returns:
-        (flat_image, flat_error_image, ell1, alpha): ``flat_image`` and ``flat_error_image``
-        are the updated tensors.  ``ell1`` holds the L1 norm of the update of each volume,
+        (flat_image, flat_error_image, l1, alpha): ``flat_image`` and ``flat_error_image``
+        are the updated tensors.  ``l1`` holds the L1 norm of the update of each volume,
         with shape (num_volumes,).  ``alpha`` holds the step size of each volume, with shape
         (num_volumes,).
     """
@@ -164,8 +164,8 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
 
     cur_error_image = cur_error_image - delta_scaled
     flat_error_image.index_copy_(1, pixel_indices, cur_error_image)
-    ell1_for_subset = torch.sum(torch.abs(delta_scaled), dim=(1, 2))
-    return flat_image, flat_error_image, ell1_for_subset, alpha
+    l1_for_subset = torch.sum(torch.abs(delta_scaled), dim=(1, 2))
+    return flat_image, flat_error_image, l1_for_subset, alpha
 
 
 def _is_stack(image):
@@ -239,9 +239,9 @@ class QGGMRFDenoiser(TomographyModel):
             ``torch.compile``.  If 'off', it does not.  Defaults to 'auto'.
     """
 
-    # This name selects the denoiser rows of the minimum size table in _widening_floors.
+    # This name selects the denoiser rows of the minimum size table in _min_problem_sizes.
     # For the denoiser, the sizes are in image voxels.
-    _floor_family = 'denoiser'
+    _size_table_key = 'denoiser'
 
     def __init__(self, image_shape, compile_mode='auto'):
         if len(image_shape) != 3:
@@ -420,7 +420,7 @@ class QGGMRFDenoiser(TomographyModel):
         return torch.as_tensor(np.ascontiguousarray(values), dtype=torch.int64,
                                device=self.torch_device)
 
-    def _settle_regularization(self, image):
+    def _get_regularization_params(self, image):
         """This method returns the regularization parameters for denoising.  When
         auto-regularization is on, the method estimates them from the image."""
         names = list(_AUTO_REGULARIZATION_PARAM_NAMES)
@@ -500,7 +500,7 @@ class QGGMRFDenoiser(TomographyModel):
         # For the identity forward model, sigma_y equals sigma_noise.
         self.set_params(no_warning=True, sigma_noise=float(sigma_noise),
                         sigma_y=float(sigma_noise))
-        regularization_params = self._settle_regularization(image)
+        regularization_params = self._get_regularization_params(image)
         if partition is None:
             partition_tensor = self._draw_partition(rng=rng)
             self._partition_supplied = False
@@ -632,18 +632,18 @@ class QGGMRFDenoiser(TomographyModel):
             num_iters = 0
             with torch.no_grad():
                 for i in range(max_iters):
-                    ell1_accum = 0.0
+                    l1_accum = 0.0
                     alpha_accum = 0.0
                     for k in range(partition.shape[0]):
-                        flat_image, flat_error_image, ell1_subset, alpha_subset = \
+                        flat_image, flat_error_image, l1_subset, alpha_subset = \
                             subset_denoiser(flat_image, flat_error_image, partition[k],
                                             fm_constant, qggmrf_params, tuple(image_shape))
-                        ell1_accum = ell1_accum + ell1_subset
+                        l1_accum = l1_accum + l1_subset
                         alpha_accum = alpha_accum + alpha_subset
 
                     # An image of zeros gives nan, not ZeroDivisionError.
-                    image_l1 = float(image_ell1(flat_image))
-                    nmae = (float(ell1_accum) / image_l1 if image_l1
+                    image_l1 = float(image_l1_norm(flat_image))
+                    nmae = (float(l1_accum) / image_l1 if image_l1
                             else float('nan'))
                     nmae_update[i] = nmae
                     alpha_values[i] = float(alpha_accum) / partition.shape[0]
@@ -716,7 +716,7 @@ class QGGMRFDenoiser(TomographyModel):
                     # The shards exchange their boundary slices once per iteration.
                     halos['left'], halos['right'] = _sharding.exchange_qggmrf_halos(
                         flat_image, self.dev2dev_safe)
-                    ell1_accum = 0.0
+                    l1_accum = 0.0
                     alpha_accum = 0.0
                     for k in range(partition.shape[0]):
                         idx = idx_per_dev[k]
@@ -759,16 +759,16 @@ class QGGMRFDenoiser(TomographyModel):
                             flat_error.tensors[j].index_add_(0, idx[j], -step)
                             return torch.sum(torch.abs(step))
 
-                        ell1_parts = _sharding.run_per_device(
+                        l1_parts = _sharding.run_per_device(
                             devices, apply_worker, executor=self._per_device_pool)
-                        ell1_accum = ell1_accum + combine_on_lead(ell1_parts)
+                        l1_accum = l1_accum + combine_on_lead(l1_parts)
                         alpha_accum = alpha_accum + alpha
 
                     # This is the only host synchronization of the iteration.  An image of
                     # zeros gives nan.
                     image_l1 = float(combine_on_lead(
-                        [image_ell1(t) for t in flat_image.tensors]))
-                    nmae = (float(ell1_accum) / image_l1 if image_l1
+                        [image_l1_norm(t) for t in flat_image.tensors]))
+                    nmae = (float(l1_accum) / image_l1 if image_l1
                             else float('nan'))
                     nmae_update[i] = nmae
                     alpha_values[i] = float(alpha_accum) / partition.shape[0]
@@ -864,7 +864,7 @@ class QGGMRFDenoiser(TomographyModel):
 
         Raises:
             ValueError: If ``volume_shape`` is not the image shape of the denoiser.
-            MemoryPreflightError: If a batch of one volume does not fit.
+            MemoryCheckError: If a batch of one volume does not fit.
         """
         image_shape = tuple(int(n) for n in self.get_params('recon_shape'))
         if volume_shape is not None and \
@@ -874,21 +874,21 @@ class QGGMRFDenoiser(TomographyModel):
                 f'over volumes of shape {image_shape}; got volume_shape '
                 f'{tuple(volume_shape)}.  Build a QGGMRFDenoiser at that shape.')
         device = self.torch_device
-        budget = _memory_ledger.device_budget_bytes(device)
+        budget = _memory_estimate.device_budget_bytes(device)
         if budget is None:
             return None
-        plan = _memory_ledger.plan_from_model(self, [device], workload='denoise')
-        ledger = _memory_ledger.estimate_peak_device_bytes(plan)
-        batch = _memory_ledger.largest_denoise_batch(
-            ledger, budget, margin=self.memory_preflight_margin)
+        plan = _memory_estimate.plan_from_model(self, [device], workload='denoise')
+        estimate = _memory_estimate.estimate_peak_device_bytes(plan)
+        batch = _memory_estimate.largest_denoise_batch(
+            estimate, budget, margin=self.memory_check_margin)
         if batch < 1:
-            need = _memory_ledger.denoise_batch_peak_bytes(ledger, 1)
-            raise _memory_ledger.MemoryPreflightError(
+            need = _memory_estimate.denoise_batch_peak_bytes(estimate, 1)
+            raise _memory_estimate.MemoryCheckError(
                 'a denoise sweep of one volume of shape {} is modeled at {:.2f} GB '
                 'against {:.2f} GB free on {} (with a {:.0%} margin), so no batch '
                 'fits.  Pass batch_size to denoise_stack to run anyway.'.format(
                     image_shape, need / 2 ** 30, budget / 2 ** 30, device,
-                    self.memory_preflight_margin))
+                    self.memory_check_margin))
         return int(batch)
 
     def denoise_stack(self, stack, sigma_noise=None, init_stack=None,
@@ -1089,14 +1089,14 @@ class QGGMRFDenoiser(TomographyModel):
         counts = np.zeros(num_vols, dtype=int)
         history = [[] for _ in range(num_vols)]
         for i in range(max_iters):
-            ell1_accum = torch.zeros(num_vols, dtype=flat_image.dtype, device=device)
+            l1_accum = torch.zeros(num_vols, dtype=flat_image.dtype, device=device)
             for k in range(partition.shape[0]):
-                flat_image, flat_error_image, ell1_subset, _alpha = subset_denoiser(
+                flat_image, flat_error_image, l1_subset, _alpha = subset_denoiser(
                     flat_image, flat_error_image, partition[k], fm_constant,
                     qggmrf_params, tuple(image_shape), active)
-                ell1_accum = ell1_accum + ell1_subset
+                l1_accum = l1_accum + l1_subset
             # The code reads from the device once per iteration.  A volume of zeros gives nan.
-            stats = torch.stack([ell1_accum, stack_ell1(flat_image)])
+            stats = torch.stack([l1_accum, stack_l1_norm(flat_image)])
             stats = stats.cpu().numpy().astype(np.float64)
             with np.errstate(divide='ignore', invalid='ignore'):
                 nmae = stats[0] / stats[1]

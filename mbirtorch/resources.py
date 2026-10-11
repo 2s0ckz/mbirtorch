@@ -234,8 +234,8 @@ def _gpu_memory_gib(ct_model, num_gpus, workload, weights=True):
         # This read-only array has the shape of the sinogram and uses almost no memory.
         shape = tuple(int(n) for n in model.get_params('sinogram_shape'))
         call_arrays['weights'] = np.broadcast_to(np.ones(1, dtype=np.float32), shape)
-    ledger = model._build_memory_ledger(devices=devices, workload=workload, **call_arrays)
-    return max(ledger.per_device_peaks()) * (1.0 + model.memory_preflight_margin) / _GIB
+    estimate = model._estimate_memory(devices=devices, workload=workload, **call_arrays)
+    return max(estimate.per_device_peaks()) * (1.0 + model.memory_check_margin) / _GIB
 
 
 # ── split reconstruction ────────────────────────────────────────────────────────────────

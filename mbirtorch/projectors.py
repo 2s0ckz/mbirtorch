@@ -269,14 +269,14 @@ class Projectors:
         The number is the default batch size, reduced if needed so that the temporary arrays
         of one batch fit within the memory limit.
         """
-        return self.view_batch_charge(body, num_pixels, band_cols, args)[0]
+        return self.view_batch_bytes(body, num_pixels, band_cols, args)[0]
 
-    def view_batch_charge(self, body, num_pixels, band_cols, args,
-                          n_devices=None):
+    def view_batch_bytes(self, body, num_pixels, band_cols, args,
+                         n_devices=None):
         """This method returns ``(view_batch, bytes_per_view)`` for one call of ``body``.
 
         ``view_batch`` is the number of views that one call of ``body`` projects.  The memory
-        estimate in ``_memory_ledger`` uses both numbers.  ``bytes_per_view`` does not include
+        estimate in ``_memory_estimate`` uses both numbers.  ``bytes_per_view`` does not include
         the output array or the array that accumulates partial results.  The memory estimate
         adds those arrays itself.
 

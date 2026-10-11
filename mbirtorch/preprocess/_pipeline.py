@@ -8,7 +8,7 @@ views in its own thread.
 import numpy as np
 import torch
 
-from .. import _memory_ledger
+from .. import _memory_estimate
 from .. import _sharding
 from ..tomography_model import _resolve_device
 
@@ -28,9 +28,9 @@ def permitted_devices(devices=None):
     if devices is not None:
         return list(devices)
     num_visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    pinned = _memory_ledger.pinned_device_count()
-    if pinned is not None:
-        num_visible = min(num_visible, pinned)
+    env_count = _memory_estimate.env_device_count()
+    if env_count is not None:
+        num_visible = min(num_visible, env_count)
     if num_visible == 0:
         return [_resolve_device('auto')]
     return [f'cuda:{i}' for i in range(num_visible)]

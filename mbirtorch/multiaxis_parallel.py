@@ -212,8 +212,8 @@ class MultiAxisParallelModel(TomographyModel):
                          view_params_name='angles', angles=angles,
                          recon_slice_offset=0.0)
 
-    # This name selects the multiaxis table of minimum sinogram sizes in ``_widening_floors``.
-    _floor_family = 'multiaxis'
+    # This name selects the multiaxis table of minimum sinogram sizes in ``_min_problem_sizes``.
+    _size_table_key = 'multiaxis'
 
     def _view_batch_bodies(self):
         # The forward and back Triton kernels are checked separately.  MBIRTORCH_DISABLE_TRITON=1

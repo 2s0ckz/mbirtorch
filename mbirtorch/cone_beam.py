@@ -322,9 +322,9 @@ class ConeBeamModel(TomographyModel):
 
     _dc_damping = _DC_DAMPING_DEFAULT
 
-    # This selects the cone-beam table in ``_widening_floors``.  That table gives the
+    # This selects the cone-beam table in ``_min_problem_sizes``.  That table gives the
     # minimum sinogram size for each number of GPUs.
-    _floor_family = 'cone'
+    _size_table_key = 'cone'
 
     def create_projectors(self):
         super().create_projectors()

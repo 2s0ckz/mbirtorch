@@ -2114,7 +2114,7 @@ def gen_demo_data(
     if devices is not None:
         ct_model_for_generation.configure_devices(devices=list(devices))
     # This model skips the memory check, because it does only one forward projection.
-    ct_model_for_generation.skip_memory_preflight = True
+    ct_model_for_generation.skip_memory_check = True
     ct_model_for_generation._apply_device_policy()
     device_provenance = 'requested' if devices is not None else 'default'
 

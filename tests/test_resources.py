@@ -3,7 +3,13 @@ import numpy as np
 import pytest
 
 import mbirtorch
-from mbirtorch import resources
+from mbirtorch import projectors, resources
+
+
+@pytest.fixture(autouse=True)
+def _no_recorded_compile_errors(monkeypatch):
+    """This function clears the compile errors that earlier tests recorded.  Those errors change the memory count."""
+    monkeypatch.setattr(projectors, '_COMPILE_ERRORS', {})
 
 
 def _hexagonal_scan_model():

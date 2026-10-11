@@ -43,12 +43,12 @@ def test_multiaxis_zero_elevation_matches_parallel(device):
     projections must agree at float level."""
     n_views = 12
     az = np.linspace(0, np.pi, n_views, endpoint=False)
-    cell = (n_views, 16, 16)
-    pm = mbirtorch.ParallelBeamModel(cell, az)
+    shape = (n_views, 16, 16)
+    pm = mbirtorch.ParallelBeamModel(shape, az)
     pm.configure_devices(devices=[device])
     pm.set_params(no_warning=True, verbose=0)
     rs = tuple(pm.get_params('recon_shape'))
-    mm = mbirtorch.MultiAxisParallelModel(cell, np.stack([az, np.zeros(n_views)], axis=1))
+    mm = mbirtorch.MultiAxisParallelModel(shape, np.stack([az, np.zeros(n_views)], axis=1))
     mm.configure_devices(devices=[device])
     mm.set_params(no_warning=True, verbose=0, recon_shape=rs)
     vol = np.random.RandomState(0).rand(*rs).astype(np.float32)

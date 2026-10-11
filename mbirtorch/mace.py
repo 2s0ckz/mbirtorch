@@ -20,8 +20,8 @@ import numpy as np
 import torch
 
 from . import _sharding
-from ._memory_ledger import (DEVICE_COUNT_ENV_VAR, ELL1_CHUNK_BYTES, ELL1_MAX_CHUNKS,
-                             pinned_device_count)
+from ._memory_estimate import (DEVICE_COUNT_ENV_VAR, L1_CHUNK_BYTES, L1_MAX_CHUNKS,
+                               env_device_count)
 from .denoising import QGGMRFDenoiser
 from .tomography_model import cpu_devices, default_devices, gpu_devices
 from .vcd_utils import named_rng
@@ -98,8 +98,8 @@ def _available_devices():
     """This function returns the default devices.  It returns at most the number of devices
     that ``MBIRTORCH_NUM_DEVICES`` sets."""
     pool = [_canonical_device(d) for d in default_devices()]
-    pinned = pinned_device_count()
-    return pool if pinned is None else pool[:pinned]
+    env_count = env_device_count()
+    return pool if env_count is None else pool[:env_count]
 
 
 def _device_pool(devices):
@@ -125,11 +125,11 @@ def _device_pool(devices):
         pool = _available_devices()
         count = int(devices)
         if not 1 <= count <= len(pool):
-            pinned = pinned_device_count()
-            pin_note = ('' if pinned is None else
-                        f'  {DEVICE_COUNT_ENV_VAR} pins the count to {pinned}.')
+            env_count = env_device_count()
+            env_note = ('' if env_count is None else
+                        f'  {DEVICE_COUNT_ENV_VAR} sets the count to {env_count}.')
             raise ValueError(f'{count} device(s) were requested, but {len(pool)} '
-                             f'are available.{pin_note}')
+                             f'are available.{env_note}')
         return pool[:count]
     devices = list(devices)
     if not devices:
@@ -189,7 +189,7 @@ def _chunk_count(tensor):
     """This function returns the number of chunks to use for a sum over a tensor.  The
     chunks keep the temporary arrays near a fixed size."""
     n_bytes = tensor.numel() * tensor.element_size()
-    return min(ELL1_MAX_CHUNKS, max(1, round(n_bytes / ELL1_CHUNK_BYTES)))
+    return min(L1_MAX_CHUNKS, max(1, round(n_bytes / L1_CHUNK_BYTES)))
 
 
 def _norms_of_change(new, previous):

@@ -263,7 +263,7 @@ def choose_num_parts(full_model, num_rows, half_overlap, margin, weights_supplie
     max_parts = max(1, num_rows // (2 * half_overlap))
     for num_parts in range(1, max_parts + 1):
         model = band_model(full_model, worst_part_rows(num_rows, num_parts, half_overlap))
-        model.memory_preflight_margin = margin
+        model.memory_check_margin = margin
         call_arrays = {'weights': 'supplied'} if weights_supplied else {}
         if model._fits_available_devices(**call_arrays):
             return num_parts

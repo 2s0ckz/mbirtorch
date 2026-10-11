@@ -381,7 +381,7 @@ REDUCE_SLAB_BYTES = 256 * 2 ** 20
 def reduce_slab_rows(num_rows, row_bytes):
     """This function returns the number of rows of a partial back projection
     that :func:`sum_band_to_owner` copies in one step.  The argument ``row_bytes``
-    is the number of bytes in one row.  The memory estimate in ``_memory_ledger``
+    is the number of bytes in one row.  The memory estimate in ``_memory_estimate``
     also uses this function.
     """
     # The result is a loop step, so it must be at least 1.

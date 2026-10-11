@@ -8,8 +8,8 @@ import mbirtorch
 
 def _small_tct(devices=("cpu",)):
     tvecs = mbirtorch.gen_translation_vectors(4, 4, x_spacing=3.0, z_spacing=2.0)
-    cell = (tvecs.shape[0], 40, 32)
-    m = mbirtorch.TranslationModel(cell, tvecs, source_detector_dist=128.0,
+    shape = (tvecs.shape[0], 40, 32)
+    m = mbirtorch.TranslationModel(shape, tvecs, source_detector_dist=128.0,
                                    source_iso_dist=32.0)
     m.configure_devices(devices=list(devices))
     m.set_params(no_warning=True, verbose=0)

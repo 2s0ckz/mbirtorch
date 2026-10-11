@@ -33,7 +33,7 @@ DIRECTION_CYLINDERS = 7
 APPLY_CYLINDERS = 2
 # A forward projection on several GPUs holds this many copied batches of cylinder arrays at
 # once.  The copy of the next batch overlaps the projection of the current batch.
-CYLINDER_TRANSFER_RESIDENTS = 3
+CYLINDER_TRANSFER_COPIES = 3
 
 # These are the numbers of cylinder arrays that one QGGMRFDenoiser subset update holds at
 # once.  The first is for computing the update direction.  The second is for applying it.
@@ -45,16 +45,16 @@ DENOISE_APPLY_CYLINDERS = 3
 DENOISE_HALO_COLUMNS = 4
 # The L1 norms and the weighted dot products are summed one chunk at a time.  These two
 # values set the chunk size for all of them.
-ELL1_CHUNK_BYTES = 16 * 2 ** 20
-ELL1_MAX_CHUNKS = 1024
+L1_CHUNK_BYTES = 16 * 2 ** 20
+L1_MAX_CHUNKS = 1024
 
 
 def _chunk_count(n_bytes):
     """This function returns the number of chunks used to sum an array of ``n_bytes`` bytes."""
-    return min(ELL1_MAX_CHUNKS, max(1, round(int(n_bytes) / ELL1_CHUNK_BYTES)))
+    return min(L1_MAX_CHUNKS, max(1, round(int(n_bytes) / L1_CHUNK_BYTES)))
 
 
-def image_ell1(flat_image):
+def image_l1_norm(flat_image):
     """This function returns the L1 norm of an array with the shape of the recon.
 
     The function sums the array one chunk at a time, so the temporary array holds only one
@@ -67,17 +67,17 @@ def image_ell1(flat_image):
                         in torch.chunk(flat_image, n_chunks, dim=0)]).sum()
 
 
-def stack_ell1(flat_stack):
+def stack_l1_norm(flat_stack):
     """This function returns the L1 norm of each volume in a stack of volumes.
 
     The function does not allocate a temporary array with the shape of the stack.
     ``flat_stack`` has shape ``(num_volumes, num_pixels, num_slices)``.  The result has shape
-    ``(num_volumes,)``.  The function chooses the number of chunks as :func:`image_ell1` does
+    ``(num_volumes,)``.  The function chooses the number of chunks as :func:`image_l1_norm` does
     for the whole stack.  It cuts the chunks along the pixel axis.  A stack smaller than one
     chunk is summed in one step.
     """
     n_bytes = flat_stack.numel() * flat_stack.element_size()
-    n_chunks = min(ELL1_MAX_CHUNKS, max(1, round(n_bytes / ELL1_CHUNK_BYTES)))
+    n_chunks = min(L1_MAX_CHUNKS, max(1, round(n_bytes / L1_CHUNK_BYTES)))
     if n_chunks == 1:
         return torch.sum(torch.abs(flat_stack), dim=(1, 2))
     return torch.stack([torch.sum(torch.abs(chunk), dim=(1, 2)) for chunk
@@ -156,21 +156,25 @@ CALIBRATION_ENV_VAR = 'MBIRTORCH_MEMORY_CALIBRATION'
 DEVICE_COUNT_ENV_VAR = 'MBIRTORCH_NUM_DEVICES'
 # One view batch of a torch projection function holds this many arrays for each view.  A
 # torch projection function is written in torch code and has no ``_view_batch_cost``.
-TORCH_BODY_VIEW_SLABS = 14
+TORCH_PROJECTOR_VIEW_SLABS = 14
 
 # The ratio of the estimated peak to the measured peak must fall in this range.
 CALIBRATION_BAND = (1.00, 1.30)
 # This wider range applies to torch projection functions.  These functions hold a different
 # number of arrays in each geometry.
-TORCH_BODY_CALIBRATION_BAND = (1.00, 5.80)
+TORCH_PROJECTOR_CALIBRATION_BAND = (1.00, 5.80)
 
 
-class MemoryPreflightError(RuntimeError):
+class MemoryCheckError(RuntimeError):
     """This class is used to signal that no number of GPUs can hold the reconstruction."""
 
 
+# MemoryPreflightError is the deprecated name of MemoryCheckError.
+MemoryPreflightError = MemoryCheckError
+
+
 @dataclass
-class PhaseCharge:
+class StepMemory:
     """This class is used to hold the bytes of one step on each device and the terms that make
     up those bytes."""
     name: str
@@ -185,7 +189,7 @@ class PhaseCharge:
 
 
 @dataclass
-class Ledger:
+class MemoryEstimate:
     """This class is used to hold the memory estimate of every step on every device.
 
     The peak on a device is the maximum over the steps.
@@ -225,7 +229,7 @@ def _gb(num_bytes):
 
 
 @dataclass
-class LedgerPlan:
+class MemoryEstimateInputs:
     """This class is used to hold the inputs of the memory estimate.
 
     :func:`plan_from_model` builds it from a model, and the tests build it by hand.  No field
@@ -268,19 +272,19 @@ class LedgerPlan:
     # A function of (direction, num_pixels, band_cols) that returns
     # (view_batch, bytes_per_view).  The direction is 'forward' or 'back'.  None means that
     # the view batches add no bytes.
-    view_charge: object = None
+    view_batch_bytes: object = None
     # The directions, 'forward' or 'back', that use a torch projection function.  The
-    # estimate counts the bytes of those view batches itself.  See TORCH_BODY_VIEW_SLABS.
-    torch_body_directions: tuple = ()
+    # estimate counts the bytes of those view batches itself.  See TORCH_PROJECTOR_VIEW_SLABS.
+    torch_projector_directions: tuple = ()
 
     @property
     def n_devices(self):
         return len(self.devices)
 
     def batch_bytes(self, direction, num_pixels, band_cols):
-        if self.view_charge is None:
+        if self.view_batch_bytes is None:
             return 0
-        view_batch, bytes_per_view = self.view_charge(
+        view_batch, bytes_per_view = self.view_batch_bytes(
             direction, int(num_pixels), int(band_cols))
         return int(view_batch) * int(bytes_per_view)
 
@@ -305,7 +309,7 @@ def estimate_peak_device_bytes(plan):
     gives one call of the denoiser.
 
     Returns:
-        Ledger: The steps and the bytes of each step on each device.
+        MemoryEstimate: The steps and the bytes of each step on each device.
     """
     n = plan.n_devices
     num_rows_dev, num_channels = plan.sino_rows, int(plan.sinogram_shape[2])
@@ -401,35 +405,35 @@ def estimate_peak_device_bytes(plan):
             return whole_slice_extent()
         return plan.band_length(i)
 
-    def torch_body_batch(i, direction, num_pixels):
+    def torch_projector_batch(i, direction, num_pixels):
         """This function returns the bytes that one view batch of a torch projection function
         holds.
 
-        The function counts ``TORCH_BODY_VIEW_SLABS`` arrays.  Each array has shape (views,
+        The function counts ``TORCH_PROJECTOR_VIEW_SLABS`` arrays.  Each array has shape (views,
         pixels, width).  The width is the larger of the number of rows and the number of
         slices.
         """
-        if plan.view_charge is None:
+        if plan.view_batch_bytes is None:
             return 0
         cols = back_cols(i) if direction == 'back' else forward_cols(i)
-        view_batch = int(plan.view_charge(direction, int(num_pixels), cols)[0])
+        view_batch = int(plan.view_batch_bytes(direction, int(num_pixels), cols)[0])
         width = max(int(plan.sino_rows), int(band_slices(i, direction)))
-        return (TORCH_BODY_VIEW_SLABS * view_batch * int(num_pixels)
+        return (TORCH_PROJECTOR_VIEW_SLABS * view_batch * int(num_pixels)
                 * width * _F32_BYTES)
 
     def back_batch(i, num_pixels):
         if not is_view_owner(i):
             return 0
-        if 'back' in plan.torch_body_directions:
-            return torch_body_batch(i, 'back', num_pixels)
+        if 'back' in plan.torch_projector_directions:
+            return torch_projector_batch(i, 'back', num_pixels)
         return plan.batch_bytes('back', num_pixels, back_cols(i))
 
     def forward_batch(i, num_pixels):
         if not is_view_owner(i):
             return 0
         call_pixels = forward_call_pixels(num_pixels)
-        if 'forward' in plan.torch_body_directions:
-            return torch_body_batch(i, 'forward', call_pixels)
+        if 'forward' in plan.torch_projector_directions:
+            return torch_projector_batch(i, 'forward', call_pixels)
         return plan.batch_bytes('forward', call_pixels, forward_cols(i))
 
     def band_reduce(i, num_pixels):
@@ -454,12 +458,12 @@ def estimate_peak_device_bytes(plan):
         """This function returns the number of view batches in the back projection on one
         device.
 
-        The function returns None when the plan has no ``view_charge``.
+        The function returns None when the plan has no ``view_batch_bytes``.
         """
         local_views = plan.view_blocks[i]
-        if local_views <= 0 or plan.view_charge is None:
+        if local_views <= 0 or plan.view_batch_bytes is None:
             return None
-        view_batch = int(plan.view_charge(
+        view_batch = int(plan.view_batch_bytes(
             'back', int(num_pixels), back_cols(i))[0])
         return max(1, -(-int(local_views) // max(1, view_batch)))
 
@@ -501,23 +505,23 @@ def estimate_peak_device_bytes(plan):
         """This function returns the bytes of the copied batches of cylinder arrays that a
         forward projection on several devices holds.
 
-        See ``CYLINDER_TRANSFER_RESIDENTS``.
+        See ``CYLINDER_TRANSFER_COPIES``.
         """
         if n == 1 or not is_view_owner(i) or not plan.pixel_batch:
             return 0
-        return (CYLINDER_TRANSFER_RESIDENTS * forward_call_pixels(num_pixels)
+        return (CYLINDER_TRANSFER_COPIES * forward_call_pixels(num_pixels)
                 * whole_slice_extent() * _F32_BYTES)
 
     def forward_view_batches(i, num_pixels):
         """This function returns the number of view batches in the forward projection on one
         device.
 
-        The function returns None when the plan has no ``view_charge``.
+        The function returns None when the plan has no ``view_batch_bytes``.
         """
         local_views = plan.view_blocks[i]
-        if local_views <= 0 or plan.view_charge is None:
+        if local_views <= 0 or plan.view_batch_bytes is None:
             return None
-        view_batch = int(plan.view_charge(
+        view_batch = int(plan.view_batch_bytes(
             'forward', forward_call_pixels(num_pixels), forward_cols(i))[0])
         return max(1, -(-int(local_views) // max(1, view_batch)))
 
@@ -528,7 +532,7 @@ def estimate_peak_device_bytes(plan):
         For a hand-written kernel, the number is rounded up to a multiple of 16.
         """
         rows = forward_cols(i) if plan.rows_track_slices else plan.sino_rows
-        if 'forward' in plan.torch_body_directions:
+        if 'forward' in plan.torch_projector_directions:
             return int(rows)
         return padded_kernel_width(rows)
 
@@ -543,10 +547,10 @@ def estimate_peak_device_bytes(plan):
             return 0
         batches = forward_view_batches(i, num_pixels)
         live = 2 if batches is None else min(2, batches)
-        already_paid = 0 if 'forward' in plan.torch_body_directions else 1
+        already_paid = 0 if 'forward' in plan.torch_projector_directions else 1
         view_batch = 1
-        if plan.view_charge is not None:
-            view_batch = plan.view_charge('forward',
+        if plan.view_batch_bytes is not None:
+            view_batch = plan.view_batch_bytes('forward',
                                           forward_call_pixels(num_pixels),
                                           forward_cols(i))[0]
         return ((live - already_paid) * int(view_batch)
@@ -581,11 +585,11 @@ def estimate_peak_device_bytes(plan):
     # There is at most one weights array with the shape of the sinogram.  A supplied array is
     # held from the direct reconstruction onward.  An unweighted run builds an array of ones
     # in the Hessian step and holds no weights before that step.
-    weights_resident = plan.weights_supplied or not plan.fm_hessian_supplied
+    weights_held = plan.weights_supplied or not plan.fm_hessian_supplied
 
     def weights_term(i):
         """This function returns the bytes of the weights from the Hessian step onward."""
-        return sino_dev(i) if weights_resident else 0
+        return sino_dev(i) if weights_held else 0
 
     def supplied_weights_term(i):
         """This function returns the bytes of the weights in the steps before the Hessian
@@ -605,15 +609,15 @@ def estimate_peak_device_bytes(plan):
         g * math.ceil(plan.num_pixels_full / g) * _INT64_BYTES
         for g in plan.partition_granularities)
     partition_bytes += plan.num_pixels_full * _INT64_BYTES
-    persistent['partitions (lead device)'] = [
+    persistent['partitions (first device)'] = [
         partition_bytes if i == 0 else 0 for i in range(n)]
 
     # The partitions and the index cache stay on the first device for the whole
     # reconstruction.  For this reason, every step includes them.
     workspace_term = ('library workspace', [FIXED_DEVICE_OVERHEAD_BYTES] * n)
     constant_terms = [
-        ('partitions (lead device)',
-         persistent.pop('partitions (lead device)')),
+        ('partitions (first device)',
+         persistent.pop('partitions (first device)')),
         workspace_term,
     ]
     constant_base = [sum(vals[i] for _name, vals in constant_terms)
@@ -624,7 +628,7 @@ def estimate_peak_device_bytes(plan):
 
     phases = []
 
-    def back_phases(name, resident_terms, num_pixels, base, base_terms):
+    def back_phases(name, held_terms, num_pixels, base, base_terms):
         """This function returns the steps of one back projection.
 
         On several devices, the back projection has two steps.  The first step is the
@@ -632,7 +636,7 @@ def estimate_peak_device_bytes(plan):
         start with ``name``.  On a single device, the function returns one step named
         ``name``.
         """
-        worker_terms = list(resident_terms) + [
+        worker_terms = list(held_terms) + [
             ('back output', per_dev(lambda i: back_fixed(i, num_pixels))),
             ('finished own band',
              per_dev(lambda i: back_own_band(i, num_pixels))),
@@ -643,7 +647,7 @@ def estimate_peak_device_bytes(plan):
         if n == 1:
             return [_phase(name, worker_terms + [reduce_term], n,
                            base=base, base_terms=base_terms)]
-        reduce_terms = list(resident_terms) + [reduce_term]
+        reduce_terms = list(held_terms) + [reduce_term]
         return [_phase(f'{name} [back workers]', worker_terms, n,
                        base=base, base_terms=base_terms),
                 _phase(f'{name} [band reduce]', reduce_terms, n,
@@ -658,15 +662,15 @@ def estimate_peak_device_bytes(plan):
         base = list(workspace_term[1])
         # _shard_sinogram copies the sinogram to the devices at the start.  The filter writes
         # a second array of the same shape, and the back projection reads that array.
-        residents = [
+        held_arrays = [
             ('sinogram', per_dev(sino_dev)),
             ('filtered sinogram', per_dev(sino_dev)),
         ]
-        filter_terms = residents + [
+        filter_terms = held_arrays + [
             ('filter row weights', per_dev(filter_row_weights)),
             ('filter row batch', per_dev(filter_row_batch)),
         ]
-        scatter_terms = residents + [
+        scatter_terms = held_arrays + [
             ('back cylinders', per_dev(lambda i: cyl(i, p_full))),
             ('scatter buffer', per_dev(recon_dev)),
         ]
@@ -674,11 +678,11 @@ def estimate_peak_device_bytes(plan):
             scatter_terms.append(('helical z-weight', per_dev(recon_dev)))
         phases.append(_phase('direct recon (filter)', filter_terms, n,
                              base=base, base_terms=base_terms))
-        phases.extend(back_phases('direct recon (back loop)', residents,
+        phases.extend(back_phases('direct recon (back loop)', held_arrays,
                                   p_full, base, base_terms))
         phases.append(_phase('direct recon (scatter)', scatter_terms, n,
                              base=base, base_terms=base_terms))
-        return Ledger(devices=list(plan.devices), phases=phases,
+        return MemoryEstimate(devices=list(plan.devices), phases=phases,
                       num_pixels_full=int(plan.num_pixels_full))
 
     # The denoise plan describes one call of QGGMRFDenoiser.  Every term has the shape of
@@ -710,7 +714,7 @@ def estimate_peak_device_bytes(plan):
         # These arrays exist from the start of the denoiser call until it returns.  An
         # initial image supplied by the caller is a fourth array.  By default, the initial
         # image is the input image, so the initial image adds no memory.
-        residents = [
+        held_arrays = [
             ('input image', per_dev(recon_dev)),
             ('init image', per_dev(
                 lambda i: recon_dev(i) if plan.init_recon_supplied else 0)),
@@ -719,7 +723,7 @@ def estimate_peak_device_bytes(plan):
             ('subset indices', per_dev(partition_indices)),
             ('qggmrf halos', per_dev(halo_columns)),
         ]
-        phases.append(_phase('denoise state placement', residents, n,
+        phases.append(_phase('denoise state placement', held_arrays, n,
                              base=base, base_terms=base_terms))
         for granularity in plan.granularities:
             p_sub = math.ceil(plan.num_pixels_full / max(1, int(granularity)))
@@ -737,17 +741,17 @@ def estimate_peak_device_bytes(plan):
             for name, terms in sub_phases:
                 phases.append(_phase(
                     f'denoise subset {name} (granularity {granularity})',
-                    residents + terms, n, base=base, base_terms=base_terms))
-        # image_ell1 sums the image one chunk at a time, so its array of absolute values
+                    held_arrays + terms, n, base=base, base_terms=base_terms))
+        # image_l1_norm sums the image one chunk at a time, so its array of absolute values
         # has the size of one chunk.
-        def ell1_chunk(i):
+        def l1_chunk(i):
             return reduction_chunk_bytes(recon_dev(i))[0]
 
         phases.append(_phase(
             'denoise per-pass statistics',
-            residents + [('ell-1 chunk', per_dev(ell1_chunk))], n,
+            held_arrays + [('L1 norm chunk', per_dev(l1_chunk))], n,
             base=base, base_terms=base_terms))
-        return Ledger(devices=list(plan.devices), phases=phases,
+        return MemoryEstimate(devices=list(plan.devices), phases=phases,
                       num_pixels_full=int(plan.num_pixels_full))
 
     # This step is the direct reconstruction.  It runs only when the caller supplies no
@@ -757,7 +761,7 @@ def estimate_peak_device_bytes(plan):
         p_full = plan.num_pixels_full
         # The back projection loop and the scatter run one after the other.  The output of
         # the back projection becomes the input of the scatter.
-        loop_residents = [
+        loop_held_arrays = [
             ('sinogram', per_dev(sino_dev)),
             ('weights', per_dev(supplied_weights_term)),
             ('filtered sinogram', per_dev(sino_dev)),
@@ -772,7 +776,7 @@ def estimate_peak_device_bytes(plan):
         if plan.helical:
             scatter_terms.append(('helical z-weight', per_dev(recon_dev)))
         # Both steps are added.  The maximum on each device chooses the larger one.
-        phases.extend(back_phases('direct recon (back loop)', loop_residents,
+        phases.extend(back_phases('direct recon (back loop)', loop_held_arrays,
                                   p_full, constant_base, constant_terms))
         phases.append(_phase('direct recon (scatter)', scatter_terms, n,
                              base=constant_base, base_terms=constant_terms))
@@ -835,12 +839,12 @@ def estimate_peak_device_bytes(plan):
         # them into a volume of zeros.  Without the mask, it back projects the whole grid.
         p_hess = (plan.num_pixels_full if plan.hessian_masked
                   else plan.num_pixels_grid)
-        hessian_residents = [
+        hessian_held_arrays = [
             ('error sinogram', per_dev(sino_dev)),
             ('hessian weights', per_dev(weights_term)),
             ('init recon', per_dev(recon_dev)),
         ]
-        phases.extend(back_phases('hessian diagonal', hessian_residents,
+        phases.extend(back_phases('hessian diagonal', hessian_held_arrays,
                                   p_hess, constant_base, constant_terms))
         if plan.hessian_masked:
             # The scatter holds the cylinder arrays and the volume of zeros at once.  For
@@ -863,8 +867,8 @@ def estimate_peak_device_bytes(plan):
         ('squared error',
          ('squared-error products',
           per_dev(lambda i: 2 * sino_reduction_block(i)))),
-        ('recon ell-1',
-         ('recon ell-1 chunk',
+        ('recon L1 norm',
+         ('recon L1 norm chunk',
           per_dev(lambda i: reduction_chunk_bytes(recon_dev(i))[0]))),
     )
     stats_base_terms = constant_terms + list(persistent.items())
@@ -927,7 +931,7 @@ def estimate_peak_device_bytes(plan):
                                  base=persistent_total,
                                  base_terms=loop_base_terms))
 
-    return Ledger(devices=list(plan.devices), phases=phases,
+    return MemoryEstimate(devices=list(plan.devices), phases=phases,
                   num_pixels_full=int(plan.num_pixels_full))
 
 
@@ -936,7 +940,7 @@ def _phase(name, terms, n, base=None, base_terms=None):
     if base is not None:
         totals = [totals[i] + base[i] for i in range(n)]
         terms = list(base_terms or []) + list(terms)
-    return PhaseCharge(name=name, per_device=totals, terms=list(terms))
+    return StepMemory(name=name, per_device=totals, terms=list(terms))
 
 
 # ── building a plan from a model ─────────────────────────────────────────────
@@ -959,7 +963,7 @@ def qggmrf_cylinder_count(model):
 def plan_from_model(model, devices, workload='recon', partition_sequence=None,
                     weights=None, init_recon=None, fm_hessian=None,
                     prox_input=None, init_error_sinogram=None):
-    """This function builds a :class:`LedgerPlan` for ``model`` on a given list of devices.
+    """This function builds a :class:`MemoryEstimateInputs` for ``model`` on a given list of devices.
 
     The device list is an argument, so the caller can test device counts that differ from
     the current count of the model.  ``workload`` names the call that the plan describes.
@@ -1006,9 +1010,9 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
     num_pixels_full = int(model.full_index_count())
     num_pixels_grid = recon_shape[0] * recon_shape[1]
 
-    charge = None if denoising else _model_view_charge(model, len(devices))
+    view_batch_bytes = None if denoising else _model_view_batch_bytes(model, len(devices))
 
-    return LedgerPlan(
+    return MemoryEstimateInputs(
         sinogram_shape=sinogram_shape,
         recon_shape=recon_shape,
         devices=devices,
@@ -1035,9 +1039,9 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
         pixel_batch=(None if denoising
                             else model._forward_pixel_batch()),
         qggmrf_cylinders=qggmrf_cylinder_count(model),
-        view_charge=charge,
-        torch_body_directions=(() if denoising
-                               else torch_body_directions(model)),
+        view_batch_bytes=view_batch_bytes,
+        torch_projector_directions=(() if denoising
+                               else torch_projector_directions(model)),
     )
 
 
@@ -1051,7 +1055,7 @@ def workload_covers(checked, incoming):
     return checked == incoming or (checked, incoming) == ('recon', 'direct')
 
 
-def torch_body_directions(model):
+def torch_projector_directions(model):
     """This function returns the projection directions that this model runs with a torch
     projection function.
 
@@ -1064,7 +1068,7 @@ def torch_body_directions(model):
                  if getattr(body, '_view_batch_cost', None) is None)
 
 
-def _model_view_charge(model, n_devices):
+def _model_view_batch_bytes(model, n_devices):
     """This function returns a function of (direction, num_pixels, band_cols).
 
     The returned function uses the projection functions of the model and returns
@@ -1074,11 +1078,11 @@ def _model_view_charge(model, n_devices):
     fwd_body, back_body = model._view_batch_bodies()
     args = model._view_batch_args()
 
-    def charge(direction, num_pixels, band_cols):
+    def view_batch_bytes(direction, num_pixels, band_cols):
         body = fwd_body if direction == 'forward' else back_body
-        return projector_functions.view_batch_charge(
+        return projector_functions.view_batch_bytes(
             body, num_pixels, band_cols, args, n_devices=n_devices)
-    return charge
+    return view_batch_bytes
 
 
 def _is_helical(model):
@@ -1113,13 +1117,13 @@ def device_budget_bytes(device):
     return int(free) + int(reclaimable)
 
 
-def resident_credits(devices, arrays):
+def bytes_already_on_devices(devices, arrays):
     """This function returns the bytes of ``arrays`` that are already on each device.
 
     The available memory already excludes these bytes.  For this reason, the required
     memory leaves them out.
     """
-    credits = [0] * len(devices)
+    totals = [0] * len(devices)
     index = {}
     for position, device in enumerate(devices):
         index.setdefault(str(torch.device(device)), position)
@@ -1130,8 +1134,8 @@ def resident_credits(devices, arrays):
             position = index.get(str(tensor.device))
             if position is None:
                 continue
-            credits[position] += tensor.numel() * tensor.element_size()
-    return credits
+            totals[position] += tensor.numel() * tensor.element_size()
+    return totals
 
 
 def _iter_tensors(array):
@@ -1148,21 +1152,21 @@ def _iter_tensors(array):
                 yield tensor
 
 
-def layout_fits(ledger, budgets, credits=None, margin=0.15):
+def layout_fits(estimate, budgets, bytes_already_on_devices=None, margin=0.15):
     """This function checks whether every device can hold its estimated peak memory.
 
-    The required memory on a device is the estimated peak minus ``credits``, times
-    ``1 + margin``.
+    The required memory on a device is the estimated peak minus
+    ``bytes_already_on_devices``, times ``1 + margin``.
 
     Returns:
         (fits, rows): fits is True when every device has enough memory.  rows holds one
         (device, demand, budget) tuple for each device, for reporting.
     """
-    peaks = ledger.per_device_peaks()
-    credits = credits or [0] * len(peaks)
+    peaks = estimate.per_device_peaks()
+    bytes_already_on_devices = bytes_already_on_devices or [0] * len(peaks)
     rows, fits = [], True
-    for i, device in enumerate(ledger.devices):
-        demand = int((1.0 + margin) * max(0, peaks[i] - credits[i]))
+    for i, device in enumerate(estimate.devices):
+        demand = int((1.0 + margin) * max(0, peaks[i] - bytes_already_on_devices[i]))
         budget = budgets[i]
         ok = budget is None or demand <= budget
         fits = fits and ok
@@ -1190,23 +1194,23 @@ def _denoise_batch_phase_split(phase):
     return int(fixed), int(per_volume)
 
 
-def denoise_batch_peak_bytes(ledger, batch_size):
+def denoise_batch_peak_bytes(estimate, batch_size):
     """This function returns the estimated peak memory of one denoiser call on a batch of
     ``batch_size`` volumes.
 
-    ``ledger`` is the estimate for one volume on one device.  The bytes of each step are
+    ``estimate`` is the estimate for one volume on one device.  The bytes of each step are
     its fixed terms plus ``batch_size`` times its terms per volume.  The peak is the largest
     step.  The result can be larger than the memory that the call holds, but it is never
     smaller.
     """
     peaks = []
-    for phase in ledger.phases:
+    for phase in estimate.phases:
         fixed, per_volume = _denoise_batch_phase_split(phase)
         peaks.append(fixed + int(batch_size) * per_volume)
     return max(peaks)
 
 
-def largest_denoise_batch(ledger, budget, margin=0.15):
+def largest_denoise_batch(estimate, budget, margin=0.15):
     """This function returns the largest number of volumes that one denoiser call can
     process within ``budget`` bytes.
 
@@ -1216,7 +1220,7 @@ def largest_denoise_batch(ledger, budget, margin=0.15):
     """
     allowed = float(budget) / (1.0 + margin)
     limit = None
-    for phase in ledger.phases:
+    for phase in estimate.phases:
         fixed, per_volume = _denoise_batch_phase_split(phase)
         if per_volume <= 0:
             room = 0 if fixed > allowed else None
@@ -1227,7 +1231,7 @@ def largest_denoise_batch(ledger, budget, margin=0.15):
     return max(0, limit if limit is not None else 0)
 
 
-def format_shortfall(ledger, rows, num_devices_tried, closest_count=None,
+def format_shortfall(estimate, rows, num_devices_tried, closest_count=None,
                      remedies=None):
     """This function writes the error message for a reconstruction that does not fit.
 
@@ -1249,9 +1253,9 @@ def format_shortfall(ledger, rows, num_devices_tried, closest_count=None,
         lines.append(f'{str(device):>10}{_gb(demand):>16}'
                      f'{available:>14}{shortfall:>14}')
 
-    phase = ledger.dominant_phase(worst_index)
-    peak = ledger.peak_bytes(worst_index)
-    lines += ['', f'The dominant phase on {ledger.devices[worst_index]} is '
+    phase = estimate.dominant_phase(worst_index)
+    peak = estimate.peak_bytes(worst_index)
+    lines += ['', f'The dominant phase on {estimate.devices[worst_index]} is '
                   f'"{phase.name}" at {_gb(phase.per_device[worst_index])} '
                   f'of the {_gb(peak)} peak.']
     top = phase.dominant_terms(worst_index)
@@ -1283,12 +1287,12 @@ def format_shortfall(ledger, rows, num_devices_tried, closest_count=None,
         '# exclude a device another process is using',
     ]
     lines += list(remedies or [])
-    lines += ['', 'To run anyway: model.skip_memory_preflight = True']
+    lines += ['', 'To run anyway: model.skip_memory_check = True']
     return '\n'.join(lines)
 
 
 # ── calibration ──────────────────────────────────────────────────────────────
-def pinned_device_count():
+def env_device_count():
     """This function returns the device count set by the environment variable
     ``MBIRTORCH_NUM_DEVICES``, or None if the variable is not set.
 
@@ -1305,7 +1309,7 @@ def pinned_device_count():
         raise ValueError(
             f'{DEVICE_COUNT_ENV_VAR}={raw!r} is not a positive integer.  '
             'Unset it for the automatic device count, or set it to the '
-            'number of devices to pin.')
+            'number of devices to use.')
     return count
 
 
@@ -1325,7 +1329,7 @@ def calibration_start(devices):
             torch.cuda.reset_peak_memory_stats(device)
 
 
-def calibration_report(ledger, devices):
+def calibration_report(estimate, devices):
     """This function returns the estimated and measured peaks on each CUDA device.
 
     Each row is a tuple (device, modeled, measured, ratio).
@@ -1336,7 +1340,7 @@ def calibration_report(ledger, devices):
         if device.type != 'cuda':
             continue
         measured = int(torch.cuda.max_memory_allocated(device))
-        modeled = ledger.peak_bytes(i)
+        modeled = estimate.peak_bytes(i)
         ratio = (modeled / measured) if measured else float('inf')
         rows.append((device, modeled, measured, ratio))
     return rows
@@ -1346,10 +1350,10 @@ def format_calibration(rows, band=None):
     """This function formats the calibration table.
 
     ``band`` defaults to ``CALIBRATION_BAND``.  A reconstruction that uses torch projection
-    functions is judged against ``TORCH_BODY_CALIBRATION_BAND`` instead.
+    functions is judged against ``TORCH_PROJECTOR_CALIBRATION_BAND`` instead.
     """
     low, high = band or CALIBRATION_BAND
-    lines = ['memory ledger calibration (this mode owns '
+    lines = ['memory estimate calibration (this mode owns '
              'torch.cuda.max_memory_allocated)',
              f'{"device":>10}{"modeled":>14}{"measured":>14}'
              f'{"ratio":>10}{"verdict":>12}']

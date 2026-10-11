@@ -171,7 +171,7 @@ def build_model(cfg):
     """Construct the model for one configuration and set its parameters.
 
     Compilation is off so that the run stays fast on a CPU and the geometry
-    code runs in plain torch.  The devices are pinned to the CPU so that the
+    code runs in plain torch.  The devices are set to the CPU so that the
     footprint measurement gives the same answer on every machine.
     """
     kind = cfg['kind']

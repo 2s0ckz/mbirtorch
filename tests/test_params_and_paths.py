@@ -99,8 +99,8 @@ class _LargestAllocation(torch.utils._python_dispatch.TorchDispatchMode):
 
     An in-place op hands back the buffer it was given, so an output that
     shares storage with an input is not an allocation and is not counted.
-    Used to hold a claim about what a piece of arithmetic does NOT allocate,
-    which is the claim the memory ledger's charges rest on.
+    The class is used to check a claim about what a piece of arithmetic does
+    NOT allocate.  The memory estimate relies on such claims.
     """
 
     def __init__(self):

@@ -62,18 +62,19 @@ def redirect_default_log_location(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True, scope="session")
-def pin_device_count():
-    """Pin the automatic device count to 1 for the whole suite.
+def fix_device_count_to_one():
+    """This fixture sets the automatic device count to 1 for the whole suite.
 
     A CUDA model spreads a reconstruction across the devices that can hold
-    their share, so on a multi-GPU machine an unpinned suite would run some
+    their share.  Without a fixed count, a multi-GPU machine would run some
     tests at a device count that depends on the machine.  That would make
     results, memory, and float trajectories vary by host.
 
-    The pin is a visible, auditable line rather than a monkeypatch, and it
-    uses the same environment variable a nightly or a measurement script
-    would use.  Tests that WANT more than one device call configure_devices
-    explicitly, which the pin does not affect.
+    The fixture sets an environment variable rather than using a monkeypatch.
+    It uses the same environment variable that a nightly run or a measurement
+    script would use.  Tests that WANT more than one device call
+    configure_devices explicitly, and the environment variable does not
+    affect them.
     """
     previous = os.environ.get("MBIRTORCH_NUM_DEVICES")
     os.environ["MBIRTORCH_NUM_DEVICES"] = "1"

@@ -218,8 +218,8 @@ class TranslationModel(TomographyModel):
         compile_mode: The same as in ``ParallelBeamModel``.
     """
 
-    # This name selects the translation table in ``_widening_floors``, which lists minimum sinogram sizes.
-    _floor_family = 'translation'
+    # This name selects the translation table in ``_min_problem_sizes``, which lists minimum sinogram sizes.
+    _size_table_key = 'translation'
 
     def __init__(self, sinogram_shape, translation_vectors, source_detector_dist,
                  source_iso_dist, view_batch_size=None, compile_mode='auto'):

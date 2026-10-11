@@ -348,7 +348,7 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
     Note:
         Suppose that ``init_recon`` is given and that the user has not chosen the GPUs of the
         model.  Then this call chooses the GPUs, and later reconstructions with the model use
-        them.  The call can also raise ``MemoryPreflightError`` if the problem is too large for
+        them.  The call can also raise ``MemoryCheckError`` if the problem is too large for
         the available GPUs.
     """
     _sharding.reject_shards('gen_weights_mar', sinogram=sinogram,

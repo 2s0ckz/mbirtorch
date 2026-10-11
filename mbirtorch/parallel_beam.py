@@ -124,9 +124,9 @@ class ParallelBeamModel(TomographyModel):
     # Detector row r corresponds to slice r.  The multi-GPU code uses this fact.
     rows_track_slices = True
 
-    # This selects the parallel-beam table in ``_widening_floors``.  That table gives the
+    # This selects the parallel-beam table in ``_min_problem_sizes``.  That table gives the
     # minimum sinogram size for each number of GPUs.
-    _floor_family = 'parallel'
+    _size_table_key = 'parallel'
 
     # On Linux, the torch 2.13.0 CPU compiler gives wrong code for a call with one pixel.
     # For this reason, mbirtorch pads such a call to two pixels before the compiled code.

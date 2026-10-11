@@ -7,20 +7,24 @@ the minimum size, mbirtorch uses that device count only when no other count fits
 memory.  mbirtorch always allows one device.  A device count with no table row uses the
 row of the next larger measured count.  A row with ``elements=None`` has no measured
 minimum size.  The sizes are measured, and the program
-``dev_scripts/refresh_widening_floors.py`` writes them.
+``dev_scripts/measure_min_problem_sizes.py`` writes them.
 """
 
 import hashlib
 import inspect
 import os
+import warnings
 from collections import namedtuple
 
 #: Setting this environment variable to '0', 'false', 'no', or 'off' turns off the minimum
 #: size check.
-GUARD_ENV_VAR = 'MBIRTORCH_WIDENING_GUARD'
-_GUARD_OFF_VALUES = ('0', 'false', 'no', 'off')
+SIZE_LIMIT_ENV_VAR = 'MBIRTORCH_LIMIT_GPUS_BY_SIZE'
+#: This is the deprecated name of SIZE_LIMIT_ENV_VAR.  mbirtorch reads it only when the new
+#: variable is not set.
+_DEPRECATED_SIZE_LIMIT_ENV_VAR = 'MBIRTORCH_WIDENING_GUARD'
+_OFF_VALUES = ('0', 'false', 'no', 'off')
 
-#: The model type used for a model that has no ``_floor_family`` attribute.
+#: The model type used for a model that has no ``_size_table_key`` attribute.
 DEFAULT_FAMILY = 'parallel'
 
 #: The hardware and the run settings used to measure every row of the table.
@@ -38,91 +42,91 @@ MEASUREMENT_CAVEAT = ('validated at MEASURED_CONFIG only; a different '
 #: The minimum speedup for a device count.  A count is allowed at the smallest measured
 #: size where it is faster than the best smaller allowed count by this factor.  The
 #: speedup must also exceed the run-to-run spread.
-ADMISSION_MARGIN = 1.15
+MIN_SPEEDUP = 1.15
 
 #: The two measured shapes on either side of a minimum size, with their speedups.
-#: ``losing_cell`` is the largest (views, rows, channels) shape where the count was slower.
-#: ``winning_cell`` is the smallest shape where the count was faster.  Either shape is
-#: None when it was not measured.  If ``winning_cell`` is None, then ``elements`` is None.
-Bracket = namedtuple('Bracket', ('losing_cell', 'losing_speedup',
-                                 'winning_cell', 'winning_speedup'))
+#: ``losing_shape`` is the largest (views, rows, channels) shape where the count was slower.
+#: ``winning_shape`` is the smallest shape where the count was faster.  Either shape is
+#: None when it was not measured.  If ``winning_shape`` is None, then ``elements`` is None.
+Bracket = namedtuple('Bracket', ('losing_shape', 'losing_speedup',
+                                 'winning_shape', 'winning_speedup'))
 
 #: One table row.  ``elements`` is the minimum size in sinogram elements, or None when
-#: no minimum size was measured.  ``cell`` is the sinogram shape where the minimum size
+#: no minimum size was measured.  ``shape`` is the sinogram shape where the minimum size
 #: was measured.  ``against`` is the device count used for comparison.  ``spread`` is the
 #: run-to-run spread of the time.
-Floor = namedtuple('Floor', ('family', 'count', 'elements', 'cell', 'against',
-                             'bracket', 'spread', 'gpu', 'config', 'measured',
-                             'commit', 'largest_tested', 'note'))
+MinSizeRow = namedtuple('MinSizeRow', ('family', 'count', 'elements', 'shape', 'against',
+                                        'bracket', 'spread', 'gpu', 'config', 'measured',
+                                        'commit', 'largest_tested', 'note'))
 
 # ── the measured table ───────────────────────────────────────────────────────
 # Shapes are (views, rows, channels).  The notes name each shape by its view count:
 # 384-class (384, 336, 288), 512-class (512, 448, 384), 768-class (768, 672, 576), and
 # 1024-class (1024, 1008, 992).  For the denoiser, the shapes are image shapes.
-FLOORS = {
-    ('cone', 2): Floor(
-        family='cone', count=2, elements=88_080_384, cell=(512, 448, 384),
+MIN_SIZES = {
+    ('cone', 2): MinSizeRow(
+        family='cone', count=2, elements=88_080_384, shape=(512, 448, 384),
         against=1,
-        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.88,
-                        winning_cell=(512, 448, 384), winning_speedup=1.31),
+        bracket=Bracket(losing_shape=(384, 336, 288), losing_speedup=0.88,
+                        winning_shape=(512, 448, 384), winning_speedup=1.31),
         spread=0.06817, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-22', commit='c024ec9',
         largest_tested=297_271_296,
         note='the full refresh on the multiaxis-kernel tree (mg56, job '
              '15435735): 0.88x at the 384-class, 1.31x at the 512-class, '
-             '1.65x at the 768-class.  The floor holds where mg48 placed '
-             'it; the multiaxis kernels share helper modules with this '
+             '1.65x at the 768-class.  The minimum size stays where mg48 '
+             'placed it; the multiaxis kernels share helper modules with this '
              'family and moved nothing here, which is what this '
              'reproduction verifies'),
-    ('cone', 4): Floor(
-        family='cone', count=4, elements=297_271_296, cell=(768, 672, 576),
+    ('cone', 4): MinSizeRow(
+        family='cone', count=4, elements=297_271_296, shape=(768, 672, 576),
         against=2,
-        bracket=Bracket(losing_cell=None, losing_speedup=None,
-                        winning_cell=(768, 672, 576), winning_speedup=1.15),
+        bracket=Bracket(losing_shape=None, losing_speedup=None,
+                        winning_shape=(768, 672, 576), winning_speedup=1.15),
         spread=0.01318, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-22', commit='c024ec9',
         largest_tested=1_023_934_464,
-        note='mg56 (job 15435735): the floor MOVES DOWN one class.  The '
+        note='mg56 (job 15435735): the minimum size MOVES DOWN one class.  The '
              '768-class read 1.15x against two devices, clearing the '
              'margin it had missed at every measurement since the width '
              'padding landed, and the 1024-class read 1.64x.  No losing '
-             'cell was measured below it this run; mg48 read 1.12x at the '
-             'same cell, so the movement is at the margin, not a step'),
-    ('denoiser', 2): Floor(
-        family='denoiser', count=2, elements=None, cell=None,
+             'shape was measured below it this run; mg48 read 1.12x at the '
+             'same shape, so the movement is at the margin, not a step'),
+    ('denoiser', 2): MinSizeRow(
+        family='denoiser', count=2, elements=None, shape=None,
         against=1,
-        bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.93,
-                        winning_cell=None, winning_speedup=None),
+        bracket=Bracket(losing_shape=(1024, 1008, 992), losing_speedup=0.93,
+                        winning_shape=None, winning_speedup=None),
         spread=0.0426, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-22', commit='c024ec9',
         largest_tested=1_023_934_464,
-        note='still a sentinel after the denoiser performance commit '
+        note='still an unmeasured row after the denoiser performance commit '
              '(mg56, job 15435735): 0.73x at the 512-class, 0.87x at the '
              '768-class, 0.93x at the 1024-class.  Read in IMAGE VOXELS: '
              'the denoiser sinogram shape is its image shape.  The timed '
              'call is denoise with sigma_noise supplied, at the shared '
              'warm-median protocol.  The ratio keeps rising with size '
-             '(mg48 read 0.67x at the top cell), so a larger ladder may '
-             'yet find admission; capacity still widens a denoise that '
-             'cannot fit one device'),
-    ('denoiser', 4): Floor(
-        family='denoiser', count=4, elements=None, cell=None,
+             '(mg48 read 0.67x at the top shape), so larger test shapes may '
+             'yet find a minimum size; a denoise that cannot fit on one '
+             'device still uses more GPUs'),
+    ('denoiser', 4): MinSizeRow(
+        family='denoiser', count=4, elements=None, shape=None,
         against=1,
-        bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.90,
-                        winning_cell=None, winning_speedup=None),
+        bracket=Bracket(losing_shape=(1024, 1008, 992), losing_speedup=0.90,
+                        winning_shape=None, winning_speedup=None),
         spread=0.03603, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-22', commit='c024ec9',
         largest_tested=1_023_934_464,
-        note='a sentinel like n=2 (mg56, job 15435735): 0.55x, 0.75x, '
-             '0.90x across the probes, measured against n=1 because no '
-             'smaller denoiser count is admitted.  Read in image voxels; '
+        note='an unmeasured row like n=2 (mg56, job 15435735): 0.55x, 0.75x, '
+             '0.90x across the test shapes, measured against n=1 because no '
+             'smaller denoiser count is allowed.  Read in image voxels; '
              'the n=2 note records the protocol.  Nearer parity at the '
-             'top cell than mg48 read (0.61x), same rising trend'),
-    ('multiaxis', 2): Floor(
+             'top shape than mg48 read (0.61x), same rising trend'),
+    ('multiaxis', 2): MinSizeRow(
         family='multiaxis', count=2, elements=88_080_384,
-        cell=(512, 448, 384), against=1,
-        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.86,
-                        winning_cell=(512, 448, 384), winning_speedup=1.38),
+        shape=(512, 448, 384), against=1,
+        bracket=Bracket(losing_shape=(384, 336, 288), losing_speedup=0.86,
+                        winning_shape=(512, 448, 384), winning_speedup=1.38),
         spread=0.0608, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-22', commit='c024ec9',
         largest_tested=297_271_296,
@@ -133,79 +137,79 @@ FLOORS = {
              'one-device and two-device walls fell together (about '
              'four-fold; multigpu_findings.md sections 1.45 and 1.46).  '
              'This run also measured the 384-class loss that mg48\'s '
-             'sentinel probes could not, so the bracket is complete for '
+             'unmeasured-row shapes could not, so the bracket is complete for '
              'the first time'),
-    ('multiaxis', 4): Floor(
+    ('multiaxis', 4): MinSizeRow(
         family='multiaxis', count=4, elements=1_023_934_464,
-        cell=(1024, 1008, 992), against=2,
-        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=1.09,
-                        winning_cell=(1024, 1008, 992), winning_speedup=1.64),
+        shape=(1024, 1008, 992), against=2,
+        bracket=Bracket(losing_shape=(768, 672, 576), losing_speedup=1.09,
+                        winning_shape=(1024, 1008, 992), winning_speedup=1.64),
         spread=0.0608, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-22', commit='c024ec9',
         largest_tested=1_023_934_464,
         note='placed by hand at the 1024-class, on two instruments.  mg56 '
              '(job 15435735) read 0.70x at the 512-class and a thin 1.09x '
              'at the 768-class, under the 1.15x margin, with nothing '
-             'larger on its ladder.  The winning reading is mg55 (job '
+             'larger among its test shapes.  The winning reading is mg55 (job '
              '15434826), the same seeded warm-median protocol at the '
              '1024-class, where four devices beat two at 1.64x with 0.1 '
              'percent spread (multigpu_findings.md section 1.46).  The '
              'coarse rule rounds the thin 768-class win up one class and '
-             'lands on the same cell.  The floor RISES from the '
+             'lands on the same shape.  The minimum size RISES from the '
              'torch-body era (mg48 read wins from the 512-class up) '
              'because the kernels cut the one-device wall about '
-             'four-fold, so small cells no longer amortize the fan-out'),
-    ('parallel', 2): Floor(
+             'four-fold, so small shapes no longer amortize the fan-out'),
+    ('parallel', 2): MinSizeRow(
         family='parallel', count=2, elements=297_271_296,
-        cell=(768, 672, 576), against=1,
-        bracket=Bracket(losing_cell=(512, 448, 384), losing_speedup=1.09,
-                        winning_cell=(768, 672, 576), winning_speedup=1.46),
+        shape=(768, 672, 576), against=1,
+        bracket=Bracket(losing_shape=(512, 448, 384), losing_speedup=1.09,
+                        winning_shape=(768, 672, 576), winning_speedup=1.46),
         spread=0.1124, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-22', commit='c024ec9',
         largest_tested=1_023_934_464,
         note='mg56 (job 15435735): 1.09x at the 512-class inside an 11.2 '
              'percent spread, which does not count as a win; 1.46x at the '
-             '768-class, 1.59x at the 1024-class.  The floor holds where '
-             'mg40 moved it on the channel-sorted kernel'),
-    ('parallel', 4): Floor(
+             '768-class, 1.59x at the 1024-class.  The minimum size stays '
+             'where mg40 moved it on the channel-sorted kernel'),
+    ('parallel', 4): MinSizeRow(
         family='parallel', count=4, elements=1_023_934_464,
-        cell=(1024, 1008, 992), against=2,
-        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.82,
-                        winning_cell=(1024, 1008, 992), winning_speedup=1.40),
+        shape=(1024, 1008, 992), against=2,
+        bracket=Bracket(losing_shape=(768, 672, 576), losing_speedup=0.82,
+                        winning_shape=(1024, 1008, 992), winning_speedup=1.40),
         spread=0.05224, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-22', commit='c024ec9',
         largest_tested=1_023_934_464,
         note='mg56 (job 15435735): 0.82x at the 768-class against two '
-             'devices and 1.40x at the 1024-class; the floor holds at the '
+             'devices and 1.40x at the 1024-class; the minimum size stays at the '
              '1024-class, reproducing mg48 (0.83x / 1.34x) within the '
              'spreads'),
-    ('translation', 2): Floor(
+    ('translation', 2): MinSizeRow(
         family='translation', count=2, elements=364_800_000,
-        cell=(256, 950, 1500), against=1,
-        bracket=Bracket(losing_cell=(256, 475, 750), losing_speedup=0.64,
-                        winning_cell=(256, 950, 1500), winning_speedup=1.19),
+        shape=(256, 950, 1500), against=1,
+        bracket=Bracket(losing_shape=(256, 475, 750), losing_speedup=0.64,
+                        winning_shape=(256, 950, 1500), winning_speedup=1.19),
         spread=0.04742, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-22', commit='c024ec9',
         largest_tested=1_459_200_000,
         note='mg56 (job 15435735): 0.64x, 1.19x, 1.25x across the '
-             'production-anchored cells, reproducing mg48 to the second '
-             'decimal; the floor holds at the middle cell.  The probe '
-             'cells are NOT the shared ladder: production-anchored '
-             'translation scans on a fixed 16x16 grid with the detector '
-             'and the spacing scaled together; the floor reads in '
-             'sinogram elements as usual'),
-    ('translation', 4): Floor(
+             'production-anchored shapes, reproducing mg48 to the second '
+             'decimal; the minimum size stays at the middle shape.  The '
+             'measured shapes are NOT the shared test shapes: '
+             'production-anchored translation scans on a fixed 16x16 grid '
+             'with the detector and the spacing scaled together; the '
+             'minimum size reads in sinogram elements as usual'),
+    ('translation', 4): MinSizeRow(
         family='translation', count=4, elements=1_459_200_000,
-        cell=(256, 1900, 3000), against=2,
-        bracket=Bracket(losing_cell=(256, 950, 1500), losing_speedup=0.79,
-                        winning_cell=(256, 1900, 3000), winning_speedup=1.15),
+        shape=(256, 1900, 3000), against=2,
+        bracket=Bracket(losing_shape=(256, 950, 1500), losing_speedup=0.79,
+                        winning_shape=(256, 1900, 3000), winning_speedup=1.15),
         spread=0.02454, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-22', commit='c024ec9',
         largest_tested=1_459_200_000,
         note='mg56 (job 15435735): 0.79x at half scale against two '
-             'devices and 1.15x at the production scan; the floor holds '
-             'at the production cell, now measured against n=2 where mg48 '
-             'measured against n=1.  The cells are the production-anchored '
+             'devices and 1.15x at the production scan; the minimum size '
+             'stays at the production shape, now measured against n=2 where '
+             'mg48 measured against n=1.  The shapes are the production-anchored '
              'scans the n=2 note names'),
 }
 
@@ -242,8 +246,8 @@ COST_INPUT_METHODS = tuple(name.split('.', 1)[1] for name in _ALL_COST_INPUTS
                            if name.startswith('TomographyModel.'))
 
 #: The sha256 of each file and method at the time the sizes were measured.
-#: ``refresh_widening_floors.py --bless`` prints new values.
-BLESSED_COST_HASHES = {
+#: ``measure_min_problem_sizes.py --update-hashes`` prints new values.
+MEASURED_CODE_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         'f73fa28f32d2393fac3f06139d8ddeccc55260fceb28bbca7f102334839fb5a4',
     'TomographyModel._sparse_forward_project_cylinders':
@@ -276,21 +280,35 @@ BLESSED_COST_HASHES = {
         '79c4aaaa071c03567f505978a65ed9a183908d6c11342b59ac5668fb10ad0d55',
 }
 
-#: A date that marks the sizes as needing a new measurement, or None.  The refresh
+#: A date that marks the sizes as needing a new measurement, or None.  The measurement
 #: program writes None.  A person may set a date, for example after a hardware change.
 STALE_SINCE = None
 
-#: The sha256 of FLOORS, BLESSED_COST_HASHES, and STALE_SINCE together.  A hand edit to
-#: any of them makes a test fail.  ``refresh_widening_floors.py --bless`` prints this value.
-TABLE_CHECKSUM = 'e564710cec9ba7d789f059de69d700ec0c6d74c8b5525d70c78a0e2a3fbaca32'
+#: The sha256 of MIN_SIZES, MEASURED_CODE_HASHES, and STALE_SINCE together.  A hand edit to
+#: any of them makes a test fail.  ``measure_min_problem_sizes.py --update-hashes`` prints
+#: this value.
+TABLE_CHECKSUM = '0b3a1efec27885726f7a31070fd4b0522fe9f407e8ebe6a60ef952c2f5774765'
 
 
 # ── the environment variable ─────────────────────────────────────────────────
-def guard_enabled():
+#: True after the warning about the deprecated environment variable has been issued.
+_DEPRECATED_ENV_VAR_WARNED = False
+
+
+def size_limit_enabled():
     """This function returns True when the minimum size check is on.  The function
-    reads the environment variable on each call."""
-    return os.environ.get(GUARD_ENV_VAR, '').strip().lower() \
-        not in _GUARD_OFF_VALUES
+    reads the environment variable on each call.  If only the deprecated variable
+    ``MBIRTORCH_WIDENING_GUARD`` is set, the function uses its value and warns once."""
+    global _DEPRECATED_ENV_VAR_WARNED
+    value = os.environ.get(SIZE_LIMIT_ENV_VAR)
+    if value is None and _DEPRECATED_SIZE_LIMIT_ENV_VAR in os.environ:
+        value = os.environ[_DEPRECATED_SIZE_LIMIT_ENV_VAR]
+        if not _DEPRECATED_ENV_VAR_WARNED:
+            _DEPRECATED_ENV_VAR_WARNED = True
+            warnings.warn(f'{_DEPRECATED_SIZE_LIMIT_ENV_VAR} is deprecated and will be removed '
+                          f'in a future release; use {SIZE_LIMIT_ENV_VAR}.',
+                          DeprecationWarning, stacklevel=2)
+    return (value or '').strip().lower() not in _OFF_VALUES
 
 
 # ── the check for changed code ───────────────────────────────────────────────
@@ -299,7 +317,7 @@ def guard_enabled():
 _DRIFT_CHECK = None
 
 #: The program that measures new sizes.  Every notice names this program.
-_REFRESH_COMMAND = 'dev_scripts/refresh_widening_floors.py'
+_REFRESH_COMMAND = 'dev_scripts/measure_min_problem_sizes.py'
 
 
 def _drift_check():
@@ -326,24 +344,22 @@ def stale_note():
     drifted, failure = _drift_check()
     parts = []
     if failure is not None:
-        parts.append('the widening speed floors could not be checked against '
-                     'the projection-cost code ({}), so whether they are '
-                     'stale is unknown'.format(failure))
+        parts.append('the minimum problem sizes could not be checked against '
+                     'the projection code ({}), so it is unknown whether they '
+                     'need a new measurement'.format(failure))
     elif drifted:
         families_hit = _families_priced_by(drifted)
-        parts.append('the widening speed floors were measured against '
-                     'projection-cost code that has since changed ({}, '
-                     'pricing the {} floors), so they may no longer '
-                     'describe it'.format(', '.join(drifted),
-                                          ', '.join(families_hit)))
+        parts.append('the minimum problem sizes were measured with '
+                     'projection code that has since changed ({}, which '
+                     'affects the {} rows), so they may be out of '
+                     'date'.format(', '.join(drifted), ', '.join(families_hit)))
     if STALE_SINCE is not None:
-        parts.append('the widening speed floors are marked stale since {}: '
-                     'the floors were not re-measured when they were '
-                     'recorded as owing a measurement'.format(STALE_SINCE))
+        parts.append('the minimum problem sizes are marked as needing a new '
+                     'measurement since {}'.format(STALE_SINCE))
     if not parts:
         return None
-    return '{}; re-measuring with {} clears this'.format('; '.join(parts),
-                                                         _REFRESH_COMMAND)
+    return '{}; a new measurement with {} removes this note'.format(
+        '; '.join(parts), _REFRESH_COMMAND)
 
 
 # ── the size measure ─────────────────────────────────────────────────────────
@@ -363,14 +379,14 @@ def _millions(elements):
 # ── the lookup ───────────────────────────────────────────────────────────────
 def families():
     """This function returns every model type that has rows in the table."""
-    return sorted({family for family, _count in FLOORS})
+    return sorted({family for family, _count in MIN_SIZES})
 
 
 def _measured_counts(family):
-    return sorted(count for fam, count in FLOORS if fam == family)
+    return sorted(count for fam, count in MIN_SIZES if fam == family)
 
 
-def governing_floor(family, count):
+def row_for_count(family, count):
     """This function returns the table row that applies to ``count`` devices for the model
     type ``family``.  A count with no row uses the row of the next larger measured count.  If
     no larger count was measured, the function returns the row of the largest count.  The
@@ -380,16 +396,16 @@ def governing_floor(family, count):
     if not counts:
         return None
     above = [c for c in counts if c >= count]
-    return FLOORS[(family, above[0] if above else counts[-1])]
+    return MIN_SIZES[(family, above[0] if above else counts[-1])]
 
 
-def admitted(family, count, sino_elements):
+def allowed(family, count, sino_elements):
     """This function decides whether the automatic device choice may use ``count``
     devices at this problem size.  The function returns the decision and the reason.
 
     Args:
         family (str or None): The model type, such as ``'parallel'`` or ``'cone'``.  None
-            means that the model has no ``_floor_family`` attribute, and then the function
+            means that the model has no ``_size_table_key`` attribute, and then the function
             uses the rows for ``'parallel'``.
         count (int): The device count to check.
         sino_elements (int): The problem size, ``prod(sinogram_shape)``.
@@ -399,36 +415,37 @@ def admitted(family, count, sino_elements):
     """
     resolved = DEFAULT_FAMILY if family is None else family
     substituted = ('' if family is not None else
-                   ' (this model names no _floor_family, so the {} floors '
-                   'apply)'.format(DEFAULT_FAMILY))
+                   ' (this model sets no _size_table_key, so the {} minimum '
+                   'sizes apply)'.format(DEFAULT_FAMILY))
     size = _millions(sino_elements)
 
     if count <= 1:
-        return True, 'a single device is always admitted'
+        return True, 'one device is always allowed'
 
-    floor = governing_floor(resolved, count)
-    if floor is None:
-        return True, ('no speed floors are measured for the {} family, so '
-                      'every count is admitted'.format(resolved))
+    row = row_for_count(resolved, count)
+    if row is None:
+        return True, ('no minimum problem sizes are measured for the {} model '
+                      'type, so every device count is allowed'.format(resolved))
 
-    inherited = ('' if floor.count == count else
-                 ', which n={} inherits'.format(count))
-    named = 'the {} n={} floor{}'.format(resolved, floor.count, inherited)
+    inherited = ('' if row.count == count else
+                 ', which n={} uses'.format(count))
+    named = 'the {} n={} row{}'.format(resolved, row.count, inherited)
 
-    if floor.elements is None:
+    if row.elements is None:
         return False, (
-            'held by the speed floor: {} is a sentinel -- no admission point '
-            'has been measured at or below {} sinogram elements, the largest '
-            'size tested; configure_devices(num_devices={}) '
-            'overrides'.format(named, _millions(floor.largest_tested), count)
+            'below the minimum problem size: {} is an unmeasured row.  No '
+            'minimum size was found at or below {} sinogram elements, the '
+            'largest size tested.  configure_devices(num_devices={}) '
+            'overrides this rule'.format(named, _millions(row.largest_tested),
+                                         count)
             + substituted)
-    if sino_elements >= floor.elements:
+    if sino_elements >= row.elements:
         return True, ('{} sinogram elements >= {} ({})'.format(
-            size, _millions(floor.elements), named) + substituted)
+            size, _millions(row.elements), named) + substituted)
     return False, (
-        'held by the speed floor: {} sinogram elements < {} ({}); '
-        'configure_devices(num_devices={}) overrides'.format(
-            size, _millions(floor.elements), named, count) + substituted)
+        'below the minimum problem size: {} sinogram elements < {} ({}).  '
+        'configure_devices(num_devices={}) overrides this rule'.format(
+            size, _millions(row.elements), named, count) + substituted)
 
 
 def fallback_reason(family, count, sino_elements):
@@ -436,18 +453,18 @@ def fallback_reason(family, count, sino_elements):
     its minimum size.  mbirtorch makes this choice only when no allowed count fits in memory.
     """
     resolved = DEFAULT_FAMILY if family is None else family
-    floor = governing_floor(resolved, count)
-    if floor is None or floor.elements is None:
-        detail = ('no admission point is measured for {} n={} at or below {} '
+    row = row_for_count(resolved, count)
+    if row is None or row.elements is None:
+        detail = ('no minimum size is measured for {} n={} at or below {} '
                   'sinogram elements'.format(
                       resolved, count,
-                      _millions(floor.largest_tested) if floor else 0))
+                      _millions(row.largest_tested) if row else 0))
     else:
         detail = '{} sinogram elements < {}'.format(
-            _millions(sino_elements), _millions(floor.elements))
-    return ('chosen past its speed floor because no admitted count fits: '
-            '{} (the {} n={} floor)'.format(detail, resolved, floor.count
-                                            if floor else count))
+            _millions(sino_elements), _millions(row.elements))
+    return ('chosen below its minimum problem size because no allowed count '
+            'fits in memory: {} (the {} n={} row)'.format(
+                detail, resolved, row.count if row else count))
 
 
 # ── checks on the table ──────────────────────────────────────────────────────
@@ -456,25 +473,25 @@ def monotone_violations():
     as the device count increases.  The module asserts that there are none."""
     bad = []
     for family in families():
-        finite = [(count, FLOORS[(family, count)].elements)
+        finite = [(count, MIN_SIZES[(family, count)].elements)
                   for count in _measured_counts(family)
-                  if FLOORS[(family, count)].elements is not None]
-        for (low, low_floor), (high, high_floor) in zip(finite, finite[1:]):
-            if high_floor < low_floor:
-                bad.append('{}: n={} floor {} < n={} floor {}'.format(
-                    family, high, high_floor, low, low_floor))
+                  if MIN_SIZES[(family, count)].elements is not None]
+        for (low, low_min_size), (high, high_min_size) in zip(finite, finite[1:]):
+            if high_min_size < low_min_size:
+                bad.append('{}: n={} minimum size {} < n={} minimum size {}'.format(
+                    family, high, high_min_size, low, low_min_size))
     return bad
 
 
 assert not monotone_violations(), \
-    'the widening floors are not monotone in count: ' \
+    'the minimum problem sizes do not increase with the device count: ' \
     + '; '.join(monotone_violations())
 
 
 # ── the hashes and the checksum ──────────────────────────────────────────────
 def cost_input_hashes():
     """This function returns the sha256 of every file and method that determines the
-    projection time.  The keys are the same as in :data:`BLESSED_COST_HASHES`."""
+    projection time.  The keys are the same as in :data:`MEASURED_CODE_HASHES`."""
     from .tomography_model import TomographyModel
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -494,8 +511,8 @@ def stale_cost_inputs():
     hash.  The result is a list of ``(name, recorded, actual)`` tuples."""
     actual = cost_input_hashes()
     stale = []
-    for name in sorted(set(actual) | set(BLESSED_COST_HASHES)):
-        want = BLESSED_COST_HASHES.get(name)
+    for name in sorted(set(actual) | set(MEASURED_CODE_HASHES)):
+        want = MEASURED_CODE_HASHES.get(name)
         got = actual.get(name)
         if want != got:
             stale.append((name, want, got))
@@ -519,22 +536,22 @@ def stale_families():
 
 
 def table_checksum():
-    """This function returns the sha256 of FLOORS, BLESSED_COST_HASHES, and STALE_SINCE
+    """This function returns the sha256 of MIN_SIZES, MEASURED_CODE_HASHES, and STALE_SINCE
     together.  A hand edit to any of them makes a test fail.
     """
-    payload = '\n'.join([repr(sorted(FLOORS.items())),
-                         repr(sorted(BLESSED_COST_HASHES.items())),
+    payload = '\n'.join([repr(sorted(MIN_SIZES.items())),
+                         repr(sorted(MEASURED_CODE_HASHES.items())),
                          repr(STALE_SINCE)])
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
-def bless_lines(stale_since=None):
-    """This function returns new source text for BLESSED_COST_HASHES, STALE_SINCE, and
+def hash_update_lines(stale_since=None):
+    """This function returns new source text for MEASURED_CODE_HASHES, STALE_SINCE, and
     TABLE_CHECKSUM.  A person pastes the text into this module.  ``stale_since`` is None
     after a refresh.  A person may pass a date instead.
     """
     hashes = cost_input_hashes()
-    lines = ['BLESSED_COST_HASHES = {']
+    lines = ['MEASURED_CODE_HASHES = {']
     for name, digest in sorted(hashes.items()):
         lines.append("    '{}':".format(name))
         lines.append("        '{}',".format(digest))
@@ -542,7 +559,7 @@ def bless_lines(stale_since=None):
     lines.append('')
     lines.append('STALE_SINCE = {!r}'.format(stale_since))
     lines.append('')
-    payload = '\n'.join([repr(sorted(FLOORS.items())),
+    payload = '\n'.join([repr(sorted(MIN_SIZES.items())),
                          repr(sorted(hashes.items())),
                          repr(stale_since)])
     lines.append("TABLE_CHECKSUM = '{}'".format(

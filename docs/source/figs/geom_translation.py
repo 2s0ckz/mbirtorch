@@ -14,7 +14,7 @@ for corner in corners:
     g.ray(ax, (sx, sy), corner)
 
 # The plate faces the source and is drawn like the detector panel, seen obliquely, its
-# broad face widening toward the viewer.
+# broad face growing wider toward the viewer.
 thick, half_h, depth = 0.07, 1.9, 1.8
 x_e = cx - 0.65                       # the edge; the beam crosses the face to its right
 grow = 0.3 * depth / det_depth        # the same perspective as the detector panel

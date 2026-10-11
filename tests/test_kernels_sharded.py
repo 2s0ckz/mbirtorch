@@ -10,9 +10,9 @@ a standing gate.
 
 Two things are asserted.  A two-device reconstruction with BOTH kernels bound
 must match the single-device torch-body reference within the multi-device
-float floor; that is the composition a multi-GPU user actually runs.  And a
-model pinned to a device other than cuda:0 must give the same values, which is
-the case the launch-context bug below reached.
+float floor; that is the composition a multi-GPU user actually runs.  A
+model that configure_devices places on a device other than cuda:0 must also
+give the same values.  The launch-context bug below reached that case.
 
 The forward's history is the reason this file exists.  Its kernels once read
 order one against the torch bodies here, because a Triton launch targets the
@@ -22,7 +22,7 @@ the diagnosis, probe matrix, and repair live in the kernel-sharding findings
 in the plans repo.
 
 A protocol note this campaign paid for: `compile_mode='off'` does NOT disable
-the kernels.  Selection is availability-driven, not compile-driven, so an arm
+the kernels.  Selection is availability-driven, not compile-driven, so a run
 that intends the plain torch engine forces the torch bodies explicitly rather
 than assuming eager means unkernelled.
 """
@@ -42,16 +42,16 @@ requires_two_cuda = pytest.mark.skipif(
     torch.cuda.device_count() < 2,
     reason="the kernel-times-sharding gate needs at least two CUDA devices")
 
-# A DIVIDING cell, so the measured n>1 spread IS this cell's own float floor
-# rather than a padding effect (the per-cell calibration rule).
-CELL = (256, 64, 64)
+# The axes of this shape divide evenly across the devices.  For this reason,
+# the measured n>1 spread is the float floor of this shape, not a padding effect.
+SHAPE = (256, 64, 64)
 VCD_ITERATIONS = 3
 VCD_SEED = 4321
-# The established multi-device float-divergence scale for cells of this class.
+# This is the established multi-device float-divergence scale for shapes of this size.
 FLOOR = 5e-3
 
 
-# The (forward, back) bodies of each geometry, keyed by name so an arm that
+# The (forward, back) bodies of each geometry, keyed by name so a run that
 # names a geometry cannot silently get another one's bodies.
 TORCH_BODIES = {
     "parallel": (_parallel_forward_view_batch, _parallel_back_view_batch),
@@ -62,22 +62,22 @@ TORCH_BODIES = {
 
 def _build(geometry):
     if geometry == "parallel":
-        angles = np.linspace(0, np.pi, CELL[0], endpoint=False)
-        model = mbirtorch.ParallelBeamModel(CELL, angles, compile_mode="off")
+        angles = np.linspace(0, np.pi, SHAPE[0], endpoint=False)
+        model = mbirtorch.ParallelBeamModel(SHAPE, angles, compile_mode="off")
     elif geometry == "multiaxis":
         # Two angles per view: the azimuth over a half turn, and an elevation
         # swept across +/- 0.5 radians, which is how this geometry is built
         # everywhere else in the suite.  The cell's own slice count follows
         # from that range (the recon height divides by the smallest
         # |cos(elevation)|), and it still divides by two.
-        azimuth = np.linspace(0, np.pi, CELL[0], endpoint=False)
-        elevation = np.linspace(-0.5, 0.5, CELL[0])
+        azimuth = np.linspace(0, np.pi, SHAPE[0], endpoint=False)
+        elevation = np.linspace(-0.5, 0.5, SHAPE[0])
         model = mbirtorch.MultiAxisParallelModel(
-            CELL, np.stack([azimuth, elevation], axis=1), compile_mode="off")
+            SHAPE, np.stack([azimuth, elevation], axis=1), compile_mode="off")
     else:
-        angles = np.linspace(0, 2 * np.pi, CELL[0], endpoint=False)
-        sdd = 4 * CELL[2]
-        model = mbirtorch.ConeBeamModel(CELL, angles, source_detector_dist=sdd,
+        angles = np.linspace(0, 2 * np.pi, SHAPE[0], endpoint=False)
+        sdd = 4 * SHAPE[2]
+        model = mbirtorch.ConeBeamModel(SHAPE, angles, source_detector_dist=sdd,
                                         source_iso_dist=sdd, compile_mode="off")
     model.set_params(no_warning=True, verbose=0)
     return model
@@ -129,8 +129,8 @@ def test_the_default_selection_matches_the_torch_bodies_under_sharding(
     """The composition a multi-GPU user actually gets.
 
     The default selection binds BOTH kernels wherever the availability gates
-    pass, so this arm covers the forward and back kernels together and must
-    sit at the same floor as the torch-body arms.  Before the launch-context
+    pass, so this run covers the forward and back kernels together and must
+    sit at the same floor as the torch-body runs.  Before the launch-context
     repair the forward kernel read order one here, non-reproducibly; the
     bracket brought it to the kernel-parity class, measured at 3.4e-07 and
     1.1e-06 on two H100s.
@@ -140,11 +140,11 @@ def test_the_default_selection_matches_the_torch_bodies_under_sharding(
     plain = _build(geometry)
     plain.configure_devices(2)
     _force_torch_bodies(plain, geometry)
-    torch_arm = _reconstruct(plain, sinogram, weights)
+    torch_result = _reconstruct(plain, sinogram, weights)
 
     shipped = _build(geometry)
     shipped.configure_devices(2)
-    # The arm check: this arm exists to measure the KERNELS, so a silent
+    # This run exists to measure the KERNELS, so a silent
     # availability decline must fail loudly rather than compare torch with
     # torch and pass vacuously.
     from mbirtorch.triton_cone import triton
@@ -153,9 +153,9 @@ def test_the_default_selection_matches_the_torch_bodies_under_sharding(
         assert "triton" in fwd.__name__ and "triton" in back.__name__, (
             f"kernels not bound with triton importable: {fwd.__name__}, "
             f"{back.__name__}")
-    default_arm = _reconstruct(shipped, sinogram, weights)
+    default_result = _reconstruct(shipped, sinogram, weights)
 
-    rel = _rel(torch_arm, default_arm)
+    rel = _rel(torch_result, default_result)
     assert rel < FLOOR, f"{geometry} default selection: {rel:.3e}"
 
 
@@ -164,12 +164,12 @@ def test_the_default_selection_matches_the_torch_bodies_under_sharding(
 def test_kernels_hold_on_a_single_nonzero_device(geometry, problem):
     """The trivial-placement twin of the launch-context defect.
 
-    A model pinned to cuda:1 launches its kernels from the main thread,
+    A model placed on cuda:1 launches its kernels from the main thread,
     whose current device is 0, so an unbracketed launch would race exactly
     as the banded workers' did -- with no banded driver involved and no
     reduce to hide it.  The n=1 composed gates all run on device 0, where
-    the thread-current and tensor devices agree, so only a nonzero pin can
-    see this.  Projections suffice: the race showed at order one in a single
+    the thread-current and tensor devices agree, so only a model placed on a
+    nonzero device can see this.  Projections suffice: the race showed at order one in a single
     forward call.
     """
     sinogram, _weights = problem[geometry]
@@ -184,8 +184,8 @@ def test_kernels_hold_on_a_single_nonzero_device(geometry, problem):
 
     kernel_model = _build(geometry)
     kernel_model.configure_devices(devices=["cuda:1"])
-    # The arm check (see the default-selection test): the kernel arm must
-    # not silently degrade to a torch-vs-torch comparison.
+    # This check matches the one in the default-selection test.  The kernel
+    # model must not silently degrade to a torch-vs-torch comparison.
     from mbirtorch.triton_cone import triton
     if triton is not None:
         fwd, back = kernel_model._view_batch_bodies()

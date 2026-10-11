@@ -19,9 +19,9 @@ import warnings
 import numpy as np
 import torch
 
-from . import _memory_ledger
+from . import _memory_estimate
 from . import _sharding
-from . import _widening_floors
+from . import _min_problem_sizes
 from . import qggmrf as _qggmrf
 from . import tomography_utils, vcd_utils
 from .memory_stats import get_memory_stats
@@ -34,6 +34,12 @@ _F32_EPS = float(np.finfo(np.float32).eps)
 # This is the number of pixels in each batch of voxel cylinders that the multi-device forward
 # projection transfers between devices.
 FORWARD_PIXEL_BATCH = 32768
+
+
+def _warn_deprecated_name(old, new):
+    """This function issues a DeprecationWarning that names the old and the new attribute."""
+    warnings.warn(f'{old} is deprecated and will be removed in a future release; use {new}.',
+                  DeprecationWarning, stacklevel=3)
 
 
 # torch.compile compiles each of these module-level functions once per process.
@@ -65,8 +71,8 @@ def _apply_update(flat_recon, error_sinogram, pixel_indices, delta_scaled,
     # addcmul_ reads alpha from a tensor on the device.  Using sub_ would force a host
     # synchronization.
     error_sinogram.addcmul_(delta_sinogram, alpha, value=-1)
-    ell1 = torch.sum(torch.abs(delta_scaled))
-    return flat_recon, error_sinogram, delta_sumsq, ell1
+    l1 = torch.sum(torch.abs(delta_scaled))
+    return flat_recon, error_sinogram, delta_sumsq, l1
 
 
 def _resolve_device(device):
@@ -157,20 +163,20 @@ class TomographyModel(ParameterHandler):
         # This becomes False when the user calls configure_devices.
         self.device_layout_is_automatic = True
         # This is the (sinogram_shape, recon_shape) pair for which mbirtorch chose the devices.
-        self._settled_shapes = None
+        self._device_choice_shapes = None
         # This is the task, 'recon' or 'direct', for which mbirtorch checked the memory of the
         # chosen GPUs.
-        self._settled_workload = None
+        self._device_choice_workload = None
         # These are the device counts that the automatic choice rejected.  The run log lists them.
         self.device_choice_rejections = []
-        self._speed_floor_fallback = None
-        self._speed_floor_held = None
+        self._size_limit_fallback = None
+        self._size_limit_held = None
         # The memory check runs when mbirtorch chooses the devices.  A later change to this value
         # has no effect until the shapes change.
-        self.skip_memory_preflight = False
-        self.memory_preflight_margin = 0.15
+        self.skip_memory_check = False
+        self.memory_check_margin = 0.15
         # Only the tests read these two values.
-        self.last_memory_ledger = None
+        self.last_memory_estimate = None
         self.last_memory_calibration = None
         # This is the thread pool of _vcd_recon, with one thread per device.  It is None outside
         # a reconstruction.
@@ -376,26 +382,26 @@ class TomographyModel(ParameterHandler):
         if not self.device_layout_is_automatic:
             return list(self.sino_placement.devices)
         visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        pinned = _memory_ledger.pinned_device_count()
-        if pinned is not None:
-            visible = min(pinned, visible)
+        env_count = _memory_estimate.env_device_count()
+        if env_count is not None:
+            visible = min(env_count, visible)
         return self._candidate_devices(visible) if visible > 1 else [self.torch_device]
 
     def _section_fits(self, section_model, devices, weighted):
         """This method returns True if a reconstruction of ``section_model`` fits in the memory
         of ``devices``."""
-        if self.skip_memory_preflight:
+        if self.skip_memory_check:
             return True
         call_arrays = {}
         if weighted:
             # This is a read-only array with the sinogram shape that uses almost no memory.
             shape = tuple(int(n) for n in section_model.get_params('sinogram_shape'))
             call_arrays['weights'] = np.broadcast_to(np.ones(1, dtype=np.float32), shape)
-        ledger = section_model._build_memory_ledger(devices=devices, workload='recon',
-                                                    **call_arrays)
-        if ledger is None:
+        estimate = section_model._estimate_memory(devices=devices, workload='recon',
+                                                  **call_arrays)
+        if estimate is None:
             return True
-        fits, _rows = section_model._layout_capacity(devices, ledger, call_arrays)
+        fits, _rows = section_model._layout_capacity(devices, estimate, call_arrays)
         return fits
 
     @staticmethod
@@ -929,8 +935,8 @@ class TomographyModel(ParameterHandler):
         self.device_layout_is_automatic = False
         # The user chose the devices, so the records of the automatic choice are cleared.
         self.device_choice_rejections = []
-        self._settled_shapes = None
-        self._settled_workload = None
+        self._device_choice_shapes = None
+        self._device_choice_workload = None
         if like is not None:
             devices = self._devices_like(like)
         if devices is None:
@@ -996,17 +1002,17 @@ class TomographyModel(ParameterHandler):
             self.create_projectors()
 
     # ── memory estimates and the automatic device count ───────────────────────
-    def _build_memory_ledger(self, devices=None, workload='recon',
-                             **call_arrays):
+    def _estimate_memory(self, devices=None, workload='recon',
+                         **call_arrays):
         """This method returns the estimated peak memory of each device for a list of devices.
         If ``devices`` is None, it uses the current devices.  The argument ``workload`` is
         'recon' or 'direct'."""
 
         devices = list(self.sino_placement.devices if devices is None
                        else devices)
-        return _memory_ledger.estimate_peak_device_bytes(
-            _memory_ledger.plan_from_model(self, devices, workload=workload,
-                                           **call_arrays))
+        return _memory_estimate.estimate_peak_device_bytes(
+            _memory_estimate.plan_from_model(self, devices, workload=workload,
+                                             **call_arrays))
 
     def _candidate_devices(self, num_devices):
         return [torch.device(f'cuda:{i}') for i in range(num_devices)]
@@ -1023,75 +1029,75 @@ class TomographyModel(ParameterHandler):
         again when the shapes change.  The argument ``workload`` is ``'recon'``, ``'direct'``,
         or ``'denoise'``.
         """
-        calibrating = _memory_ledger.calibration_enabled()
+        calibrating = _memory_estimate.calibration_enabled()
         # The devices are chosen for a full reconstruction.  A denoiser is the exception,
         # because it only denoises.
         sizing = 'denoise' if workload == 'denoise' else 'recon'
         if not self.device_layout_is_automatic:
             # When the user chose the devices, the memory estimate runs only for calibration.
-            ledger = self._build_memory_ledger(workload=sizing,
-                                               **call_arrays) \
+            estimate = self._estimate_memory(workload=sizing,
+                                             **call_arrays) \
                 if calibrating else None
-            return self._arm_calibration(ledger, sizing)
+            return self._record_memory_estimate(estimate, sizing)
 
-        if self._settled_shapes is not None:
-            if self._settled_shapes == self._shape_pair():
-                if _memory_ledger.workload_covers(self._settled_workload,
-                                                  workload):
+        if self._device_choice_shapes is not None:
+            if self._device_choice_shapes == self._shape_pair():
+                if _memory_estimate.workload_covers(self._device_choice_workload,
+                                                    workload):
                     # The earlier memory check covers this call, so the same devices are reused.
-                    ledger = self._build_memory_ledger(workload=sizing,
-                                                       **call_arrays) \
+                    estimate = self._estimate_memory(workload=sizing,
+                                                     **call_arrays) \
                         if calibrating else None
-                    return self._arm_calibration(ledger, sizing)
+                    return self._record_memory_estimate(estimate, sizing)
                 # This call needs more memory than the earlier check assumed, so the check runs
                 # again.
-                ledger = self._check_settled_capacity(workload, call_arrays)
-                self._settled_workload = workload
-                return self._arm_calibration(ledger, sizing)
-            self._settled_shapes = None
-            self._settled_workload = None
+                estimate = self._recheck_memory_for_chosen_devices(workload, call_arrays)
+                self._device_choice_workload = workload
+                return self._record_memory_estimate(estimate, sizing)
+            self._device_choice_shapes = None
+            self._device_choice_workload = None
 
-        pinned = _memory_ledger.pinned_device_count()
+        env_count = _memory_estimate.env_device_count()
         visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
         if visible < 2:
             # There is no choice to make.  On one device, the allocator reports any lack of
             # memory.
-            return self._arm_calibration(None, sizing)
+            return self._record_memory_estimate(None, sizing)
 
-        if pinned is not None:
+        if env_count is not None:
             # If the environment sets the device count for the process, that count is used.
-            candidates, held = [min(pinned, visible)], {}
+            candidates, held = [min(env_count, visible)], {}
         else:
             candidates, held = self._speed_ordered_candidates(visible)
 
         rejected, best = [], None
-        self._speed_floor_fallback = None
-        self._speed_floor_held = held
+        self._size_limit_fallback = None
+        self._size_limit_held = held
         for count in candidates:
             if count in held:
                 # The sinogram is below the minimum size for this count.  The count is tried only
                 # because larger counts did not fit in memory.
                 held_note, taken_note = held[count]
                 rejected.append((count, held_note))
-                self._speed_floor_fallback = (count, taken_note)
+                self._size_limit_fallback = (count, taken_note)
             devices = (self._candidate_devices(count) if count > 1
                        else [self.torch_device])
             if not self._layout_is_valid(devices):
                 rejected.append((count, 'a device would own no real data'))
                 continue
             # The memory estimate is for the largest task that the model may run later.
-            ledger = self._build_memory_ledger(devices=devices,
-                                               workload=sizing, **call_arrays)
-            if ledger is None or self.skip_memory_preflight:
+            estimate = self._estimate_memory(devices=devices,
+                                             workload=sizing, **call_arrays)
+            if estimate is None or self.skip_memory_check:
                 # Either there is no memory limit to check, or the caller turned off the check.
-                return self._settle(devices, ledger, rejected, sizing)
-            fits, rows = self._layout_capacity(devices, ledger, call_arrays)
+                return self._use_chosen_devices(devices, estimate, rejected, sizing)
+            fits, rows = self._layout_capacity(devices, estimate, call_arrays)
             if fits:
-                return self._settle(devices, ledger, rejected, sizing)
+                return self._use_chosen_devices(devices, estimate, rejected, sizing)
             shortfall = max((d - b) for _dev, d, b in rows if b is not None)
             rejected.append((count, f'{shortfall / 2 ** 30:.2f} GB short'))
             if best is None or shortfall < best[0]:
-                best = (shortfall, ledger, rows, count)
+                best = (shortfall, estimate, rows, count)
 
         if workload != sizing and best is not None:
             # No count fits the largest task.  For this reason, the counts are tried again with
@@ -1102,38 +1108,38 @@ class TomographyModel(ParameterHandler):
                            else [self.torch_device])
                 if not self._layout_is_valid(devices):
                     continue
-                ledger = self._build_memory_ledger(
+                estimate = self._estimate_memory(
                     devices=devices, workload=workload, **call_arrays)
-                fits, rows = self._layout_capacity(devices, ledger,
+                fits, rows = self._layout_capacity(devices, estimate,
                                                    call_arrays)
                 if fits:
                     # The first loop rejected this count for a task that this call does not run.
-                    self._speed_floor_fallback = None
+                    self._size_limit_fallback = None
                     rejected = [(c, why) for c, why in rejected
                                 if c != count]
                     rejected.append(
                         (count, f'chosen for the {workload} reconstruction '
                                 'in progress: no device count fits a full '
                                 'recon at this size'))
-                    return self._settle(devices, ledger, rejected, workload)
+                    return self._use_chosen_devices(devices, estimate, rejected, workload)
                 shortfall = max((d - b) for _dev, d, b in rows if b is not None)
                 if best is None or shortfall < best[0]:
-                    best = (shortfall, ledger, rows, count)
+                    best = (shortfall, estimate, rows, count)
 
         # No device count fits.  The call raises an error before the reconstruction starts.
         if best is None:
-            raise _memory_ledger.MemoryPreflightError(
+            raise _memory_estimate.MemoryCheckError(
                 'no device layout is valid for this geometry: '
                 + '; '.join(f'{c} devices ({why})' for c, why in rejected))
-        _shortfall, ledger, rows, count = best
-        raise _memory_ledger.MemoryPreflightError(
-            _memory_ledger.format_shortfall(
-                ledger, rows, num_devices_tried=candidates,
+        _shortfall, estimate, rows, count = best
+        raise _memory_estimate.MemoryCheckError(
+            _memory_estimate.format_shortfall(
+                estimate, rows, num_devices_tried=candidates,
                 closest_count=count, remedies=self._memory_remedies()))
 
     def _speed_ordered_candidates(self, visible):
         """This method returns the order in which to try the device counts.  The counts for
-        which the sinogram meets the minimum size in ``_widening_floors`` come first, from
+        which the sinogram meets the minimum size in ``_min_problem_sizes`` come first, from
         largest to smallest.  The other counts come after them.
 
         Returns:
@@ -1141,29 +1147,29 @@ class TomographyModel(ParameterHandler):
             ``{count: (held_note, taken_note)}`` for the counts below their minimum size.
         """
         candidates = list(range(visible, 0, -1))
-        if not _widening_floors.guard_enabled():
+        if not _min_problem_sizes.size_limit_enabled():
             return candidates, {}
-        elements = _widening_floors.sinogram_elements(
+        elements = _min_problem_sizes.sinogram_elements(
             self.get_params('sinogram_shape'))
-        family = self._floor_family
-        note = _widening_floors.stale_note()
+        family = self._size_table_key
+        note = _min_problem_sizes.stale_note()
         if note is not None:
             self.logger.info('Note: ' + note + '.')
         if family is None and self.get_params('verbose') >= 2:
             self.logger.debug(
-                f'  {type(self).__name__} names no _floor_family, so the '
-                f'{_widening_floors.DEFAULT_FAMILY} widening speed floors '
+                f'  {type(self).__name__} sets no _size_table_key, so the '
+                f'{_min_problem_sizes.DEFAULT_FAMILY} minimum problem sizes '
                 f'apply to its automatic device count.')
-        admitted, held = [], {}
+        allowed_counts, held = [], {}
         for count in candidates:
-            ok, why = _widening_floors.admitted(family, count, elements)
+            ok, why = _min_problem_sizes.allowed(family, count, elements)
             if ok:
-                admitted.append(count)
+                allowed_counts.append(count)
             else:
-                held[count] = (why, _widening_floors.fallback_reason(
+                held[count] = (why, _min_problem_sizes.fallback_reason(
                     family, count, elements))
         # One device is always allowed, so the list is never empty.
-        return admitted + list(held), held
+        return allowed_counts + list(held), held
 
     def _memory_remedies(self):
         """This method returns extra suggestion lines for the error message that this geometry
@@ -1182,33 +1188,33 @@ class TomographyModel(ParameterHandler):
                                                        'recon_shape'])
         return len(devices) <= max(int(sinogram_shape[0]), int(recon_shape[2]))
 
-    def _layout_capacity(self, devices, ledger, call_arrays):
-        """This method returns True if the estimated peak memory in ``ledger`` fits on
+    def _layout_capacity(self, devices, estimate, call_arrays):
+        """This method returns True if the estimated peak memory in ``estimate`` fits on
         ``devices``.  It also returns the table rows that an error message uses to report the
         result."""
-        budgets = [_memory_ledger.device_budget_bytes(d) for d in devices]
-        credits = _memory_ledger.resident_credits(
+        budgets = [_memory_estimate.device_budget_bytes(d) for d in devices]
+        bytes_already_on_devices = _memory_estimate.bytes_already_on_devices(
             devices, list(call_arrays.values()))
-        return _memory_ledger.layout_fits(
-            ledger, budgets, credits, margin=self.memory_preflight_margin)
+        return _memory_estimate.layout_fits(
+            estimate, budgets, bytes_already_on_devices, margin=self.memory_check_margin)
 
     def _fits_available_devices(self, workload='recon', **call_arrays):
         """This method returns True if the estimated peak memory for ``workload`` fits on some
         set of devices that this model could use.  The method treats a device other than a CUDA
         device as having unlimited memory.
         """
-        if self.skip_memory_preflight:
+        if self.skip_memory_check:
             return True
         if not self.device_layout_is_automatic:
             candidates = [list(self.sino_placement.devices)]
         else:
-            pinned = _memory_ledger.pinned_device_count()
+            env_count = _memory_estimate.env_device_count()
             visible = (torch.cuda.device_count() if torch.cuda.is_available()
                        else 0)
             if visible < 2:
                 counts = [1]
-            elif pinned is not None:
-                counts = [min(pinned, visible)]
+            elif env_count is not None:
+                counts = [min(env_count, visible)]
             else:
                 counts = list(range(visible, 0, -1))
             candidates = [self._candidate_devices(count) if count > 1
@@ -1216,78 +1222,107 @@ class TomographyModel(ParameterHandler):
         for devices in candidates:
             if not self._layout_is_valid(devices):
                 continue
-            ledger = self._build_memory_ledger(devices=devices,
-                                               workload=workload,
-                                               **call_arrays)
-            if ledger is None:
+            estimate = self._estimate_memory(devices=devices,
+                                             workload=workload,
+                                             **call_arrays)
+            if estimate is None:
                 return True
-            fits, _rows = self._layout_capacity(devices, ledger, call_arrays)
+            fits, _rows = self._layout_capacity(devices, estimate, call_arrays)
             if fits:
                 return True
         return False
 
-    def _check_settled_capacity(self, workload, call_arrays):
+    def _recheck_memory_for_chosen_devices(self, workload, call_arrays):
         """This method runs the memory check for ``workload`` on the chosen GPUs, and it
         returns the memory estimate.  The method does not change the devices.
         """
-        if self.skip_memory_preflight:
+        if self.skip_memory_check:
             # The caller has turned off the memory check.
             return None
         devices = list(self.sino_placement.devices)
-        ledger = self._build_memory_ledger(devices=devices, workload=workload,
-                                           **call_arrays)
-        fits, rows = self._layout_capacity(devices, ledger, call_arrays)
+        estimate = self._estimate_memory(devices=devices, workload=workload,
+                                         **call_arrays)
+        fits, rows = self._layout_capacity(devices, estimate, call_arrays)
         if fits:
-            return ledger
-        raise _memory_ledger.MemoryPreflightError(
-            _memory_ledger.format_shortfall(
-                ledger, rows, num_devices_tried=[len(devices)],
+            return estimate
+        raise _memory_estimate.MemoryCheckError(
+            _memory_estimate.format_shortfall(
+                estimate, rows, num_devices_tried=[len(devices)],
                 closest_count=len(devices),
                 remedies=self._memory_remedies()))
 
-    def _settle(self, devices, ledger, rejected, workload='recon'):
+    def _use_chosen_devices(self, devices, estimate, rejected, workload='recon'):
         """This method switches the model to the chosen devices if they differ from the current
         devices.  It also logs the choice and records the memory estimate."""
         chosen, current = len(devices), self.sino_placement.n_devices
         # If the chosen count is below its minimum sinogram size, the log says that memory decided
         # the choice.
-        fallback = getattr(self, '_speed_floor_fallback', None)
+        fallback = getattr(self, '_size_limit_fallback', None)
         if fallback is not None and fallback[0] == chosen:
             rejected = [fallback if count == chosen else (count, why)
                         for count, why in rejected]
         # The log names the larger counts that were not used, to explain idle GPUs.
-        held = getattr(self, '_speed_floor_held', None) or {}
+        held = getattr(self, '_size_limit_held', None) or {}
         rejected = list(rejected)
         already = {count for count, _why in rejected}
         for count in sorted(held, reverse=True):
             if count > chosen and count not in already:
                 rejected.append((count, held[count][0]))
-        self._speed_floor_fallback = None
-        self._speed_floor_held = None
+        self._size_limit_fallback = None
+        self._size_limit_held = None
         # The run log reads this to explain any idle GPUs.
         self.device_choice_rejections = list(rejected)
         if chosen != current:
             self.logger.info(
                 f'Using {chosen} CUDA device(s) for this reconstruction '
-                f'(was {current}).  configure_devices(num_devices=n) pins it.')
+                f'(was {current}).  configure_devices(num_devices=n) fixes it.')
             self._install_device_layout(devices)
         if rejected and self.get_params('verbose') >= 2:
             for count, why in rejected:
                 self.logger.debug(f'  device count {count} rejected: {why}')
         # Later calls reuse these devices while the shapes stay the same.
-        self._settled_shapes = self._shape_pair()
-        self._settled_workload = workload
-        return self._arm_calibration(ledger, workload)
+        self._device_choice_shapes = self._shape_pair()
+        self._device_choice_workload = workload
+        return self._record_memory_estimate(estimate, workload)
 
-    def _arm_calibration(self, ledger, workload='recon'):
+    def _record_memory_estimate(self, estimate, workload='recon'):
         """This method stores the memory estimate for the tests to read.  In calibration mode,
         it computes an estimate if the caller has none."""
-        if ledger is not None:
-            self.last_memory_ledger = ledger
-        if _memory_ledger.calibration_enabled() and ledger is None:
-            ledger = self._build_memory_ledger(workload=workload)
-            self.last_memory_ledger = ledger
-        return ledger
+        if estimate is not None:
+            self.last_memory_estimate = estimate
+        if _memory_estimate.calibration_enabled() and estimate is None:
+            estimate = self._estimate_memory(workload=workload)
+            self.last_memory_estimate = estimate
+        return estimate
+
+    # ── deprecated attribute names ────────────────────────────────────────────
+    @property
+    def skip_memory_preflight(self):
+        """This property is the deprecated name of ``skip_memory_check``."""
+        _warn_deprecated_name('skip_memory_preflight', 'skip_memory_check')
+        return self.skip_memory_check
+
+    @skip_memory_preflight.setter
+    def skip_memory_preflight(self, value):
+        _warn_deprecated_name('skip_memory_preflight', 'skip_memory_check')
+        self.skip_memory_check = value
+
+    @property
+    def memory_preflight_margin(self):
+        """This property is the deprecated name of ``memory_check_margin``."""
+        _warn_deprecated_name('memory_preflight_margin', 'memory_check_margin')
+        return self.memory_check_margin
+
+    @memory_preflight_margin.setter
+    def memory_preflight_margin(self, value):
+        _warn_deprecated_name('memory_preflight_margin', 'memory_check_margin')
+        self.memory_check_margin = value
+
+    @property
+    def last_memory_ledger(self):
+        """This property is the deprecated name of ``last_memory_estimate``."""
+        _warn_deprecated_name('last_memory_ledger', 'last_memory_estimate')
+        return self.last_memory_estimate
 
     def _shard_sinogram(self, sinogram):
         """This method copies a sinogram or a weights array to the devices as float32.  On
@@ -1321,7 +1356,7 @@ class TomographyModel(ParameterHandler):
 
     # This names the model type in the table of minimum sinogram sizes per device count.  None
     # means parallel beam.
-    _floor_family = None
+    _size_table_key = None
 
     def prepare_sino_for_devices(self, sinogram, weights=None):
         """
@@ -1435,8 +1470,8 @@ class TomographyModel(ParameterHandler):
                 # is formed.
                 f = fwd.tensors[i]
                 w = None if constant_weights else weights.tensors[i]
-                return (float(_memory_ledger.weighted_square_sum(f, w)),
-                        float(_memory_ledger.weighted_dot(
+                return (float(_memory_estimate.weighted_square_sum(f, w)),
+                        float(_memory_estimate.weighted_dot(
                             f, sinogram.tensors[i], w)))
             dots = _sharding.run_per_device(self.sino_placement.devices,
                                             dots_worker)
@@ -1458,9 +1493,9 @@ class TomographyModel(ParameterHandler):
                 [alpha * t for t in init_recon.tensors], self.recon_placement)
         else:
             w = None if constant_weights else weights
-            wtd_err_sino_norm = _memory_ledger.weighted_square_sum(fwd, w)
+            wtd_err_sino_norm = _memory_estimate.weighted_square_sum(fwd, w)
             if wtd_err_sino_norm > 0 and scale_recon_to_sinogram:
-                alpha = (_memory_ledger.weighted_dot(fwd, sinogram, w)
+                alpha = (_memory_estimate.weighted_dot(fwd, sinogram, w)
                          / wtd_err_sino_norm).item()
             else:
                 alpha = 1
@@ -2068,7 +2103,7 @@ class TomographyModel(ParameterHandler):
             weights = torch.as_tensor(weights, dtype=torch.float32,
                                       device=error_sinogram.device)
             avg_weight = torch.mean(weights)
-        weighted_sq_sum = _memory_ledger.weighted_square_sum(error_sinogram,
+        weighted_sq_sum = _memory_estimate.weighted_square_sum(error_sinogram,
                                                              weights)
         if normalize:
             loss = torch.sqrt(weighted_sq_sum
@@ -2083,10 +2118,10 @@ class TomographyModel(ParameterHandler):
         (fm_loss, recon_l1, es_rmse)."""
         fm_loss = TomographyModel.get_forward_model_loss(
             error_sinogram, sigma_y, weights)
-        # ``image_ell1`` sums in chunks, which can change the last digits of the NMAE stopping
+        # ``image_l1_norm`` sums in chunks, which can change the last digits of the NMAE stopping
         # test.
-        recon_l1 = _memory_ledger.image_ell1(flat_recon)
-        es_rmse = torch.sqrt(_memory_ledger.weighted_square_sum(error_sinogram)
+        recon_l1 = _memory_estimate.image_l1_norm(flat_recon)
+        es_rmse = torch.sqrt(_memory_estimate.weighted_square_sum(error_sinogram)
                              / float(error_sinogram.numel()))
         return fm_loss, recon_l1, es_rmse
 
@@ -2187,7 +2222,7 @@ class TomographyModel(ParameterHandler):
 
         def vcd_subset_updater(flat_recon, error_sinogram, pixel_indices):
             """This function runs one VCD update on one subset of the partition, in place.  It
-            returns flat_recon, error_sinogram, ``ell1_for_subset`` (the L1 norm of the update),
+            returns flat_recon, error_sinogram, ``l1_for_subset`` (the L1 norm of the update),
             alpha_for_subset, and delta_sumsq_subset."""
             pixel_indices_per_device = [torch.as_tensor(pixel_indices, dtype=torch.int64).to(dev)
                        for dev in devices]
@@ -2291,20 +2326,20 @@ class TomographyModel(ParameterHandler):
 
             def apply_worker(i, dev):
                 delta_scaled = alpha_per_device[i] * delta_recon_per_device[i]
-                _, _, delta_sumsq_local, ell1_local = apply_update[i](
+                _, _, delta_sumsq_local, l1_local = apply_update[i](
                     flat_recon.tensors[i], error_sinogram.tensors[i],
                     pixel_indices_per_device[i], delta_scaled, alpha_per_device[i],
                     delta_sinogram.tensors[i])
-                return delta_sumsq_local, ell1_local
+                return delta_sumsq_local, l1_local
             apply_results = _sharding.run_per_device(devices, apply_worker,
                                                executor=self._per_device_pool)
             delta_sumsq_subset = (apply_results[0][0] if num_devices == 1
                                   else torch.cat(
                 [_sharding.move_shard(sumsq, dev0, self.dev2dev_safe)
                  for sumsq, _ in apply_results]))
-            ell1_for_subset = combine_on_lead(
-                [ell1 for _, ell1 in apply_results])
-            return (flat_recon, error_sinogram, ell1_for_subset, alpha,
+            l1_for_subset = combine_on_lead(
+                [l1 for _, l1 in apply_results])
+            return (flat_recon, error_sinogram, l1_for_subset, alpha,
                     delta_sumsq_subset)
 
         vcd_subset_updater.stage_halos = stage_halos
@@ -2322,7 +2357,7 @@ class TomographyModel(ParameterHandler):
                 state.
 
         Returns:
-            (flat_recon, error_sinogram, ell1_for_partition, alpha, delta_sumsq_partition): The
+            (flat_recon, error_sinogram, l1_for_partition, alpha, delta_sumsq_partition): The
             updated recon and error sinogram, the summed L1 norm of the recon change, the
             average of alpha over the subsets, and the sum of squared updates of each slice over
             the partition.
@@ -2331,7 +2366,7 @@ class TomographyModel(ParameterHandler):
             vcd_subset_updater.stage_halos(flat_recon)
         # This random draw must not change, because the tests compare the values at each
         # iteration.
-        ell1_for_partition = 0
+        l1_for_partition = 0
         alpha_sum = 0
         delta_sumsq_partition = 0
         draw = np.random if rng is None else rng
@@ -2339,13 +2374,13 @@ class TomographyModel(ParameterHandler):
 
         for index in subset_indices:
             subset = partition[index]
-            (flat_recon, error_sinogram, ell1_for_subset, alpha_for_subset,
+            (flat_recon, error_sinogram, l1_for_subset, alpha_for_subset,
              delta_sumsq_subset) = vcd_subset_updater(flat_recon, error_sinogram, subset)
-            ell1_for_partition += ell1_for_subset
+            l1_for_partition += l1_for_subset
             alpha_sum += alpha_for_subset
             delta_sumsq_partition = delta_sumsq_partition + delta_sumsq_subset
 
-        return (flat_recon, error_sinogram, ell1_for_partition,
+        return (flat_recon, error_sinogram, l1_for_partition,
                 alpha_sum / partition.shape[0], delta_sumsq_partition)
 
     def _vcd_recon(self, sinogram, partitions, partition_sequence,
@@ -2410,13 +2445,13 @@ class TomographyModel(ParameterHandler):
                              f'{tuple(sinogram.shape)}.')
 
         # The GPUs must be chosen before the first large allocation.
-        memory_ledger = self._apply_device_policy(
+        memory_estimate = self._apply_device_policy(
             partition_sequence=partition_sequence, weights=weights,
             init_recon=init_recon, fm_hessian=fm_hessian,
             prox_input=prox_input, init_error_sinogram=init_error_sinogram)
-        if _memory_ledger.calibration_enabled():
+        if _memory_estimate.calibration_enabled():
             # The peak memory counters are reset here, once per reconstruction.
-            _memory_ledger.calibration_start(self.sino_placement.devices)
+            _memory_estimate.calibration_start(self.sino_placement.devices)
         self._log_device_report()
 
         constant_weights = weights is None
@@ -2505,9 +2540,9 @@ class TomographyModel(ParameterHandler):
 
         self.logger.info('Starting VCD iterations')
         if verbose >= 2:
-            if memory_ledger is not None:
+            if memory_estimate is not None:
                 self.logger.debug('Modeled peak device memory by phase:')
-                self.logger.debug(memory_ledger.format_table())
+                self.logger.debug(memory_estimate.format_table())
                 self.logger.debug('--------')
             output = io.StringIO()
             get_memory_stats(file=output)
@@ -2527,7 +2562,7 @@ class TomographyModel(ParameterHandler):
         try:
             for i in range(max_iters):
                 partition = partitions[partition_sequence[i]]
-                (flat_recon, error_sinogram, ell1_for_partition, alpha,
+                (flat_recon, error_sinogram, l1_for_partition, alpha,
                  delta_sumsq_partition) = self.vcd_partition_iterator(
                     vcd_subset_updater, flat_recon, error_sinogram, partition,
                     rng=rng)
@@ -2538,7 +2573,7 @@ class TomographyModel(ParameterHandler):
                 fm_rmse[i] = float(fm_loss_i)
                 recon_l1_f = float(recon_l1)
                 # A reconstruction of all zeros gives nan rather than ZeroDivisionError.
-                nmae_update[i] = (float(ell1_for_partition) / recon_l1_f
+                nmae_update[i] = (float(l1_for_partition) / recon_l1_f
                                   if recon_l1_f else float('nan'))
                 alpha_values[i] = float(alpha)
                 delta_norm_per_slice[i] = np.sqrt(
@@ -2586,12 +2621,12 @@ class TomographyModel(ParameterHandler):
 
         # This code must run before the loop releases its arrays, so that the measured peak is
         # correct.
-        if memory_ledger is not None and _memory_ledger.calibration_enabled():
-            rows = _memory_ledger.calibration_report(
-                memory_ledger, self.sino_placement.devices)
+        if memory_estimate is not None and _memory_estimate.calibration_enabled():
+            rows = _memory_estimate.calibration_report(
+                memory_estimate, self.sino_placement.devices)
             self.last_memory_calibration = rows
             if rows:
-                self.logger.warning(_memory_ledger.format_calibration(rows))
+                self.logger.warning(_memory_estimate.format_calibration(rows))
 
         flat_recon = self._as_device_form(flat_recon)
         error_sinogram = self._as_device_form(error_sinogram)
@@ -2777,11 +2812,11 @@ class TomographyModel(ParameterHandler):
 
             def sino_worker(i, d):
                 e = error_shards.tensors[i]
-                sq = float(_memory_ledger.weighted_square_sum(e))
+                sq = float(_memory_estimate.weighted_square_sum(e))
                 if weights_shards is None:
                     return sq, 0.0, sq
                 w = weights_shards.tensors[i]
-                return (float(_memory_ledger.weighted_square_sum(e, w)),
+                return (float(_memory_estimate.weighted_square_sum(e, w)),
                         float(torch.sum(w)), sq)
             parts = _sharding.run_per_device(error_shards.placement.devices,
                                              sino_worker)
@@ -2794,7 +2829,7 @@ class TomographyModel(ParameterHandler):
             fm_loss = ((weighted_sq / (avg_weight * total_sino_size)) ** 0.5
                        / sigma_y)
             recon_l1 = sum(
-                float(_memory_ledger.image_ell1(t))
+                float(_memory_estimate.image_l1_norm(t))
                 for t in flat_shards.tensors)
             es_rmse = (sq / total_sino_size) ** 0.5
         else:

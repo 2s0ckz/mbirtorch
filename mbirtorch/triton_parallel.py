@@ -196,10 +196,10 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
                   int(num_views), int(num_pixels), int(num_channels),
                   launch_rows)
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
-    guard = compile_serialized() if first_launch else contextlib.nullcontext()
+    compile_lock = compile_serialized() if first_launch else contextlib.nullcontext()
     # The kernel runs on the device of the tensors.  The device index is part
     # of the launch key.
-    with torch.cuda.device(sino_batch.device), guard:
+    with torch.cuda.device(sino_batch.device), compile_lock:
         _parallel_back_kernel[grid](
             *contract, sino_t, out,
             int(num_views), int(num_pixels), int(num_channels), launch_rows,
@@ -447,9 +447,9 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
                       block_p, block_r, int(num_views),
                       int(num_pixels), int(num_channels), launch_cols)
         first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
-        guard = (compile_serialized() if first_launch
-                 else contextlib.nullcontext())
-        with torch.cuda.device(values.device), guard:
+        compile_lock = (compile_serialized() if first_launch
+                        else contextlib.nullcontext())
+        with torch.cuda.device(values.device), compile_lock:
             _parallel_forward_sorted_kernel[grid](
                 *contract, values, perm, out,
                 int(num_views), int(num_pixels), int(num_channels),
@@ -485,10 +485,10 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
                   block_r, int(num_views),
                   int(num_pixels), int(num_channels), launch_cols)
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
-    guard = compile_serialized() if first_launch else contextlib.nullcontext()
+    compile_lock = compile_serialized() if first_launch else contextlib.nullcontext()
     # The kernel runs on the device of the tensors.  The device index is part
     # of the launch key.
-    with torch.cuda.device(values.device), guard:
+    with torch.cuda.device(values.device), compile_lock:
         _parallel_forward_kernel[grid](
             *contract, values, out,
             int(num_pixels), int(num_channels), launch_cols,

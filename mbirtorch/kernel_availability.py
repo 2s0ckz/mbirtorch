@@ -183,7 +183,7 @@ def _kernel_usable(model, cache, self_check):
     return result
 
 
-def _cone_self_check_cell(device_key):
+def _cone_self_check_problem(device_key):
     """This function returns (model, pixel_indices, view_params, kwargs) for a small cone
     beam test problem.
 
@@ -209,7 +209,7 @@ def _cone_self_check_cell(device_key):
     return model, pixel_indices, view_params, model._view_batch_args()
 
 
-def _parallel_self_check_cell(device_key):
+def _parallel_self_check_problem(device_key):
     """This function returns (model, pixel_indices, view_params, kwargs) for a small parallel
     beam test problem.
 
@@ -234,7 +234,7 @@ def _parallel_self_check_cell(device_key):
     return model, pixel_indices, view_params, model._view_batch_args()
 
 
-def _multiaxis_self_check_cell(device_key):
+def _multiaxis_self_check_problem(device_key):
     """This function returns (model, pixel_indices, view_params, kwargs) for a small multiaxis
     test problem.
 
@@ -279,7 +279,7 @@ def _cone_back_self_check(device_key):
         from .cone_beam import _cone_back_view_batch
         from .triton_cone import _cone_back_view_batch_triton
 
-        model, pixel_indices, view_params, args = _cone_self_check_cell(
+        model, pixel_indices, view_params, args = _cone_self_check_problem(
             device_key)
         # A private generator keeps this check from advancing the global random state,
         # which the tests with fixed seeds depend on.
@@ -316,7 +316,7 @@ def _cone_forward_self_check(device_key):
         from .cone_beam import _cone_forward_view_batch
         from .triton_cone import _cone_forward_view_batch_triton
 
-        model, pixel_indices, view_params, args = _cone_self_check_cell(
+        model, pixel_indices, view_params, args = _cone_self_check_problem(
             device_key)
         num_slices = int(args['num_slices'])
         generator = torch.Generator().manual_seed(0)
@@ -357,7 +357,7 @@ def _parallel_back_self_check(device_key):
         from .parallel_beam import _parallel_back_view_batch
         from .triton_parallel import _parallel_back_view_batch_triton
 
-        model, pixel_indices, view_params, args = _parallel_self_check_cell(
+        model, pixel_indices, view_params, args = _parallel_self_check_problem(
             device_key)
         # A private generator keeps this check from advancing the global random state,
         # which the tests with fixed seeds depend on.
@@ -401,7 +401,7 @@ def _parallel_forward_self_check(device_key):
         from .parallel_beam import _parallel_forward_view_batch
         from .triton_parallel import _parallel_forward_view_batch_triton
 
-        model, pixel_indices, view_params, args = _parallel_self_check_cell(
+        model, pixel_indices, view_params, args = _parallel_self_check_problem(
             device_key)
         num_slices = int(model.get_params('recon_shape')[2])
         generator = torch.Generator().manual_seed(0)
@@ -441,7 +441,7 @@ def _multiaxis_back_self_check(device_key):
         from .multiaxis_parallel import _multiaxis_back_view_batch
         from .triton_multiaxis import _multiaxis_back_view_batch_triton
 
-        model, pixel_indices, view_params, args = _multiaxis_self_check_cell(
+        model, pixel_indices, view_params, args = _multiaxis_self_check_problem(
             device_key)
         # A private generator keeps this check from advancing the global random state,
         # which the tests with fixed seeds depend on.
@@ -486,7 +486,7 @@ def _multiaxis_forward_self_check(device_key):
         from .multiaxis_parallel import _multiaxis_forward_view_batch
         from .triton_multiaxis import _multiaxis_forward_view_batch_triton
 
-        model, pixel_indices, view_params, args = _multiaxis_self_check_cell(
+        model, pixel_indices, view_params, args = _multiaxis_self_check_problem(
             device_key)
         num_slices = int(args['num_slices'])
         generator = torch.Generator().manual_seed(0)

@@ -7,10 +7,10 @@ import mbirtorch
 
 
 def _small_cone(device="cpu"):
-    cell = (24, 16, 16)
-    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
-    m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
-                                source_iso_dist=2 * cell[2])
+    shape = (24, 16, 16)
+    angles = np.linspace(0, 2 * np.pi, shape[0], endpoint=False)
+    m = mbirtorch.ConeBeamModel(shape, angles, source_detector_dist=4 * shape[2],
+                                source_iso_dist=2 * shape[2])
     m.configure_devices(devices=[device])
     m.set_params(no_warning=True, verbose=0)
     return m

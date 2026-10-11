@@ -14,8 +14,8 @@ import pytest
 
 import mbirtorch
 
-# One small synthetic cell, shared by both geometries.
-_CELL = dict(num_views=16, num_det_rows=8, num_det_channels=16)
+# Both geometries use this small synthetic shape.
+_SHAPE = dict(num_views=16, num_det_rows=8, num_det_channels=16)
 
 # Both paths run the same arithmetic on the same device with the same seed, so
 # the only expected difference is float summation order.  Tolerances are
@@ -42,7 +42,7 @@ def case(request):
     function and the equivalent model-based calls."""
     geometry = request.param
     _, sinogram, params = mbirtorch.gen_demo_data(
-        model_type=geometry, object_type="cube", **_CELL)
+        model_type=geometry, object_type="cube", **_SHAPE)
     angles = params["angles"]
 
     if geometry == "parallel":

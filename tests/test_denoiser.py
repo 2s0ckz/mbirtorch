@@ -39,7 +39,7 @@ def test_sharded_denoise_matches_single_device():
     with the single-device run.
 
     The sharded path stages halos once per pass and combines the step-size sums
-    on the lead device, so agreement is at float level, not bitwise (gate per
+    on the first device, so agreement is at float level, not bitwise (gate per
     the measured iterated-comparison floor).  The regularization parameters are
     gated relatively for the same reason: the two runs reach numpy by different
     routes -- a strided view of the caller's own array on one, a concatenation
@@ -291,8 +291,8 @@ def test_one_initialization_fixes_the_stack_sweep(device):
     denoiser = mbirtorch.QGGMRFDenoiser(shape)
     denoiser.configure_devices(devices=[device])
     denoiser.set_params(no_warning=True, verbose=0)
-    settled = denoiser.initialize_denoiser(image=stack, sigma_noise=0.1)
-    assert int(settled['partition'].shape[0]) == 16
+    initialized = denoiser.initialize_denoiser(image=stack, sigma_noise=0.1)
+    assert int(initialized['partition'].shape[0]) == 16
 
     fixed_first, _ = denoiser.denoise_stack(stack, do_initialization=False, **sweep)
     fixed_again, _ = denoiser.denoise_stack(stack, do_initialization=False, **sweep)

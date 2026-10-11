@@ -1,29 +1,31 @@
-"""The automatic device count and the preflight that gates it.
+"""The automatic device count and the memory check that limits it.
 
 A CUDA model spreads a reconstruction across the devices that can hold their
-share.  These tests pin the RULE rather than the hardware: the selection, the
-validation, the pin, the fallback, and the readable failure all run on CPU,
+share.  These tests check the RULE rather than the hardware: the selection, the
+validation, the count set by MBIRTORCH_NUM_DEVICES, the fallback, and the
+readable failure all run on CPU,
 by driving the policy with fabricated device lists and budgets.  The
 multi-device VALUE gates live in test_sharding.py, which is where the seeded
 n>1 parity patterns already are.
 """
+
 
 import numpy as np
 import pytest
 import torch
 
 import mbirtorch
-from mbirtorch import _memory_ledger, _sharding
-from mbirtorch._memory_ledger import MemoryPreflightError
+from mbirtorch import _memory_estimate, _sharding
+from mbirtorch._memory_estimate import MemoryCheckError
 
 GB = 2 ** 30
 
-# Sinogram shapes the speed floors are measured at, each named for its view
-# count; the comment beside each is its sinogram element count.
-CELL_512 = (512, 448, 384)          #    88,080,384
-CELL_1024 = (1024, 1008, 992)       # 1,023,934,464
-CELL_128 = (128, 112, 96)           #     1,376,256
-SPARSE_VIEW_CELL = (64, 448, 384)   #    11,010,048
+# Sinogram shapes at which the minimum problem sizes are measured, each named
+# for its view count.  The comment beside each is its sinogram element count.
+SHAPE_512 = (512, 448, 384)          #    88,080,384
+SHAPE_1024 = (1024, 1008, 992)       # 1,023,934,464
+SHAPE_128 = (128, 112, 96)           #     1,376,256
+SPARSE_VIEW_SHAPE = (64, 448, 384)   #    11,010,048
 
 
 def make_model(shape=(8, 6, 8), device='cpu', **kwargs):
@@ -42,37 +44,37 @@ def kernel_declared_projection(monkeypatch):
     A CUDA parallel or cone model binds the hand-written kernel bodies, and
     each of those declares what one of its views holds.  On CPU no kernel is
     available, so the same model binds the general torch bodies instead, and
-    the ledger prices a torch body's views for itself at a much larger
-    residency (``_memory_ledger.TORCH_BODY_VIEW_SLABS``).  These tests are
-    about the device-count RULE, not about either residency, so they hold the
-    projection charge at the kernel-declared one; otherwise the capacity
+    the memory estimate counts many more bytes for each view of a torch body
+    (``_memory_estimate.TORCH_PROJECTOR_VIEW_SLABS``).  These tests are about
+    the device-count RULE, not about either byte count, so they hold the
+    projection bytes at the kernel-declared value.  Otherwise the capacity
     arithmetic they drive would be a different model's.
     """
-    monkeypatch.setattr(_memory_ledger, 'torch_body_directions',
+    monkeypatch.setattr(_memory_estimate, 'torch_projector_directions',
                         lambda model: ())
 
 
 @pytest.fixture
-def no_speed_guard(monkeypatch):
-    """Turn off the widening speed floors.
+def no_size_limit(monkeypatch):
+    """Turn off the minimum problem sizes.
 
-    The floors hold small problems at one device, and the toy shapes these
-    tests use are far below every one of them.  A test whose subject is the
-    CAPACITY rule therefore has to opt out, exactly as a user would, or it
-    would be measuring two rules at once.  The floors' own effect on the
-    chosen count is tested below, at the sizes they were measured at.
+    The minimum sizes keep small problems on one device, and the toy shapes
+    these tests use are far below every one of them.  A test whose subject is
+    the CAPACITY rule therefore has to opt out, exactly as a user would, or it
+    would be measuring two rules at once.  The effect of the minimum sizes on
+    the chosen count is tested below, at the sizes where they were measured.
     """
-    monkeypatch.setenv('MBIRTORCH_WIDENING_GUARD', '0')
+    monkeypatch.setenv('MBIRTORCH_LIMIT_GPUS_BY_SIZE', '0')
 
 
 @pytest.fixture
-def unpinned(monkeypatch):
-    """Clear the suite's device-count pin.
+def no_device_count_env(monkeypatch):
+    """Clear the device count that the suite sets with MBIRTORCH_NUM_DEVICES.
 
-    The conftest fixture pins every test to one device, which is exactly what
+    The conftest fixture fixes every test to one device, which is exactly what
     keeps the suite deterministic on a multi-GPU host.  The tests that
     exercise the SEARCH have to opt out of it, and doing so explicitly keeps
-    the pin's reach visible.
+    the reach of that setting visible.
     """
     monkeypatch.delenv('MBIRTORCH_NUM_DEVICES', raising=False)
 
@@ -94,47 +96,48 @@ def recon_peak(model, num_devices):
     """The largest per-device peak of the model's full recon plan at
     ``num_devices``.
 
-    ``layout_fits`` admits a layout only when EVERY device holds its share and
+    ``layout_fits`` allows a layout only when EVERY device holds its share and
     refuses it when any one is short, so the number that decides a budget
-    question is the largest per-device peak, not the lead device's.
+    question is the largest per-device peak, not the first device's.
     """
     devices = [torch.device('cpu', i) for i in range(num_devices)]
-    return max(model._build_memory_ledger(devices=devices).per_device_peaks())
+    return max(model._estimate_memory(devices=devices).per_device_peaks())
 
 
-def budget_admitting_only(monkeypatch, model, fits, misses):
+def budget_allowing_only(monkeypatch, model, fits, misses):
     """A per-device budget the recon plan clears at ``fits`` and misses at
-    every entry of ``misses``, each given as a ``(device count, preflight
+    every entry of ``misses``, each given as a ``(device count, memory check
     margin)`` pair.
 
     Both ends of the window are modeled peaks scaled by the margin they are
-    priced against, so the budget is placed at the MIDPOINT and recomputed on
-    every run.  A charge that moves either peak is followed, rather than
-    breaking a factor someone chose once against numbers that have since
-    moved.  The window is as wide as widening's effect on the per-device peak,
-    which is the property these tests exist to exercise, so a window that
-    closes is reported as that and not as arithmetic that happened to invert.
+    checked against, so the budget is placed at the MIDPOINT and recomputed on
+    every run.  A change in the memory estimate that moves either peak is
+    followed, rather than breaking a factor someone chose once against numbers
+    that have since moved.  The window is as wide as the drop in the
+    per-device peak from using more GPUs, which is the property these tests
+    exist to exercise.  A window that closes is reported as that and not as
+    arithmetic that happened to invert.
     """
     count, margin = fits
-    floor = int((1.0 + margin) * recon_peak(model, count))
+    lower = int((1.0 + margin) * recon_peak(model, count))
     ceiling = min(int((1.0 + m) * recon_peak(model, n)) for n, m in misses)
-    assert floor < ceiling, (
-        f'no budget clears {fits} and misses {misses}: widening no longer '
-        f'lowers the modeled per-device peak enough to tell them apart '
-        f'({floor} is not below {ceiling})')
-    budget = (floor + ceiling) // 2
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+    assert lower < ceiling, (
+        f'no budget clears {fits} and misses {misses}: using more GPUs no '
+        f'longer lowers the modeled per-device peak enough to tell them apart '
+        f'({lower} is not below {ceiling})')
+    budget = (lower + ceiling) // 2
+    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes',
                         lambda d: budget)
     return budget
 
 
 # ── the selection rule ───────────────────────────────────────────────────────
-def test_widening_picks_the_largest_count_that_fits(monkeypatch, unpinned,
-                                                    no_speed_guard):
+def test_the_largest_count_that_fits_is_chosen(monkeypatch, no_device_count_env,
+                                                no_size_limit):
     """Two budgets through the same selection call.
 
     With room on every device the largest valid count wins.  Per-device peaks
-    SHRINK as the count grows, so no uniform budget can admit two devices and
+    SHRINK as the count grows, so no uniform budget can allow two devices and
     refuse four; what refuses four is one device without room.  Every device
     in a candidate set must pass its own budget, so a busy `cuda:2` sends the
     rule back to two devices rather than letting it start a run only three
@@ -145,7 +148,7 @@ def test_widening_picks_the_largest_count_that_fits(monkeypatch, unpinned,
 
     roomy = make_model((16, 8, 16))
     as_automatic(roomy, 4)
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes',
                         lambda d: 64 * GB)
     roomy._apply_device_policy()
     assert roomy.sino_placement.n_devices == 4
@@ -154,33 +157,33 @@ def test_widening_picks_the_largest_count_that_fits(monkeypatch, unpinned,
     crowded = make_model((16, 8, 16))
     as_automatic(crowded, 4)
     monkeypatch.setattr(
-        _memory_ledger, 'device_budget_bytes',
+        _memory_estimate, 'device_budget_bytes',
         lambda d: 1024 if (d.index or 0) >= 2 else 64 * GB)
     crowded._apply_device_policy()
     assert crowded.sino_placement.n_devices == 2
 
 
-def test_widening_refuses_a_layout_that_leaves_a_device_idle(monkeypatch, unpinned):
-    """The empty-shard rules gate the count before the ledger does."""
+def test_a_layout_that_leaves_a_device_idle_is_refused(monkeypatch, no_device_count_env):
+    """The empty-shard rules gate the count before the estimate does."""
     # 3 views and 3 slices over 4 devices leaves device 3 with neither.
     model = make_model((3, 6, 8))
     model.set_params(no_warning=True, recon_shape=(6, 6, 3))
     as_automatic(model, 4)
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes',
                         lambda d: 64 * GB)
     assert not model._layout_is_valid(['cpu'] * 4)
     model._apply_device_policy()
     assert model.sino_placement.n_devices <= 3
 
 
-def test_a_single_visible_device_gets_no_preflight_at_all(monkeypatch,
-                                                          unpinned):
-    """One visible device has no layout to choose, so the ledger does not run.
+def test_a_single_visible_device_gets_no_memory_check_at_all(monkeypatch,
+                                                             no_device_count_env):
+    """One visible device has no layout to choose, so the estimate does not run.
 
     Torch's caching allocator already raises a fast, readable error on a
-    single-device overflow, which is the job the preflight does where the
+    single-device overflow, which is the job the memory check does where the
     allocator cannot.  Skipping it keeps the n=1 path free of any new
     per-reconstruction cost, and it means a single-GPU user cannot be refused
     a run that would previously have started.
@@ -190,32 +193,32 @@ def test_a_single_visible_device_gets_no_preflight_at_all(monkeypatch,
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 1)
     # A budget of zero would refuse everything, and must never be consulted.
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes', lambda d: 0)
+    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes', lambda d: 0)
     called = []
-    original = model._build_memory_ledger
-    model._build_memory_ledger = lambda *a, **k: (called.append(1),
-                                                  original(*a, **k))[1]
+    original = model._estimate_memory
+    model._estimate_memory = lambda *a, **k: (called.append(1),
+                                              original(*a, **k))[1]
     before = model.projector_functions
     assert model._apply_device_policy() is None
-    assert not called                               # the ledger never ran
+    assert not called                               # the estimate never ran
     assert model.sino_placement.n_devices == 1
     assert model.projector_functions is before      # no needless rebuild
 
 
 # ── what turns the rule off ──────────────────────────────────────────────────
-def test_an_explicit_configure_devices_is_never_second_guessed(monkeypatch, unpinned):
+def test_an_explicit_configure_devices_is_never_second_guessed(monkeypatch, no_device_count_env):
     model = make_model()
     model.configure_devices(devices=['cpu', 'cpu'])
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
-    # A budget of zero would fail any preflight; an explicit layout does not
+    # A budget of zero would fail any memory check; an explicit layout does not
     # consult one at all.
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes', lambda d: 0)
+    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes', lambda d: 0)
     model._apply_device_policy()
     assert model.sino_placement.n_devices == 2
 
 
-def test_a_machine_without_cuda_never_widens(monkeypatch, unpinned):
+def test_a_machine_without_cuda_uses_one_device(monkeypatch, no_device_count_env):
     """The other half of CUDA-only.
 
     Under the constructor amendment every model starts in automatic mode, so
@@ -232,12 +235,12 @@ def test_a_machine_without_cuda_never_widens(monkeypatch, unpinned):
     assert model.device_layout_is_automatic is True
 
 
-def test_the_environment_pin_fixes_the_count(monkeypatch):
-    """The pin decides the count, it is capped by what is visible, and it
-    holds through a whole reconstruction -- which is the suite's own
-    determinism guarantee on a multi-GPU host."""
+def test_the_environment_variable_fixes_the_count(monkeypatch):
+    """MBIRTORCH_NUM_DEVICES decides the count, the count is capped by what is
+    visible, and it holds through a whole reconstruction.  This is the suite's
+    own determinism guarantee on a multi-GPU host."""
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes',
                         lambda d: 64 * GB)
 
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
@@ -256,29 +259,29 @@ def test_the_environment_pin_fixes_the_count(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
     monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '1')
-    pinned = make_model()
-    as_automatic(pinned, 4)
+    fixed = make_model()
+    as_automatic(fixed, 4)
     sinogram = np.zeros((8, 6, 8), dtype=np.float32)
     sinogram[:, 3, 4] = 1.0
     np.random.seed(0)
-    pinned.recon(sinogram, max_iterations=2)
-    assert pinned.sino_placement.n_devices == 1
+    fixed.recon(sinogram, max_iterations=2)
+    assert fixed.sino_placement.n_devices == 1
 
 
 # ── the doomed run ───────────────────────────────────────────────────────────
-def test_a_doomed_run_fails_before_allocating_anything(monkeypatch, unpinned):
+def test_a_doomed_run_fails_before_allocating_anything(monkeypatch, no_device_count_env):
     """No count fits, including one, so the answer to 'which count' is
     'none'.  That must arrive as a readable error rather than as a
     reconstruction that dies later inside the allocator, and it must arrive
     through the public entry as well as the internal one."""
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes',
                         lambda d: 1024)          # a kilobyte: nothing fits
 
     model = make_model((16, 8, 16))
     as_automatic(model, 4)
-    with pytest.raises(MemoryPreflightError):
+    with pytest.raises(MemoryCheckError):
         model._apply_device_policy()
 
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 2)
@@ -287,152 +290,153 @@ def test_a_doomed_run_fails_before_allocating_anything(monkeypatch, unpinned):
     sinogram = np.zeros((16, 8, 16), dtype=np.float32)
     sinogram[:, 4, 8] = 1.0
     np.random.seed(0)
-    with pytest.raises(MemoryPreflightError):
+    with pytest.raises(MemoryCheckError):
         through_recon.recon(sinogram, max_iterations=1)
 
 
-def test_skip_memory_preflight_forces_a_doomed_run(monkeypatch, unpinned,
-                                                   no_speed_guard):
+def test_skip_memory_check_forces_a_doomed_run(monkeypatch, no_device_count_env,
+                                               no_size_limit):
     """The escape hatch: the layout is chosen by the empty-shard rules alone
     and the budget is not consulted."""
     model = make_model((16, 8, 16))
     as_automatic(model, 4)
-    model.skip_memory_preflight = True
+    model.skip_memory_check = True
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes', lambda d: 1024)
+    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes', lambda d: 1024)
     model._apply_device_policy()                 # does not raise
     assert model.sino_placement.n_devices == 4
 
 
-# ── the widening speed floors ────────────────────────────────────────────────
-# The guard is a SPEED rule laid over the capacity rule: below a measured
-# floor, a device count is pushed behind every admitted count rather than
-# removed, so capacity still wins when nothing admitted fits.  These tests use
-# the sizes the floors were actually measured at.  They are also the guard's
-# standing regression coverage: every nightly row is env-pinned, and a pin
-# bypasses the guard, so nothing else exercises this ordering end to end.
+# ── the minimum problem sizes ───────────────────────────────────────────────
+# The minimum problem size is a SPEED rule applied after the capacity rule.
+# Below a measured minimum size, a device count is moved behind every allowed
+# count rather than removed, so capacity still wins when nothing allowed fits.
+# These tests use the sizes where the minimum sizes were actually measured.
+# They are also the standing regression coverage of the rule.  Every nightly
+# row sets MBIRTORCH_NUM_DEVICES, which bypasses the rule, so nothing else
+# exercises this ordering end to end.
 def with_four_visible(monkeypatch, model, budget=64 * GB):
     """Four visible devices, every one of them with ample room, so the ONLY
-    thing that can hold the count down is the speed guard."""
+    thing that can hold the count down is the minimum problem size."""
     as_automatic(model, 4)
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes',
                         lambda d: budget)
     return model
 
 
 def test_a_small_parallel_problem_holds_at_one_device_however_free_the_gpus(
-        monkeypatch, unpinned):
-    """The 128-class shape, where widening to four was measured 13x slower,
-    holds at one device however free the GPUs are -- and the guard does not
-    cost the case widening was built for: at the 1024-class shape n=4 is
-    admitted and capacity has room."""
-    small = with_four_visible(monkeypatch, make_model(CELL_128))
+        monkeypatch, no_device_count_env):
+    """The 128-class shape, where four devices were measured 13x slower,
+    stays on one device however free the GPUs are.  The rule does not cost the
+    case that more GPUs are meant for: at the 1024-class shape n=4 is allowed
+    and capacity has room."""
+    small = with_four_visible(monkeypatch, make_model(SHAPE_128))
     small._apply_device_policy()
     assert small.sino_placement.n_devices == 1
 
-    large = with_four_visible(monkeypatch, make_model(CELL_1024))
+    large = with_four_visible(monkeypatch, make_model(SHAPE_1024))
     large._apply_device_policy()
     assert large.sino_placement.n_devices == 4
 
 
-# ── what turns the guard off ─────────────────────────────────────────────────
-def test_an_explicit_choice_a_pin_or_the_switch_ignores_the_speed_floors(
-        monkeypatch, unpinned):
-    """Three ways past the floors, at a size they would otherwise hold at one
-    device.
+# ── what turns the minimum problem sizes off ────────────────────────────────
+def test_an_explicit_choice_the_env_count_or_the_switch_ignores_the_min_sizes(
+        monkeypatch, no_device_count_env):
+    """Three ways past the minimum problem sizes, at a size that would
+    otherwise stay on one device.
 
     A count the caller named is not the library's to second-guess.  The
-    environment pin reaches the policy by a different branch and must bypass
-    the guard the same way.  The guard's own switch restores the pure
-    capacity order.
+    count set by MBIRTORCH_NUM_DEVICES reaches the policy by a different
+    branch and must bypass the rule the same way.  The environment variable
+    MBIRTORCH_LIMIT_GPUS_BY_SIZE=0 restores the pure capacity order.
     """
-    explicit = make_model(CELL_128)
+    explicit = make_model(SHAPE_128)
     explicit.configure_devices(devices=['cpu'] * 4)
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
     explicit._apply_device_policy()
     assert explicit.sino_placement.n_devices == 4
 
-    pinned = with_four_visible(monkeypatch, make_model(CELL_128))
-    order, held = pinned._speed_ordered_candidates(4)
+    fixed = with_four_visible(monkeypatch, make_model(SHAPE_128))
+    order, held = fixed._speed_ordered_candidates(4)
     assert order == [1, 4, 3, 2] and set(held) == {2, 3, 4}
     monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '4')
-    pinned._apply_device_policy()
-    assert pinned.sino_placement.n_devices == 4
-    assert pinned.device_choice_rejections == []
+    fixed._apply_device_policy()
+    assert fixed.sino_placement.n_devices == 4
+    assert fixed.device_choice_rejections == []
 
     monkeypatch.delenv('MBIRTORCH_NUM_DEVICES')
-    switched = with_four_visible(monkeypatch, make_model(CELL_128))
-    monkeypatch.setenv('MBIRTORCH_WIDENING_GUARD', '0')
+    switched = with_four_visible(monkeypatch, make_model(SHAPE_128))
+    monkeypatch.setenv('MBIRTORCH_LIMIT_GPUS_BY_SIZE', '0')
     assert switched._speed_ordered_candidates(4) == ([4, 3, 2, 1], {})
     switched._apply_device_policy()
     assert switched.sino_placement.n_devices == 4
 
 
 # ── capacity still wins ──────────────────────────────────────────────────────
-def test_capacity_falls_back_past_a_speed_floor_and_says_so(monkeypatch,
-                                                            unpinned):
+def test_capacity_falls_back_below_a_min_size_and_says_so(monkeypatch,
+                                                          no_device_count_env):
     """The reorder never removes a count.
 
-    Below its floor, n=4 is tried only after n=1 has been refused for lack of
+    Below its minimum size, n=4 is tried only after n=1 has been refused for lack of
     memory -- and then it is taken, because a run that fits slowly beats a
     run that does not fit at all.  The log says which happened.
     """
-    model = make_model((128, 64, 128))           # 1.0M elements: below every floor
+    model = make_model((128, 64, 128))           # 1.0M elements: below every minimum size
     # This shape reconstructs 16,384 pixels a slice, which the shipped forward
     # batch covers whole, so that transient does not shrink as devices are
-    # added and the one- and four-device peaks barely separate.  Pinning the
+    # added and the one- and four-device peaks barely separate.  Setting the
     # batch to half a slice leaves the sharded arrays to dominate the
     # difference, which is what the budget below is built from.
     model.forward_project_pixel_batch = 8192
     with_four_visible(monkeypatch, model)
-    # Only the wide layout fits: n=1 is priced first, misses, and n=4 is then
-    # taken past its speed floor.
+    # Only the four-device layout fits.  n=1 is checked first and misses, and
+    # n=4 is then taken below its minimum size.
     margin = 0.02
-    budget_admitting_only(monkeypatch, model, fits=(4, margin),
+    budget_allowing_only(monkeypatch, model, fits=(4, margin),
                           misses=[(1, margin)])
-    model.memory_preflight_margin = margin
+    model.memory_check_margin = margin
     model._apply_device_policy()
 
     assert model.sino_placement.n_devices == 4
     reasons = dict(model.device_choice_rejections)
     assert 1 in reasons and 'short' in reasons[1]
-    assert 'chosen past its speed floor' in reasons[4]
-    assert 'no admitted count fits' in reasons[4]
+    assert 'chosen below its minimum problem size' in reasons[4]
+    assert 'no allowed count fits' in reasons[4]
 
 
 # ── the ordering itself ──────────────────────────────────────────────────────
-def test_the_guard_reorders_the_candidates_and_never_removes_one():
+def test_the_min_sizes_reorder_the_candidates_and_never_remove_one():
     """The invariant the whole design rests on: every visible count is still
-    a candidate, admitted ones first, each group largest-first."""
-    for shape in (CELL_128, SPARSE_VIEW_CELL, CELL_512, CELL_1024):
+    a candidate, allowed ones first, each group largest-first."""
+    for shape in (SHAPE_128, SPARSE_VIEW_SHAPE, SHAPE_512, SHAPE_1024):
         model = make_model(shape)
         order, held = model._speed_ordered_candidates(4)
         assert sorted(order) == [1, 2, 3, 4], shape
         assert set(held) <= set(order), shape
-        admitted = [n for n in order if n not in held]
-        assert order == admitted + [n for n in order if n in held], shape
-        assert admitted == sorted(admitted, reverse=True), shape
-        assert 1 in admitted, shape       # n=1 is always admitted
+        allowed = [n for n in order if n not in held]
+        assert order == allowed + [n for n in order if n in held], shape
+        assert allowed == sorted(allowed, reverse=True), shape
+        assert 1 in allowed, shape       # n=1 is always allowed
 
 
-# ── the settled layout ───────────────────────────────────────────────────────
-# The automatic choice is made once per model and kept: settling records the
+# ── the device choice is kept ────────────────────────────────────────────────
+# The automatic choice is made once per model and kept.  The model records the
 # (sinogram_shape, recon_shape) pair it decided from, later calls reuse the
 # layout while those shapes hold, and only a shape change re-decides.  The
-# poison budget below is the discriminator: a call that consults any budget
-# raises, so a passing test proves the settled path ran no search.
+# budget function below raises when it is called, so a passing test proves
+# that a call after the choice ran no search.
 def poison_budgets(monkeypatch):
     def no_budget(_device):
-        raise AssertionError('a settled call consulted a device budget')
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes', no_budget)
+        raise AssertionError('a call after the device choice consulted a device budget')
+    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes', no_budget)
 
 
-def test_a_settled_model_does_not_redecide_when_free_memory_moves(
-        monkeypatch, unpinned, no_speed_guard):
+def test_a_model_with_chosen_devices_does_not_redecide_when_free_memory_moves(
+        monkeypatch, no_device_count_env, no_size_limit):
     """The automatic choice is made once and kept.  The poisoned budget is
     the proof that no second search ran, either on a later policy call or
     after a recompile-flagged parameter that leaves the shapes alone."""
@@ -446,7 +450,7 @@ def test_a_settled_model_does_not_redecide_when_free_memory_moves(
     # The same layout, and the SAME placement object: a re-decision would
     # reinstall the placements and invalidate every Shards a caller holds.
     assert model.sino_placement is placement
-    # Re-deciding on every recompile would unsettle the layout on a
+    # Re-deciding on every recompile would clear the device choice on a
     # detector-offset edit, and on the sigma_noise the denoiser sets at every
     # call.
     model.set_params(no_warning=True, det_channel_offset=0.5)
@@ -454,17 +458,17 @@ def test_a_settled_model_does_not_redecide_when_free_memory_moves(
     assert model.sino_placement.n_devices == 4
 
 
-def test_a_shape_change_redecides_at_the_new_shapes(monkeypatch, unpinned,
-                                                    no_speed_guard):
+def test_a_shape_change_redecides_at_the_new_shapes(monkeypatch, no_device_count_env,
+                                                    no_size_limit):
     model = make_model((16, 8, 16))
     with_four_visible(monkeypatch, model)
     model._apply_device_policy()
     assert model.sino_placement.n_devices == 4
-    # Two of the four devices fill up between the calls.  A settled model
-    # ignores that by design; a shape change must not, because the
+    # Two of the four devices fill up between the calls.  A model whose device
+    # choice is made ignores that by design; a shape change must not, because the
     # decision's inputs are new.
     monkeypatch.setattr(
-        _memory_ledger, 'device_budget_bytes',
+        _memory_estimate, 'device_budget_bytes',
         lambda d: 1024 if (d.index or 0) >= 2 else 64 * GB)
     model.set_params(no_warning=True, sinogram_shape=(16, 12, 16))
     model._apply_device_policy()
@@ -472,9 +476,9 @@ def test_a_shape_change_redecides_at_the_new_shapes(monkeypatch, unpinned,
 
 
 # ── the direct reconstructions ───────────────────────────────────────────────
-# recon_fbp and recon_fdk settle the layout themselves, so a direct
+# recon_fbp and recon_fdk choose the devices themselves, so a direct
 # reconstruction spreads across the devices instead of landing whole on the
-# lead one.  All four geometries are covered here: cone has made the call
+# first one.  All four geometries are covered here: cone has made the call
 # since commit 72208bb and the other three gained it with this increment.
 def _automatic_parallel(shape=(8, 6, 8)):
     angles = np.linspace(0, np.pi, shape[0], endpoint=False)
@@ -540,11 +544,11 @@ def _impulse_sinogram(model):
 
 
 @pytest.mark.parametrize("make,method", DIRECT_RECONS, ids=DIRECT_RECON_IDS)
-def test_a_bare_recon_direct_settles_the_layout_and_spreads(
-        monkeypatch, unpinned, no_speed_guard, make, method):
+def test_a_bare_recon_direct_chooses_the_devices_and_spreads(
+        monkeypatch, no_device_count_env, no_size_limit, make, method):
     """The A2 gap, closed for every geometry: a direct reconstruction on a
     model with no explicit layout uses the devices that fit, exactly as recon
-    does, rather than running whole on the lead device."""
+    does, rather than running whole on the first device."""
     model = _automatic_on_cpu(make)
     with_four_visible(monkeypatch, model)
     recon = getattr(model, method)(_impulse_sinogram(model))
@@ -560,10 +564,10 @@ def test_a_bare_recon_direct_settles_the_layout_and_spreads(
 # loop -- but only if the two models place recon-like arrays the same way.
 # configure_devices(like=...) is how they are made to agree, and the tests
 # below drive the handoff on two virtual CPU devices, in both directions.
-PAIR_CELL = (12, 8, 20)      # recon shape (20, 20, 8): 8 slices, split 4 + 4
+PAIR_SHAPE = (12, 8, 20)      # recon shape (20, 20, 8): 8 slices, split 4 + 4
 
 
-def paired_ct_and_denoiser(sino_shape=PAIR_CELL, devices=('cpu', 'cpu')):
+def paired_ct_and_denoiser(sino_shape=PAIR_SHAPE, devices=('cpu', 'cpu')):
     """A parallel-beam model and a denoiser built at its recon shape, placed
     on the same (virtual) devices -- the two-line idiom the configure_devices
     docstring gives."""
@@ -637,7 +641,7 @@ def test_a_denoiser_placed_like_a_ct_model_takes_its_sharded_volume():
 # loop can therefore prepare its sinogram once and pay the host-to-device
 # transfer once, rather than on every prox_map call.  The tests below drive
 # that on two virtual CPU devices, against the same runs on host arrays, at the
-# small cell and phantom the section above already builds.
+# small shape and phantom the section above already builds.
 
 
 def model_on_devices(sino_shape, num_devices):
@@ -711,7 +715,7 @@ def test_a_prepared_sinogram_reconstructs_like_a_host_one():
     little from run to run whatever their input was -- so the comparison is
     the relative one the value tests in this file use.
     """
-    model = model_on_devices(PAIR_CELL, 2)
+    model = model_on_devices(PAIR_SHAPE, 2)
     phantom = pair_phantom(model)
     sinogram = model.forward_project(phantom)
     prepared = model.prepare_sino_for_devices(sinogram)
@@ -722,7 +726,7 @@ def test_a_prepared_sinogram_reconstructs_like_a_host_one():
     assert max_relative_difference(from_prepared, from_host) <= 1e-4
 
     weights = 0.5 + np.random.RandomState(5).rand(
-        *PAIR_CELL).astype(np.float32)
+        *PAIR_SHAPE).astype(np.float32)
     prepared, prepared_weights = model.prepare_sino_for_devices(
         sinogram, weights=weights)
     assert isinstance(prepared_weights, _sharding.Shards)

@@ -41,14 +41,14 @@ requires_cuda = pytest.mark.skipif(
     reason="the hand-written Triton kernels need a CUDA device")
 
 
-def _cone_model(curved=False, helical=False, cell=(6, 12, 12), device="cuda",
+def _cone_model(curved=False, helical=False, shape=(6, 12, 12), device="cuda",
                 compile_mode="off"):
-    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
-    z_shifts = (np.linspace(-1.5, 1.5, cell[0]).astype(np.float32)
+    angles = np.linspace(0, 2 * np.pi, shape[0], endpoint=False)
+    z_shifts = (np.linspace(-1.5, 1.5, shape[0]).astype(np.float32)
                 if helical else None)
-    model = mbirtorch.ConeBeamModel(cell, angles,
-                                    source_detector_dist=4 * cell[2],
-                                    source_iso_dist=2 * cell[2],
+    model = mbirtorch.ConeBeamModel(shape, angles,
+                                    source_detector_dist=4 * shape[2],
+                                    source_iso_dist=2 * shape[2],
                                     helical_z_shifts=z_shifts,
                                     use_curved_detector=curved, 
                                     compile_mode=compile_mode)
@@ -141,7 +141,7 @@ def test_cone_kernel_pads_the_width_argument_to_a_multiple_of_16(direction,
     """
     if direction == "back":
         band_slices = case
-        model = _cone_model(cell=(6, 32, 20))
+        model = _cone_model(shape=(6, 32, 20))
         sinogram, pixel_indices, view_params, args = _body_inputs(model)
         num_slices = int(args['num_slices'])
         assert num_slices == 32
@@ -165,8 +165,8 @@ def test_cone_kernel_pads_the_width_argument_to_a_multiple_of_16(direction,
             assert banded.is_contiguous() == (padded == length)
         return
 
-    cell, detector_rows = case
-    model = _cone_model(cell=cell)
+    shape, detector_rows = case
+    model = _cone_model(shape=shape)
     _, pixel_indices, view_params, args = _body_inputs(model)
     assert int(args['num_rows_r']) == detector_rows
     values = _voxel_values(model, pixel_indices)

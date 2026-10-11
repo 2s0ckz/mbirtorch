@@ -19,10 +19,10 @@ def _set_hand_pitch(model, delta_voxel_scale):
 
 
 def _small_cone_case(delta_voxel_scale=1.0):
-    cell = (32, 32, 32)
-    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
-    model = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
-                                    source_iso_dist=2 * cell[2])
+    shape = (32, 32, 32)
+    angles = np.linspace(0, 2 * np.pi, shape[0], endpoint=False)
+    model = mbirtorch.ConeBeamModel(shape, angles, source_detector_dist=4 * shape[2],
+                                    source_iso_dist=2 * shape[2])
     model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     _set_hand_pitch(model, delta_voxel_scale)
@@ -61,9 +61,9 @@ def test_split_approximates_full_recon():
 
 
 def _small_parallel_case():
-    cell = (48, 24, 32)  # views, detector rows (which are slices), channels
-    angles = np.linspace(0, np.pi, cell[0], endpoint=False)
-    model = mbirtorch.ParallelBeamModel(cell, angles)
+    shape = (48, 24, 32)  # views, detector rows (which are slices), channels
+    angles = np.linspace(0, np.pi, shape[0], endpoint=False)
+    model = mbirtorch.ParallelBeamModel(shape, angles)
     model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     rshape = tuple(model.get_params('recon_shape'))
