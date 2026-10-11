@@ -277,6 +277,8 @@ class MemoryEstimateInputs:
     # The directions, 'forward' or 'back', that use a torch projection function.  The
     # estimate counts the bytes of those view batches itself.  See TORCH_PROJECTOR_VIEW_SLABS.
     torch_projector_directions: tuple = ()
+    # True when the back projection function adds each view batch into the running sum.
+    back_adds_into_output: bool = False
 
     @property
     def n_devices(self):
@@ -473,15 +475,17 @@ def estimate_peak_device_bytes(plan):
         """This function returns the bytes of the cylinder arrays that the back projection
         loop holds.
 
-        The loop holds two such arrays on several devices and three on a single device.
+        The loop holds two such arrays on several devices and three on a single device.  A
+        back projection function that adds into the running sum holds one array fewer.
         """
+        fewer = 1 if plan.back_adds_into_output else 0
         if n == 1:
-            return (3 * back_block(i, num_pixels) if is_slice_owner(i) else 0)
+            return ((3 - fewer) * back_block(i, num_pixels) if is_slice_owner(i) else 0)
         if not is_view_owner(i):
             return 0
         batches = back_view_batches(i, num_pixels)
         live = 2 if batches is None else min(2, batches)
-        return live * back_block(i, num_pixels)
+        return max(1, live - fewer) * back_block(i, num_pixels)
 
     def back_own_band(i, num_pixels):
         """This function returns the bytes of the slices that this device has finished.
@@ -788,10 +792,11 @@ def estimate_peak_device_bytes(plan):
         else:
             held_arrays = [index_term, ('sinogram', per_dev(sino_dev))]
 
-            # back_fixed counts three output arrays on a single device.  This call holds two.
+            # On a single device, this call holds one output array fewer than back_fixed counts.
             def back_output(i):
                 if n == 1:
-                    return 2 * back_block(i, p_full) if is_slice_owner(i) else 0
+                    return (back_fixed(i, p_full) - back_block(i, p_full)
+                            if is_slice_owner(i) else 0)
                 return back_fixed(i, p_full)
 
             phases.extend(back_phases('back projection (loop)', held_arrays,
@@ -1095,6 +1100,8 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
         view_batch_bytes=view_batch_bytes,
         torch_projector_directions=(() if denoising
                                else torch_projector_directions(model)),
+        back_adds_into_output=(not denoising and bool(getattr(
+            model._view_batch_bodies()[1], '_adds_into_output', False))),
     )
 
 

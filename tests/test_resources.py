@@ -41,7 +41,7 @@ def test_memory_matches_the_cluster_check():
     # The reconstruction check on 4 H100 GPUs on Gautschi reported the 'recon' needs on 2026-10-10, without weights.
     model = _hexagonal_scan_model()
     assert resources._gpu_memory_gib(model, 4, 'recon', weights=False) == pytest.approx(151.54, abs=0.01)
-    assert resources._gpu_memory_gib(model, 4, 'direct', weights=False) == pytest.approx(92.18, abs=0.01)
+    assert resources._gpu_memory_gib(model, 4, 'direct', weights=False) == pytest.approx(72.52, abs=0.01)
     parts, _ = resources._cone_split_parts(model)
     assert [p.get_params('sinogram_shape')[1] for p in parts] == [1643, 1391]
     assert [p.get_params('recon_shape')[2] for p in parts] == [1647, 1393]
@@ -125,7 +125,7 @@ def test_estimate_reports_forward_and_back_projection():
 
 @pytest.mark.filterwarnings('ignore:Cone angle')
 def test_back_projection_memory_of_the_hexagonal_scan():
-    # The arrays that back_project holds on each of 4 H100 GPUs sum to 80.2 GiB before the margin.
+    # The arrays that back_project holds on each of 4 H100 GPUs sum to 63.1 GiB before the margin.
     model = _hexagonal_scan_model()
     need = resources._gpu_memory_gib(model, 4, 'back', weights=False) / (1 + model.memory_check_margin)
-    assert need == pytest.approx(80.2, abs=1.0)
+    assert need == pytest.approx(63.1, abs=1.0)

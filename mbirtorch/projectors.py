@@ -396,15 +396,20 @@ class Projectors:
         vb_size = self._effective_view_batch(back_body, pixel_indices.shape[0],
                                              local_sino.shape[1], args)
         view_params = self._view_params_per_dev[dev_index]
+        # A hand-written kernel with this attribute adds each batch into the running sum, so
+        # the loop holds one output-sized array.
+        adds_into_output = getattr(back_body, '_adds_into_output', False)
         out = None
         for v in range(v0, v1, vb_size):
             view_params_batch = view_params[v:min(v + vb_size, v1)]
+            extra = ({'accumulate_into': out}
+                     if adds_into_output and out is not None else {})
             block = back_body(
                 local_sino[v - v0:v - v0 + view_params_batch.shape[0]],
                 pixel_indices, view_params_batch, coeff_power=coeff_power,
                 slice_start=slice_start, band_slices=band_slices, plan=plan,
-                **args)
-            if out is None:
+                **extra, **args)
+            if out is None or extra:
                 out = block
             else:
                 out.add_(block)

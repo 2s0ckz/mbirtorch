@@ -20,8 +20,8 @@ from .parallel_beam import _parallel_back_view_batch, _parallel_hfan_math
 from .projectors import compile_serialized
 # The Triton helpers come from the cone-beam module.  All four kernels share
 # _COMPILED_LAUNCH_KEYS, and every key starts with the name of its kernel.
-from .triton_cone import (_COMPILED_LAUNCH_KEYS, _jit, _tap_range, _tile_size,
-                          _tl_abs, tl, triton)
+from .triton_cone import (_COMPILED_LAUNCH_KEYS, _jit, _padded_accumulator,
+                          _tap_range, _tile_size, _tl_abs, tl, triton)
 
 _F32 = torch.float32
 
@@ -73,6 +73,7 @@ def _parallel_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                           num_views, num_pixels, num_channels, num_band_rows,
                           sino_view_stride,
                           PSF_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
+                          ACCUMULATE: tl.constexpr,
                           BLOCK_P: tl.constexpr, BLOCK_R: tl.constexpr):
     """This function is the Triton back projection kernel.  It runs one program
     for each pair (pixel block, row block) of the output.  It computes
@@ -82,7 +83,8 @@ def _parallel_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
 
     The argument ``num_band_rows`` is the padded row count.  The kernel masks
     pixel indices beyond ``num_pixels``.  The wrapper removes the padded
-    columns.
+    columns.  When ``ACCUMULATE`` is True, the kernel adds its result to the
+    values already in ``out``.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)     # (BLOCK_P,)
     r_offs = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)     # (BLOCK_R,)
@@ -123,6 +125,9 @@ def _parallel_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
 
     out_ptrs = (out_ptr + p_offs.to(tl.int64)[:, None] * num_band_rows
                 + r_offs[None, :])
+    if ACCUMULATE:
+        # This float32 sum equals torch's add_ of the stored array and this result.
+        acc = tl.load(out_ptrs, mask=tile_mask, other=0.0) + acc
     tl.store(out_ptrs, acc, mask=tile_mask)
 
 
@@ -133,7 +138,8 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
                                      det_channel_offset, delta_voxel,
                                      delta_voxel_row, psf_radius,
                                      coeff_power=1, slice_start=0,
-                                     band_slices=None, plan=None):
+                                     band_slices=None, plan=None,
+                                     accumulate_into=None):
     """This function computes the parallel-beam back projection of one batch of
     views with a Triton kernel.  It replaces
     :func:`mbirtorch.parallel_beam._parallel_back_view_batch`.
@@ -143,6 +149,10 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
     place.  The function is never compiled by torch.compile.  The arguments
     ``slice_start`` and ``band_slices`` must keep their defaults, because the
     sinogram rows already select the slices.  The function ignores ``plan``.
+
+    ``accumulate_into`` is None or the output of an earlier call with the same
+    pixels and rows.  If it is given, the function adds this batch to it in
+    place and returns it.
     """
     if triton is None:
         raise RuntimeError('the Triton parallel back body was called without '
@@ -152,11 +162,12 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
     assert slice_start == 0 and band_slices is None
     # The kernel supports only the powers 1 and 2.
     if coeff_power not in (1, 2):
-        return _parallel_back_view_batch(
+        block = _parallel_back_view_batch(
             sino_batch, pixel_indices, view_params_batch, num_rows, num_cols,
             num_channels, delta_det_channel, det_channel_offset, delta_voxel,
             delta_voxel_row, psf_radius, coeff_power=coeff_power,
             slice_start=slice_start, band_slices=band_slices, plan=plan)
+        return block if accumulate_into is None else accumulate_into.add_(block)
 
     n_p, centers, w_p_c, weight_scale = _parallel_hfan_math(
         pixel_indices, view_params_batch, num_rows, num_cols, num_channels,
@@ -183,8 +194,10 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
     # they do not have one value per view.
     contract += [t.reshape(num_views).contiguous()
                  for t in (w_p_c, weight_scale)]
-    out = torch.empty((num_pixels, launch_rows), dtype=_F32,
-                      device=sino_batch.device)
+    target = (None if accumulate_into is None else _padded_accumulator(
+        accumulate_into, num_pixels, num_band_rows, launch_rows, sino_batch.device))
+    out = target if target is not None else torch.empty(
+        (num_pixels, launch_rows), dtype=_F32, device=sino_batch.device)
 
     block_p = _tile_size(PARALLEL_BACK_BLOCK_P, num_pixels,
                          PARALLEL_BACK_MIN_TILE)
@@ -192,7 +205,7 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
                          PARALLEL_BACK_MIN_TILE)
     grid = (-(-num_pixels // block_p), -(-launch_rows // block_r))
     launch_key = ('pback', sino_batch.device.index, int(psf_radius),
-                  int(coeff_power), block_p, block_r,
+                  int(coeff_power), target is not None, block_p, block_r,
                   int(num_views), int(num_pixels), int(num_channels),
                   launch_rows)
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
@@ -205,19 +218,24 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
             int(num_views), int(num_pixels), int(num_channels), launch_rows,
             int(num_channels) * launch_rows,
             PSF_RADIUS=int(psf_radius), COEFF_POWER=int(coeff_power),
+            ACCUMULATE=target is not None,
             BLOCK_P=block_p, BLOCK_R=block_r,
             num_warps=PARALLEL_BACK_NUM_WARPS,
             num_stages=PARALLEL_BACK_NUM_STAGES)
     _COMPILED_LAUNCH_KEYS.add(launch_key)
-    if launch_rows == num_band_rows:
-        return out
+    if target is not None:
+        return accumulate_into
     # The padded columns are removed.  The result is a strided view, and each
     # of its rows is contiguous.
-    return out[:, :num_band_rows]
+    block = out if launch_rows == num_band_rows else out[:, :num_band_rows]
+    # An accumulate_into without the layout of a kernel output receives the new result here.
+    return block if accumulate_into is None else accumulate_into.add_(block)
 
 
 # The function maybe_compile reads this attribute and does not compile this function.
 _parallel_back_view_batch_triton._mbirtorch_no_compile = True
+# The projection loop reads this attribute and passes its running sum as accumulate_into.
+_parallel_back_view_batch_triton._adds_into_output = True
 
 
 def _parallel_back_view_batch_cost(num_pixels, band_rows, args):

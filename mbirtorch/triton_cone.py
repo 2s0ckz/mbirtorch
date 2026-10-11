@@ -91,6 +91,7 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                       slice_start, sino_view_stride,
                       delta_voxel_slice, slice_center, inv_sdd, num_rows_f,
                       PSF_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
+                      ACCUMULATE: tl.constexpr,
                       BLOCK_P: tl.constexpr, BLOCK_L: tl.constexpr):
     """This function is the Triton back projection kernel.  Each Triton program computes
     one block of pixels and one block of slices of the output.
@@ -102,6 +103,7 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
     The kernel computes both sets of weights from arrays indexed by (view, pixel).  The
     output covers a contiguous range of slices.  ``band_len`` is the number of slices in this
     range, padded by the wrapper.  The kernel masks pixel indices at or beyond ``num_pixels``.
+    When ``ACCUMULATE`` is True, the kernel adds its result to the values already in ``out``.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)     # (BLOCK_P,)
     l_offs = tl.program_id(1) * BLOCK_L + tl.arange(0, BLOCK_L)     # (BLOCK_L,)
@@ -174,6 +176,9 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
             acc = acc + w_row * row_vals
 
     out_ptrs = out_ptr + p_offs.to(tl.int64)[:, None] * band_len + l_offs[None, :]
+    if ACCUMULATE:
+        # This float32 sum equals torch's add_ of the stored array and this result.
+        acc = tl.load(out_ptrs, mask=tile_mask, other=0.0) + acc
     tl.store(out_ptrs, acc, mask=tile_mask)
 
 
@@ -189,6 +194,25 @@ def _tile_size(cap, extent, min_tile):
     return max(int(min_tile), min(int(cap), _next_pow2(extent)))
 
 
+def _padded_accumulator(accumulate_into, num_pixels, band_len, launch_band, device):
+    """This function returns the (num_pixels, launch_band) array that holds
+    ``accumulate_into``, so that a back kernel can add into it.
+
+    A back kernel wrapper returns the first ``band_len`` columns of a (num_pixels,
+    launch_band) array.  The function returns None when ``accumulate_into`` is not such an
+    output.
+    """
+    a = accumulate_into
+    if (a.dtype != _F32 or a.device != device
+            or tuple(a.shape) != (int(num_pixels), int(band_len))
+            or tuple(a.stride()) != (int(launch_band), 1)):
+        return None
+    needed_bytes = (a.storage_offset() + int(num_pixels) * int(launch_band)) * 4
+    if a.untyped_storage().nbytes() < needed_bytes:
+        return None
+    return a.as_strided((int(num_pixels), int(launch_band)), (int(launch_band), 1))
+
+
 @torch.compiler.disable
 def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
                                  num_rows_r, num_channels, num_recon_rows,
@@ -199,7 +223,8 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
                                  recon_slice_offset, magnification,
                                  source_detector_dist, use_curved_detector,
                                  psf_radius, bp_psf_radius, coeff_power=1,
-                                 slice_start=0, band_slices=None, plan=None):
+                                 slice_start=0, band_slices=None, plan=None,
+                                 accumulate_into=None):
     """This function computes the cone beam back projection of one batch of views with
     Triton.  It replaces :func:`mbirtorch.cone_beam._cone_back_view_batch`.
 
@@ -207,6 +232,9 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
     call allocates a new output tensor, so the caller may add into it in place.  When the
     number of slices is not a multiple of 16, the output is a strided view.  torch.compile
     does not compile this function.  The function ignores ``bp_psf_radius`` and ``plan``.
+
+    ``accumulate_into`` is None or the output of an earlier call with the same pixels and
+    slices.  If it is given, the function adds this batch to it in place and returns it.
     """
     if triton is None:
         raise RuntimeError('the Triton cone back body was called without '
@@ -215,7 +243,7 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
                            'the torch body (see kernel_availability).')
     # The kernel supports only coeff_power 1 and 2.
     if coeff_power not in (1, 2):
-        return _cone_back_view_batch(
+        block = _cone_back_view_batch(
             sino_batch, pixel_indices, view_params_batch, num_rows_r,
             num_channels, num_recon_rows, num_recon_cols, num_slices,
             delta_voxel, delta_voxel_row, delta_voxel_slice, delta_det_channel,
@@ -224,6 +252,7 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
             use_curved_detector, psf_radius, bp_psf_radius,
             coeff_power=coeff_power, slice_start=slice_start,
             band_slices=band_slices, plan=plan)
+        return block if accumulate_into is None else accumulate_into.add_(block)
 
     angles = view_params_batch[:, 0]
     z_shifts = view_params_batch[:, 1]
@@ -245,8 +274,10 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
     sino_t = sino_batch.permute(0, 2, 1).contiguous()
     contract = [t.contiguous() for t in (n_p, centers, w_p_c, weight_scale,
                                          m0, w_p_r, pixel_mag, z_offset)]
-    out = torch.empty((num_pixels, launch_band), dtype=_F32,
-                      device=sino_batch.device)
+    target = (None if accumulate_into is None else _padded_accumulator(
+        accumulate_into, num_pixels, band_len, launch_band, sino_batch.device))
+    out = target if target is not None else torch.empty(
+        (num_pixels, launch_band), dtype=_F32, device=sino_batch.device)
 
     block_p = _tile_size(CONE_BACK_BLOCK_P, num_pixels, CONE_BACK_MIN_TILE)
     block_l = _tile_size(CONE_BACK_BLOCK_L, launch_band, CONE_BACK_MIN_TILE)
@@ -254,7 +285,7 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
     inv_sdd = (0.0 if math.isinf(float(source_detector_dist))
                else 1.0 / float(source_detector_dist))
     launch_key = ('back', sino_batch.device.index, int(psf_radius),
-                  int(coeff_power), block_p, block_l,
+                  int(coeff_power), target is not None, block_p, block_l,
                   int(num_views), int(num_pixels), int(num_channels),
                   int(num_rows_r), launch_band, int(slice_start))
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
@@ -270,18 +301,23 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
             float(delta_voxel_slice), (int(num_slices) - 1) / 2.0, inv_sdd,
             float(num_rows_r),
             PSF_RADIUS=int(psf_radius), COEFF_POWER=int(coeff_power),
+            ACCUMULATE=target is not None,
             BLOCK_P=block_p, BLOCK_L=block_l,
             num_warps=CONE_BACK_NUM_WARPS, num_stages=CONE_BACK_NUM_STAGES)
     _COMPILED_LAUNCH_KEYS.add(launch_key)
-    if launch_band == band_len:
-        return out
+    if target is not None:
+        return accumulate_into
     # This slice removes the padded columns.  The result is a strided view, and each
     # row of the view is contiguous.
-    return out[:, :band_len]
+    block = out if launch_band == band_len else out[:, :band_len]
+    # An accumulate_into without the layout of a kernel output receives the new result here.
+    return block if accumulate_into is None else accumulate_into.add_(block)
 
 
 # maybe_compile reads this attribute and does not compile the function.
 _cone_back_view_batch_triton._mbirtorch_no_compile = True
+# The projection loop reads this attribute and passes its running sum as accumulate_into.
+_cone_back_view_batch_triton._adds_into_output = True
 
 
 def _cone_back_view_batch_cost(num_pixels, num_band_rows, args):

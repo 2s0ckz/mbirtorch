@@ -23,8 +23,8 @@ from .multiaxis_parallel import (_multiaxis_back_view_batch,
 from .projectors import compile_serialized
 # The Triton helper functions come from the cone-beam module.  All kernels share
 # _COMPILED_LAUNCH_KEYS, and each key starts with the name of its kernel.
-from .triton_cone import (_COMPILED_LAUNCH_KEYS, _jit, _tap_range, _tile_size,
-                          _tl_abs, _tl_floor, tl, triton)
+from .triton_cone import (_COMPILED_LAUNCH_KEYS, _jit, _padded_accumulator,
+                          _tap_range, _tile_size, _tl_abs, _tl_floor, tl, triton)
 
 _F32 = torch.float32
 
@@ -84,6 +84,7 @@ def _multiaxis_back_kernel(n_p_ptr, centers_ptr, m0_ptr,
                            band_len, slice_start, num_slices,
                            sino_view_stride, num_rows_f,
                            PSF_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
+                           ACCUMULATE: tl.constexpr,
                            BLOCK_P: tl.constexpr, BLOCK_L: tl.constexpr):
     """This function is the Triton back projection kernel.  Each program computes one block of
     pixels and one block of slices of the output.
@@ -95,6 +96,7 @@ def _multiaxis_back_kernel(n_p_ptr, centers_ptr, m0_ptr,
     The output is zero where the slice index slice_start + l is greater than or equal to
     num_slices.  ``band_len`` is the padded number of slices in the output.  The kernel masks
     pixels with index ``num_pixels`` or greater.  The wrapper returns only the unpadded slices.
+    When ``ACCUMULATE`` is True, the kernel adds its result to the values already in ``out``.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)     # (BLOCK_P,)
     l_offs = tl.program_id(1) * BLOCK_L + tl.arange(0, BLOCK_L)     # (BLOCK_L,)
@@ -172,6 +174,9 @@ def _multiaxis_back_kernel(n_p_ptr, centers_ptr, m0_ptr,
     # Padded slices, with index num_slices or greater, are set to zero.
     acc = tl.where(valid_k[None, :], acc, 0.0)
     out_ptrs = out_ptr + p_offs.to(tl.int64)[:, None] * band_len + l_offs[None, :]
+    if ACCUMULATE:
+        # This float32 sum equals torch's add_ of the stored array and this result.
+        acc = tl.load(out_ptrs, mask=tile_mask, other=0.0) + acc
     tl.store(out_ptrs, acc, mask=tile_mask)
 
 
@@ -185,7 +190,8 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
                                       det_channel_offset, det_row_offset,
                                       recon_slice_offset, psf_radius,
                                       coeff_power=1, slice_start=0,
-                                      band_slices=None, plan=None):
+                                      band_slices=None, plan=None,
+                                      accumulate_into=None):
     """This function back projects one batch of views with the Triton kernel.
 
     The function replaces :func:`mbirtorch.multiaxis_parallel._multiaxis_back_view_batch`, and
@@ -193,6 +199,9 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
     the caller can add into the array in place.  If band_len is not a multiple of 16, the
     returned array is a strided view.  torch.compile does not compile this function.  The
     function ignores ``plan``.
+
+    ``accumulate_into`` is None or the output of an earlier call with the same pixels and
+    slices.  If it is given, the function adds this batch to it in place and returns it.
     """
     if triton is None:
         raise RuntimeError('the Triton multiaxis back body was called without '
@@ -200,13 +209,14 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
                            'body where no triton is available.')
     # The kernel supports only coeff_power 1 and 2.
     if coeff_power not in (1, 2):
-        return _multiaxis_back_view_batch(
+        block = _multiaxis_back_view_batch(
             sino_batch, pixel_indices, view_params_batch, num_rows_r,
             num_channels, num_recon_rows, num_recon_cols, num_slices,
             delta_voxel, delta_voxel_row, delta_voxel_slice, delta_det_channel,
             delta_det_row, det_channel_offset, det_row_offset,
             recon_slice_offset, psf_radius, coeff_power=coeff_power,
             slice_start=slice_start, band_slices=band_slices, plan=plan)
+        return block if accumulate_into is None else accumulate_into.add_(block)
 
     azimuth = view_params_batch[:, 0]
     elevation = view_params_batch[:, 1]
@@ -236,8 +246,10 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
     contract += [t.reshape(num_views).contiguous()
                  for t in (w_p_c, weight_scale, slope, w_p_r, l_max,
                            scale_pow)]
-    out = torch.empty((num_pixels, launch_band), dtype=_F32,
-                      device=sino_batch.device)
+    target = (None if accumulate_into is None else _padded_accumulator(
+        accumulate_into, num_pixels, band_len, launch_band, sino_batch.device))
+    out = target if target is not None else torch.empty(
+        (num_pixels, launch_band), dtype=_F32, device=sino_batch.device)
 
     block_p = _tile_size(MULTIAXIS_BACK_BLOCK_P, num_pixels,
                          MULTIAXIS_BACK_MIN_TILE)
@@ -245,7 +257,7 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
                          MULTIAXIS_BACK_MIN_TILE)
     grid = (-(-num_pixels // block_p), -(-launch_band // block_l))
     launch_key = ('maback', sino_batch.device.index, int(psf_radius),
-                  int(coeff_power), block_p, block_l,
+                  int(coeff_power), target is not None, block_p, block_l,
                   int(num_views), int(num_pixels), int(num_channels),
                   int(num_rows_r), launch_band, int(slice_start),
                   int(num_slices))
@@ -259,19 +271,24 @@ def _multiaxis_back_view_batch_triton(sino_batch, pixel_indices,
             int(num_rows_r), launch_band, int(slice_start), int(num_slices),
             int(num_channels) * int(num_rows_r), float(num_rows_r),
             PSF_RADIUS=int(psf_radius), COEFF_POWER=int(coeff_power),
+            ACCUMULATE=target is not None,
             BLOCK_P=block_p, BLOCK_L=block_l,
             num_warps=MULTIAXIS_BACK_NUM_WARPS,
             num_stages=MULTIAXIS_BACK_NUM_STAGES)
     _COMPILED_LAUNCH_KEYS.add(launch_key)
-    if launch_band == band_len:
-        return out
+    if target is not None:
+        return accumulate_into
     # This slice removes the padded columns.  The result is a strided view, and each
     # of its rows is contiguous.
-    return out[:, :band_len]
+    block = out if launch_band == band_len else out[:, :band_len]
+    # An accumulate_into without the layout of a kernel output receives the new result here.
+    return block if accumulate_into is None else accumulate_into.add_(block)
 
 
 # maybe_compile reads this attribute and does not compile the function.
 _multiaxis_back_view_batch_triton._mbirtorch_no_compile = True
+# The projection loop reads this attribute and passes its running sum as accumulate_into.
+_multiaxis_back_view_batch_triton._adds_into_output = True
 
 
 def _multiaxis_back_view_batch_cost(num_pixels, num_band_rows, args):

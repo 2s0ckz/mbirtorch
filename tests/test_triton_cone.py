@@ -280,3 +280,27 @@ def test_cone_forward_kernel_pixel_padding(num_pixels):
     rest_out = _cone_forward_view_batch_triton(values[num_pixels:], rest,
                                                view_params, **args)
     assert _rel_max(kernel_out + rest_out, full) <= 1e-5
+
+
+@requires_cuda
+@pytest.mark.parametrize("geometry", ["cone", "parallel"])
+def test_back_kernel_adds_into_its_output_bit_for_bit(geometry, monkeypatch):
+    # The back kernel adds each view batch into the running sum.  The result must equal the
+    # loop that adds a new output array for each batch with add_.  Both widths are padded.
+    if geometry == "cone":
+        model = _cone_model(shape=(24, 12, 20))
+    else:
+        model = mbirtorch.ParallelBeamModel(
+            (24, 12, 20), np.linspace(0, np.pi, 24, endpoint=False), compile_mode="off")
+        model.configure_devices(devices=["cuda"])
+        model.set_params(no_warning=True, verbose=0)
+    model.view_batch_size = 5
+    back_body = model._view_batch_bodies()[1]
+    assert back_body._adds_into_output
+    generator = torch.Generator().manual_seed(0)
+    sinogram = torch.rand(tuple(model.get_params('sinogram_shape')),
+                          generator=generator).to("cuda")
+    added_in_kernel = model.back_project(sinogram)
+    monkeypatch.setattr(back_body, '_adds_into_output', False)
+    added_with_add_ = model.back_project(sinogram)
+    assert torch.equal(torch.as_tensor(added_in_kernel), torch.as_tensor(added_with_add_))
