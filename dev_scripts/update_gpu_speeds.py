@@ -1,10 +1,10 @@
-"""Write mbirtorch/data/gpu_speeds.json from the newest nightly performance records.
+"""This script writes mbirtorch/data/gpu_speeds.json from the newest nightly performance records.
 
-Run before each release:
+It is run before each release:
 
     python dev_scripts/update_gpu_speeds.py
 
-The script downloads the newest nightly records for the prerelease branch from the
+It downloads the newest nightly records for the prerelease branch from the
 cabouman/mbirtorch_metrics repository, fits the time lines that mbirtorch.estimate_resources
 uses, prints the old and new values, and writes the speed file.  It is the only code that
 knows the format of the nightly records.  If the records are missing or have changed
@@ -42,12 +42,12 @@ INITIAL_GPUS = {
 
 
 def fail(message):
-    """Stop without writing anything."""
+    """Stops without writing anything."""
     sys.exit(f'update_gpu_speeds: {message}  The speed file was not changed.')
 
 
 def fetch(url):
-    """Return the text at ``url``."""
+    """Returns the text at ``url``."""
     try:
         with urllib.request.urlopen(url, timeout=60) as response:
             return response.read().decode()
@@ -56,7 +56,7 @@ def fetch(url):
 
 
 def nightly_model(geometry, size):
-    """Return the model the nightly runs build for ``geometry`` and sinogram ``size``."""
+    """Returns the model the nightly runs build for ``geometry`` and sinogram ``size``."""
     num_views, num_rows, num_channels = size
     angles = np.linspace(0, np.pi, num_views, endpoint=False)
     if geometry == 'parallel':
@@ -70,13 +70,13 @@ def nightly_model(geometry, size):
 
 
 def iso_date(date):
-    """Return a nightly run date such as 20261010 as 2026-10-10."""
+    """Returns a nightly run date such as 20261010 as 2026-10-10."""
     text = str(date)
     return f'{text[:4]}-{text[4:6]}-{text[6:8]}' if re.fullmatch(r'\d{8}', text) else text
 
 
 def fit_line(work, seconds):
-    """Return a and b of seconds = a + b * work, by least squares with a >= 0."""
+    """Returns a and b of seconds = a + b * work, by least squares with a >= 0."""
     work, seconds = np.asarray(work, float), np.asarray(seconds, float)
     b, a = np.polyfit(work, seconds, 1) if len(work) > 1 else (seconds[0] / work[0], 0.0)
     if a < 0:

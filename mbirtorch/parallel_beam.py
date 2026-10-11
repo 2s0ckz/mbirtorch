@@ -322,23 +322,25 @@ class ParallelBeamModel(TomographyModel):
                          align_split_grid=False, slices_per_section=None, min_slices_per_section=200,
                          slices_per_part=None):
         """
-        Reduce the memory parallel beam MBIR needs by splitting the detector rows into overlapping
-        sections, reconstructing the sections separately, and joining the results.
+        This function reduces the memory needed for parallel beam MBIR reconstruction by
+        reconstructing the volume in sections and joining the results.  It is for a volume that
+        does not fit on the GPUs as a whole.
 
-        In parallel beam geometry detector row r is recon slice r, so a section of detector rows
-        reconstructs exactly the matching section of slices.  The overlap is there for the prior: it
-        gives the voxels near a seam their neighbors on the other side, so the seam is not treated
-        as a volume boundary.
+        The method works as follows.  In parallel beam geometry, detector row r is reconstruction
+        slice r, so a section of detector rows reconstructs exactly the matching section of slices.
+        Each section is reconstructed with ordinary MBIR, with a few extra rows past each seam
+        so that the prior sees the neighboring slices on the other side.  The sections are then
+        joined with a linear blend across the overlap.  The GPUs are divided into equal groups, as
+        many as possible, such that each group can hold a section of at least
+        ``min_slices_per_section`` slices.  The groups reconstruct sections side by side, and each
+        group takes its sections one after another, so a volume of any size can be reconstructed.
+        If no smaller group can hold a section, all the GPUs reconstruct each section in turn.
 
-        The GPUs are divided into equal groups, as many as possible, so that each group can hold a
-        section of at least ``min_slices_per_section`` slices.  The groups reconstruct sections
-        side by side, and each group takes its sections one after another, so a volume of any
-        size can be reconstructed.  When no smaller group holds such a section, all the GPUs
-        reconstruct each section in turn.
-
-        The arguments mirror TomographyModel.recon(), and the result is approximately equal to the
-        reconstruction recon() returns.  Two differences: ``output_sharded`` is not accepted, and
-        ``compute_prior_loss`` is accepted but unused.
+        The function is used like :meth:`recon`, and its result is approximately equal to the
+        result of :meth:`recon`.  A device choice made with ``configure_devices`` limits the GPUs
+        the split may use, and the grouping stays automatic.  Two differences from :meth:`recon`
+        are that ``output_sharded`` is not accepted and ``compute_prior_loss`` is accepted but
+        unused.
 
         Args:
             sino (numpy or tensor): Full sinogram of shape (num_views, num_rows, num_cols).  A
@@ -437,7 +439,7 @@ class ParallelBeamModel(TomographyModel):
         recon_rows, recon_cols = self.get_params('recon_shape')[:2]
 
         def _section_model(num_section_rows):
-            """Return a copy of this model covering ``num_section_rows``
+            """Returns a copy of this model covering ``num_section_rows``
             detector rows, and therefore that many recon slices."""
             model = copy_ct_model(self, new_num_det_rows=num_section_rows, no_warning=True)
             # The regularization values come from the parent, which derives them from
@@ -447,7 +449,7 @@ class ParallelBeamModel(TomographyModel):
             return model
 
         def _largest_section_rows(num_sections):
-            """Return the number of rows in the largest section model at this
+            """Returns the number of rows in the largest section model at this
             section count.  It is the largest kept section plus half_overlap for
             each interior side it has."""
             biggest_kept = -(-num_rows // num_sections)
@@ -543,7 +545,7 @@ class ParallelBeamModel(TomographyModel):
         self.auto_set_regularization_params(sino, weights=weights)
 
         def _recon_one_section(model_lo, model_hi, section_logfile_path, devices, rng):
-            """Reconstruct one band of detector rows and return (host_recon,
+            """Reconstructs one section of detector rows and returns (host_recon,
             recon_dict).
 
             ``devices`` is the section's group of devices, or None to let the
@@ -580,7 +582,7 @@ class ParallelBeamModel(TomographyModel):
             log_path, section_log_paths = None, [None] * num_sections
 
         def _job(index, lo, hi):
-            """Return the job that reconstructs section ``index``.  The section's model spans its
+            """Returns the job that reconstructs section ``index``.  The section's model spans its
             kept rows plus half_overlap on each interior side."""
             model_lo, model_hi = max(lo - half_overlap, 0), min(hi + half_overlap, num_rows)
             return lambda group, rng: _recon_one_section(model_lo, model_hi, section_log_paths[index],

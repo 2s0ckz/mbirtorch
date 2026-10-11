@@ -372,23 +372,23 @@ class TomographyModel(ParameterHandler):
                          logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
                          align_split_grid=False):
         """
-        Perform MBIR reconstruction with less memory than :meth:`recon` by
-        splitting the detector rows into overlapping sections -- two halves
-        for cone beam, one or more sections for parallel beam -- reconstructing
-        each section, and joining the results.  The output is approximately
-        equal to the output of :meth:`recon`.
+        This function reduces the memory needed for MBIR reconstruction by reconstructing the volume
+        in sections and joining the results.  It is for a volume that does not fit on the GPUs as a
+        whole.
 
-        The GPUs are divided into equal groups, as many as possible, so that
-        each group can hold a section.  The groups reconstruct sections side by
-        side, and each group takes its sections one after another.  When no
-        smaller group holds a section, all the GPUs reconstruct each section in
-        turn.  A device choice made with ``configure_devices`` limits the GPUs
-        the split may use, and the grouping stays automatic.  The result's
-        ``'split_params'`` reports ``'num_groups'`` and ``'gpus_per_group'``.
+        The method works as follows.  The detector rows are divided into overlapping sections, two
+        halves for cone beam and one or more sections for parallel beam.  Each section is
+        reconstructed with ordinary MBIR, and the sections are joined with a linear blend across
+        the overlap.  The GPUs are divided into equal groups, as many as possible, such that each
+        group can hold a section.  The groups reconstruct sections side by side, and each group
+        takes its sections one after another.  If no smaller group can hold a section, all the
+        GPUs reconstruct each section in turn.
 
-        The split arithmetic is geometry specific, and recon_split_sino may
-        not be available for all geometries; geometries without an
-        implementation raise ``NotImplementedError``.
+        The function is used like :meth:`recon`, and its result is approximately equal to the
+        result of :meth:`recon`.  A device choice made with ``configure_devices`` limits the GPUs
+        the split may use, and the grouping stays automatic.  The result's ``'split_params'``
+        reports ``'num_groups'`` and ``'gpus_per_group'``.  The split arithmetic is geometry
+        specific, and a geometry without an implementation raises ``NotImplementedError``.
 
         Args:
             sino (numpy or tensor): Full sinogram of shape (num_views, num_rows, num_cols).  A
@@ -425,7 +425,7 @@ class TomographyModel(ParameterHandler):
     # ── the sections of a split reconstruction ────────────────────────────────
 
     def _split_devices(self):
-        """Return the devices a split reconstruction divides into groups.
+        """Returns the devices a split reconstruction divides into groups.
 
         An explicit device choice is used as made.  Otherwise these are the GPUs the automatic
         choice could use: every visible GPU, or the count set by MBIRTORCH_NUM_DEVICES.  On a
@@ -440,7 +440,7 @@ class TomographyModel(ParameterHandler):
         return self._candidate_devices(visible) if visible > 1 else [self.torch_device]
 
     def _section_fits(self, section_model, devices, weighted):
-        """Return whether a reconstruction of ``section_model`` fits on ``devices``.
+        """Returns whether a reconstruction of ``section_model`` fits on ``devices``.
 
         This is the memory check a reconstruction makes before it starts.  A device with no
         readable memory, such as the CPU, holds whatever it is asked to.
@@ -461,7 +461,7 @@ class TomographyModel(ParameterHandler):
 
     @staticmethod
     def _choose_gpus_per_group(devices, fits, max_groups=None):
-        """Return the number of devices in each group of a split reconstruction.
+        """Returns the number of devices in each group of a split reconstruction.
 
         The devices are divided into equal groups, as many as possible, so that each group can
         hold a section: the result is the smallest group size that divides the device count,
@@ -478,7 +478,7 @@ class TomographyModel(ParameterHandler):
 
     @staticmethod
     def _run_split_sections(jobs, devices, gpus_per_group):
-        """Run the sections of a split reconstruction and return their results in order.
+        """Runs the sections of a split reconstruction and returns their results in order.
 
         Each job reconstructs one section.  It takes a list of devices, or None to let the
         section's model choose its devices as ``recon`` does, and a random generator for the
@@ -3051,7 +3051,7 @@ class TomographyModel(ParameterHandler):
               logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
               output_sharded=False, rng=None):
         """
-        Reconstruct a volume from a sinogram by MBIR.
+        This method reconstructs a volume from a sinogram by MBIR.
 
         The reconstruction runs the Multi-Granular Vector Coordinate Descent algorithm for up to
         ``max_iterations`` iterations, or until the change between iterations falls below

@@ -842,18 +842,23 @@ class ConeBeamModel(TomographyModel):
                          first_iteration=0, compute_prior_loss=False, logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
                          align_split_grid=False):
         """
-        This function reduces memory usage for cone beam MBIR reconstruction by approximately a factor of 2
-        by splitting the detector rows into two overlapping halves, reconstructing each half separately,
-        and joining the reconstructions.
+        This function reduces the memory needed for cone beam MBIR reconstruction by about a factor
+        of 2 by reconstructing the volume in two halves and joining the results.  It is for a
+        volume that does not fit on the GPUs as a whole.
 
-        When each half fits on half the GPUs, the two halves are reconstructed side by side on two
-        equal groups of GPUs.  Otherwise all the GPUs reconstruct one half and then the other.  A
-        device choice made with ``configure_devices`` limits the GPUs the split may use, and the
-        grouping stays automatic.
+        The method works as follows.  The detector rows are cut at the row where the central ray
+        hits the detector, and each half keeps a few extra rows past the cut.  Each half is
+        reconstructed with ordinary MBIR as its own volume, with extra slices past the cut that are
+        computed from the geometry, so that the half covers every slice its rows see.  The two
+        halves are then joined with a linear blend across the overlap.  When each half fits on
+        half the GPUs, the two halves are reconstructed side by side on two equal groups of GPUs.
+        Otherwise all the GPUs reconstruct one half and then the other.
 
-        The arguments mirror TomographyModel.recon(), and the result is approximately equal to the
-        reconstruction recon() returns.  Two differences: ``output_sharded`` is not accepted, and
-        ``compute_prior_loss`` is accepted but unused.
+        The function is used like :meth:`recon`, and its result is approximately equal to the
+        result of :meth:`recon`.  A device choice made with ``configure_devices`` limits the GPUs
+        the split may use, and the grouping stays automatic.  Two differences from :meth:`recon`
+        are that ``output_sharded`` is not accepted and ``compute_prior_loss`` is accepted but
+        unused.
 
         Args:
             sino (numpy or tensor): Full sinogram of shape (num_views, num_rows, num_cols).  A
@@ -1052,7 +1057,7 @@ class ConeBeamModel(TomographyModel):
         self.auto_set_regularization_params(sino, weights=weights)
 
         def _half_model(lo, hi, recon_shape, recon_slice_offset):
-            """Return the model of one detector-row half."""
+            """Returns the model of one detector-row half."""
             num_rows = hi - lo
             det_center = (num_rows - 1) / 2.0
             det_row_offset = full_det_row_offset + (full_det_center - (det_center + lo)) * delta_det_row
@@ -1067,7 +1072,7 @@ class ConeBeamModel(TomographyModel):
             return model
 
         def _recon_one_half(model, lo, hi, is_top, half_logfile_path, devices, rng):
-            """Reconstruct one detector-row half and return (host_recon,
+            """Reconstructs one detector-row half and returns (host_recon,
             recon_dict).
 
             ``devices`` is the half's group of devices, or None to let the half
