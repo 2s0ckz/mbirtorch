@@ -774,11 +774,20 @@ def estimate_peak_device_bytes(plan):
         base = list(workspace_term[1])
         index_term = ('pixel indices', per_dev(lambda i: p_full * _INT64_BYTES))
         if plan.workload == 'forward':
+            # The gather copies the voxels inside the ROR mask from the volume.  The projection
+            # step holds this copy but not the volume.  A volume that the caller placed on the
+            # devices is already excluded from the available memory.
+            gather_terms = [
+                index_term,
+                ('recon', per_dev(recon_dev)),
+                ('voxel gather', per_dev(lambda i: cyl(i, p_full))),
+            ]
+            phases.append(_phase('forward projection (gather)', gather_terms, n,
+                                 base=base, base_terms=base_terms))
             # forward_fixed counts the output twice on several devices.  This call holds one
             # output, so the output is counted here with sino_dev.
             forward_terms = [
                 index_term,
-                ('recon', per_dev(recon_dev)),
                 ('voxel gather', per_dev(lambda i: cyl(i, p_full))),
                 ('transferred cylinders', per_dev(
                     lambda i: forward_transferred_cylinders(i, p_full))),

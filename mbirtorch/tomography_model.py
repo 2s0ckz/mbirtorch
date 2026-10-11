@@ -1668,13 +1668,15 @@ class TomographyModel(ParameterHandler):
         if isinstance(recon, _sharding.Shards):
             # reshape cannot infer the number of rows of a shard that holds no slices.
             num_pixels = int(recon_shape[0]) * int(recon_shape[1])
-            flat = _sharding.Shards(
+            voxel_values = _sharding.Shards(
                 [t.reshape(num_pixels, t.shape[-1])[indices.to(t.device)]
                  for t in recon.tensors], recon.placement)
-            sinogram = self.sparse_forward_project(flat, indices)
         else:
             voxel_values = recon.reshape(-1, recon.shape[-1])[indices]
-            sinogram = self.sparse_forward_project(voxel_values, indices)
+        # The projection reads only voxel_values, which is a copy.  When the input is a host
+        # array, this line frees the volume on the devices.
+        del recon
+        sinogram = self.sparse_forward_project(voxel_values, indices)
         return sinogram if output_sharded else self._gather_sinogram(sinogram)
 
     def back_project(self, sinogram, output_sharded=False):
