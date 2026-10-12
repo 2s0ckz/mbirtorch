@@ -197,7 +197,7 @@ def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
     shape = (8, 10, 12)
     num_volumes = 6
     sigma_noise = 0.1
-    stack = _ramp_stack(num_volumes, shape)
+    stack = _ramp_stack(num_volumes, shape, noise_lo=0.01, noise_hi=0.2)
 
     auto = mbirtorch.QGGMRFDenoiser(shape)
     auto.configure_devices(devices=[device])

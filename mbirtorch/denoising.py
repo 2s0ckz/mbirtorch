@@ -83,10 +83,10 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
     prior_grad, prior_hess, slice_b_tilde_2 = _qggmrf.qggmrf_terms_at_indices(
         flat_image, image_shape, pixel_indices, qggmrf_params)
 
-    # The forward Hessian is all 1s for the qggmrf proximal map.
+    # The forward Hessian is fm_constant, because the forward model is the identity.
     cur_error_image = flat_error_image[pixel_indices]
     forward_grad = -fm_constant * cur_error_image
-    forward_hess = 1
+    forward_hess = fm_constant
 
     delta_recon_at_indices = -((forward_grad + prior_grad)
                                / (forward_hess + prior_hess))
@@ -138,10 +138,10 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
     prior_grad, prior_hess, slice_b_tilde_2 = _qggmrf.qggmrf_terms_batched(
         flat_image, image_shape, pixel_indices, qggmrf_params)
 
-    # The forward Hessian is all 1s for the qggmrf proximal map.
+    # The forward Hessian is fm_constant, because the forward model is the identity.
     cur_error_image = flat_error_image[:, pixel_indices]
     forward_grad = -fm_constant * cur_error_image
-    forward_hess = 1
+    forward_hess = fm_constant
 
     delta_recon_at_indices = -((forward_grad + prior_grad)
                                / (forward_hess + prior_hess))
@@ -752,7 +752,7 @@ class QGGMRFDenoiser(TomographyModel):
                                 right_halo=halos['right'][j])
                             cur_error = flat_error.tensors[j][idx[j]]
                             forward_grad = -fm_constant * cur_error
-                            delta = -((forward_grad + grad) / (1.0 + hess))
+                            delta = -((forward_grad + grad) / (fm_constant + hess))
                             # The four sums are scalar tensors.  The code adds them on the
                             # first device.
                             return (delta,
