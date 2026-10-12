@@ -269,22 +269,26 @@ def test_qggmrf_halos_match_full_volume():
 
 
 def test_qggmrf_chunks_match_one_call():
-    # The prior computed on chunks of pixels, with a padded last chunk, matches one call on
-    # all of the pixels.  CPU kernels can differ in the last bit, so the check is relative.
+    # The prior pass computed on chunks of pixels, with a padded last chunk, matches one call on
+    # all of the pixels.  The padded pixels do not count in the slice sums.  CPU kernels can
+    # differ in the last bit, so the check is relative.
     from mbirtorch import qggmrf
-    from mbirtorch._memory_estimate import QGGMRF_CYLINDERS_EAGER
+    from mbirtorch._memory_estimate import PRIOR_PASS_CYLINDERS_EAGER
     rng = np.random.RandomState(5)
     rows, cols, S = 9, 7, 6
     flat = torch.as_tensor(rng.rand(rows * cols, S).astype(np.float32))
     left = torch.as_tensor(rng.rand(rows * cols).astype(np.float32))
     right = torch.as_tensor(rng.rand(rows * cols).astype(np.float32))
     idx = torch.as_tensor(rng.choice(rows * cols, 23, replace=False))
+    forward_grad = torch.as_tensor(rng.randn(23, S).astype(np.float32))
+    forward_hess = torch.as_tensor(rng.rand(23, S).astype(np.float32))
     params = ((1.0, 1.0, 1.0, 1.0, 0.8, 0.8), 0.3, 2.0, 1.2, 1.0)
-    ref = qggmrf.qggmrf_gradient_and_hessian_at_indices(
-        flat, (rows, cols, S), idx, params, left_halo=left, right_halo=right)
-    out = qggmrf.qggmrf_gradient_and_hessian_in_chunks(
-        flat, (rows, cols, S), idx, params, left_halo=left, right_halo=right,
-        max_chunk_bytes=5 * QGGMRF_CYLINDERS_EAGER * S * 4)
+    ref = qggmrf.qggmrf_prior_pass_in_chunks(
+        flat, (rows, cols, S), idx, params, forward_grad, forward_hess, left_halo=left,
+        right_halo=right)
+    out = qggmrf.qggmrf_prior_pass_in_chunks(
+        flat, (rows, cols, S), idx, params, forward_grad, forward_hess, left_halo=left,
+        right_halo=right, max_chunk_bytes=5 * PRIOR_PASS_CYLINDERS_EAGER * S * 4)
     for o, r in zip(out, ref):
         assert o.shape == r.shape
         assert float((o - r).abs().max() / r.abs().max()) < 1e-6

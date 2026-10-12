@@ -201,6 +201,50 @@ def gen_set_of_pixel_partitions(recon_shape, granularity, device=None, use_ror_m
     return partitions
 
 
+def gen_neighbor_pair_lists(partition, recon_shape):
+    """
+    This function lists, for each subset of a partition, the pairs of neighboring pixels with
+    both pixels in the subset.  The exact line search of the qGGMRF prior uses these pairs.
+    The row pairs join a pixel and its neighbor in the next row.  The column pairs join a pixel
+    and its neighbor in the next column.
+
+    Args:
+        partition (array or tensor): The partition, with shape (num_subsets, num_indices).
+            Each row holds the pixel indices of one subset.
+        recon_shape (tuple): The shape of the recon as (rows, columns, slices).
+
+    Returns:
+        tuple ((row_pairs, row_counts), (col_pairs, col_counts)): ``row_pairs`` is an int32
+        array of shape (num_subsets, max_pairs, 2).  Each entry holds the positions of the two
+        pixels of a pair in the row of the subset.  Subset k has ``row_counts[k]`` pairs, and
+        the rows after them hold zeros.  The column pairs have the same form.
+    """
+    subsets = (partition.detach().cpu().numpy() if torch.is_tensor(partition)
+               else np.asarray(partition))
+    num_rows, num_cols = recon_shape[:2]
+    position = np.full(num_rows * num_cols, -1, dtype=np.int64)
+    lists = {num_cols: [], 1: []}
+    for subset in subsets:
+        position[subset] = np.arange(subset.size)
+        for step, has_neighbor in ((num_cols, subset // num_cols < num_rows - 1),
+                                   (1, subset % num_cols < num_cols - 1)):
+            first = subset[has_neighbor]
+            second_position = position[first + step]
+            keep = second_position >= 0
+            lists[step].append(np.stack((position[first[keep]], second_position[keep]),
+                                        axis=1))
+        position[subset] = -1
+
+    def padded(pair_lists):
+        counts = np.array([len(pairs) for pairs in pair_lists], dtype=np.int64)
+        array = np.zeros((len(pair_lists), int(counts.max(initial=0)), 2), dtype=np.int32)
+        for k, pairs in enumerate(pair_lists):
+            array[k, :len(pairs)] = pairs
+        return array, counts
+
+    return padded(lists[num_cols]), padded(lists[1])
+
+
 def gen_partition_sequence(partition_sequence, max_iterations):
     """
     This function returns a partition sequence of length ``max_iterations``.  If the input

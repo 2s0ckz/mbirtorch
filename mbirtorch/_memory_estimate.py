@@ -28,6 +28,10 @@ QGGMRF_CYLINDERS_EAGER = 16
 # The subset update computes the qGGMRF prior on chunks of pixels.  The temporary arrays of
 # one chunk use at most this many bytes.  The chunk size is set with the eager count.
 PRIOR_CHUNK_BYTES = 2 ** 30
+# The prior pass of the subset update also holds the forward model gradient and Hessian of the
+# chunk and the slice coefficients of the exact line search.  The chunk size of that pass is set
+# with this count.
+PRIOR_PASS_CYLINDERS_EAGER = QGGMRF_CYLINDERS_EAGER + 3
 # The proximal map prior acts on each voxel separately.  It holds four cylinder arrays: the
 # recon, the prox input, their difference, and the scaled result.
 PROX_CYLINDERS = 4
@@ -42,6 +46,9 @@ CYLINDER_TRANSFER_COPIES = 3
 # once.  The first is for computing the update direction.  The second is for applying it.
 DENOISE_DIRECTION_CYLINDERS = 8
 DENOISE_APPLY_CYLINDERS = 3
+# The exact quadratic term of the denoiser holds the slice coefficients of the prior and two
+# temporary arrays.
+DENOISE_EXACT_TERM_CYLINDERS = 3
 # Each GPU holds this many boundary slices while the denoiser on several GPUs exchanges
 # boundary slices.  The first and last GPUs hold fewer, but the estimate counts four for
 # them too.
@@ -50,6 +57,25 @@ DENOISE_HALO_COLUMNS = 4
 # values set the chunk size for all of them.
 L1_CHUNK_BYTES = 16 * 2 ** 20
 L1_MAX_CHUNKS = 1024
+
+
+def neighbor_pair_rows(num_subset_pixels, granularity):
+    """This function returns an upper estimate of the number of rows of one direction of the
+    pair list of a subset, from :func:`vcd_utils.gen_neighbor_pair_lists`.
+
+    A pixel has its neighbor in the same subset with probability about 1 / granularity.  The
+    list is padded to the longest list of the partition, so the estimate adds a margin.
+    """
+    granularity = max(1, int(granularity))
+    num_subset_pixels = int(num_subset_pixels)
+    return min(num_subset_pixels, math.ceil(1.25 * num_subset_pixels / granularity) + 64)
+
+
+def neighbor_pair_list_bytes(num_subset_pixels, granularity):
+    """This function returns the bytes of the pair lists of a whole partition.  Each list has two
+    directions, and each pair is two int32 values."""
+    granularity = max(1, int(granularity))
+    return 2 * granularity * neighbor_pair_rows(num_subset_pixels, granularity) * 2 * 4
 
 
 def _chunk_count(n_bytes):
@@ -725,6 +751,15 @@ def estimate_peak_device_bytes(plan):
                 int(g) * math.ceil(plan.num_pixels_full / max(1, int(g)))
                 * _INT64_BYTES for g in plan.partition_granularities)
 
+        def pair_lists(i):
+            """This function returns the bytes of the pair lists of the partition.
+
+            Every device holds the pair lists of every subset.
+            """
+            return sum(neighbor_pair_list_bytes(
+                math.ceil(plan.num_pixels_full / max(1, int(g))), g)
+                for g in plan.partition_granularities)
+
         # These arrays exist from the start of the denoiser call until it returns.  An
         # initial image supplied by the caller is a fourth array.  By default, the initial
         # image is the input image, so the initial image adds no memory.
@@ -735,6 +770,7 @@ def estimate_peak_device_bytes(plan):
             ('working image', per_dev(recon_dev)),
             ('residual', per_dev(recon_dev)),
             ('subset indices', per_dev(partition_indices)),
+            ('neighbor pair lists', per_dev(pair_lists)),
             ('qggmrf halos', per_dev(halo_columns)),
         ]
         phases.append(_phase('denoise state placement', held_arrays, n,
@@ -743,11 +779,17 @@ def estimate_peak_device_bytes(plan):
             p_sub = math.ceil(plan.num_pixels_full / max(1, int(granularity)))
             # The prior and the update direction run one after the other.  The maximum over
             # steps on each device therefore chooses the larger of the two.
+            pair_rows = neighbor_pair_rows(p_sub, granularity)
             sub_phases = (
                 ('prior', [('prior cylinders', per_dev(
-                    lambda i: plan.qggmrf_cylinders * cyl(i, p_sub)))]),
-                ('update direction', [('direction cylinders', per_dev(
-                    lambda i: DENOISE_DIRECTION_CYLINDERS * cyl(i, p_sub)))]),
+                    lambda i: (plan.qggmrf_cylinders + 1) * cyl(i, p_sub)))]),
+                ('update direction', [
+                    ('direction cylinders', per_dev(
+                        lambda i: DENOISE_DIRECTION_CYLINDERS * cyl(i, p_sub))),
+                    ('exact line search', per_dev(
+                        lambda i: DENOISE_EXACT_TERM_CYLINDERS * cyl(i, p_sub))),
+                    ('pair terms', per_dev(
+                        lambda i: QGGMRF_CYLINDERS_EAGER * cyl(i, pair_rows)))]),
                 ('state application', [
                     ('direction and scaled direction', per_dev(
                         lambda i: DENOISE_APPLY_CYLINDERS * cyl(i, p_sub)))]),
@@ -955,10 +997,23 @@ def estimate_peak_device_bytes(plan):
                 lambda i: PROX_CYLINDERS * cyl(i, p_sub)))]
         else:
             prior_terms = [
+                ('forward Hessian', per_dev(lambda i: cyl(i, p_sub))),
                 ('prior gradient and hessian', per_dev(lambda i: 2 * cyl(i, p_sub))),
                 ('prior chunk', per_dev(lambda i: min(
-                    PRIOR_CHUNK_BYTES, plan.qggmrf_cylinders * cyl(i, p_sub)))),
+                    PRIOR_CHUNK_BYTES, (plan.qggmrf_cylinders + PRIOR_PASS_CYLINDERS_EAGER
+                                        - QGGMRF_CYLINDERS_EAGER) * cyl(i, p_sub)))),
             ]
+        # The exact line search of the qGGMRF prior holds the pair lists of the partition,
+        # one chunk of pairs, and one slice of the direction from the next device.
+        pair_rows = neighbor_pair_rows(p_sub, granularity)
+        pair_list_bytes = per_dev(lambda i: 0 if plan.prox
+                                  else neighbor_pair_list_bytes(p_sub, granularity))
+        pair_terms = [] if plan.prox else [
+            ('pair chunk', per_dev(lambda i: min(
+                PRIOR_CHUNK_BYTES, QGGMRF_CYLINDERS_EAGER * cyl(i, pair_rows)))),
+            ('direction slice from the next device', per_dev(
+                lambda i: p_sub * _F32_BYTES if n > 1 else 0)),
+        ]
         sub_phases = {
             # This entry lists only the arrays that the back projection holds throughout.
             # back_phases below builds the two steps of the back projection and their terms.
@@ -966,14 +1021,14 @@ def estimate_peak_device_bytes(plan):
                 ('weighted error sinogram', per_dev(
                     lambda i: sino_dev(i) if plan.weights_supplied else 0)),
             ],
-            # The prior runs after the back projection, so it also holds the output of the
-            # back projection.
+            # The prior runs after the back projection.  The output of the back projection
+            # becomes the forward model gradient.
             'prior': [('back projection output', per_dev(lambda i: cyl(i, p_sub)))]
             + prior_terms,
             'update direction': [
                 ('direction cylinders', per_dev(
                     lambda i: DIRECTION_CYLINDERS * cyl(i, p_sub))),
-            ],
+            ] + pair_terms,
             'delta forward projection': [
                 ('update direction', per_dev(
                     lambda i: (2 if plan.positivity else 1) * cyl(i, p_sub))),
@@ -996,7 +1051,8 @@ def estimate_peak_device_bytes(plan):
         }
         loop_base_terms = constant_terms + list(persistent.items())
         for name, terms in sub_phases.items():
-            all_terms = terms + [('subset indices', index_bytes)]
+            all_terms = terms + [('subset indices', index_bytes),
+                                 ('neighbor pair lists', pair_list_bytes)]
             phase_name = f'subset {name} (granularity {granularity})'
             if name == 'back projection':
                 phases.extend(back_phases(phase_name, all_terms, p_sub,

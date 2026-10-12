@@ -40,12 +40,12 @@ def _small_model(geometry):
 def test_memory_matches_the_cluster_check():
     # These are the estimated needs on 4 H100 GPUs, without weights.
     model = _hexagonal_scan_model()
-    assert resources._gpu_memory_gib(model, 4, 'recon', weights=False) == pytest.approx(149.97, abs=0.01)
+    assert resources._gpu_memory_gib(model, 4, 'recon', weights=False) == pytest.approx(150.01, abs=0.01)
     assert resources._gpu_memory_gib(model, 4, 'direct', weights=False) == pytest.approx(72.52, abs=0.01)
     parts, _ = resources._cone_split_parts(model)
     assert [p.get_params('sinogram_shape')[1] for p in parts] == [1643, 1391]
     assert [p.get_params('recon_shape')[2] for p in parts] == [1647, 1393]
-    assert resources._gpu_memory_gib(parts[0], 4, 'recon', weights=False) == pytest.approx(83.92, abs=0.01)
+    assert resources._gpu_memory_gib(parts[0], 4, 'recon', weights=False) == pytest.approx(83.96, abs=0.01)
 
 
 def test_cone_split_parts_match_a_real_split():

@@ -72,13 +72,14 @@ def _sample_tiles(num_rows, num_cols, num_leading, point_budget):
 
 
 def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
-                        fm_constant, qggmrf_params, image_shape):
+                        fm_constant, qggmrf_params, image_shape, pair_lists):
     """This function performs one VCD subset update for the identity forward model.  The
     function changes ``flat_image`` and ``flat_error_image`` in place.  It returns
     (flat_image, flat_error_image, l1, alpha), where ``l1`` is the L1 norm of the update.
-    The tests in tests/test_denoiser.py compare against stored values, so the order of
-    operations must not change."""
-    prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_at_indices(
+    ``pair_lists`` holds the pair lists of the subset, as for
+    :func:`qggmrf.qggmrf_exact_quadratic`.  The tests in tests/test_denoiser.py compare against
+    stored values, so the order of operations must not change."""
+    prior_grad, prior_hess, slice_b_tilde_2 = _qggmrf.qggmrf_terms_at_indices(
         flat_image, image_shape, pixel_indices, qggmrf_params)
 
     # The forward Hessian is all 1s for the qggmrf proximal map.
@@ -89,17 +90,19 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
     delta_recon_at_indices = -((forward_grad + prior_grad)
                                / (forward_hess + prior_hess))
 
-    # These are delta^T grad Q(x_hat; x'=x_hat) and an upper bound on the prior Hessian term.
-    # The step size alpha uses both.
+    # These are delta^T grad Q(x_hat; x'=x_hat) and the exact quadratic term of the prior.  The
+    # step size alpha uses both.
     prior_linear = torch.sum(prior_grad * delta_recon_at_indices)
-    prior_quadratic_approx = torch.sum(prior_hess * delta_recon_at_indices ** 2)
+    prior_quadratic = _qggmrf.qggmrf_exact_quadratic(
+        prior_hess, slice_b_tilde_2, delta_recon_at_indices, flat_image, pixel_indices,
+        image_shape, qggmrf_params, pair_lists).to(delta_recon_at_indices.dtype)
 
     delta_sinogram = delta_recon_at_indices
     forward_linear = fm_constant * torch.sum(cur_error_image * delta_sinogram)
     forward_quadratic = fm_constant * torch.sum(delta_sinogram * delta_sinogram)
 
     alpha_numerator = forward_linear - prior_linear
-    alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
+    alpha_denominator = forward_quadratic + prior_quadratic + _F32_EPS
     alpha = alpha_numerator / alpha_denominator
     max_alpha = 1.5
     alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
@@ -114,13 +117,14 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
 
 
 def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
-                                fm_constant, qggmrf_params, image_shape, active):
+                                fm_constant, qggmrf_params, image_shape, active, pair_lists):
     """This function performs one VCD subset update for a stack of images with the identity
     forward model.  The function computes the same update as :func:`vcd_subset_denoiser`,
     with an added first axis that indexes the volumes.
 
     Each volume has its own step size, and the volumes do not interact.  ``active`` is a
     boolean tensor with one entry per volume.  A volume whose entry is False does not change.
+    ``pair_lists`` holds the pair lists of the subset.
     The function changes ``flat_image`` and ``flat_error_image`` in place.  Both have shape
     (num_volumes, num_pixels, num_slices).
 
@@ -130,7 +134,7 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
         with shape (num_volumes,).  ``alpha`` holds the step size of each volume, with shape
         (num_volumes,).
     """
-    prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_batched(
+    prior_grad, prior_hess, slice_b_tilde_2 = _qggmrf.qggmrf_terms_batched(
         flat_image, image_shape, pixel_indices, qggmrf_params)
 
     # The forward Hessian is all 1s for the qggmrf proximal map.
@@ -142,8 +146,9 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
                                / (forward_hess + prior_hess))
 
     prior_linear = torch.sum(prior_grad * delta_recon_at_indices, dim=(1, 2))
-    prior_quadratic_approx = torch.sum(prior_hess * delta_recon_at_indices ** 2,
-                                       dim=(1, 2))
+    prior_quadratic = _qggmrf.qggmrf_exact_quadratic(
+        prior_hess, slice_b_tilde_2, delta_recon_at_indices, flat_image, pixel_indices,
+        image_shape, qggmrf_params, pair_lists).to(delta_recon_at_indices.dtype)
 
     delta_sinogram = delta_recon_at_indices
     forward_linear = fm_constant * torch.sum(cur_error_image * delta_sinogram,
@@ -152,7 +157,7 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
                                                 dim=(1, 2))
 
     alpha_numerator = forward_linear - prior_linear
-    alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
+    alpha_denominator = forward_quadratic + prior_quadratic + _F32_EPS
     alpha = alpha_numerator / alpha_denominator
     max_alpha = 1.5
     alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
@@ -166,6 +171,21 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
     flat_error_image.index_copy_(1, pixel_indices, cur_error_image)
     l1_for_subset = torch.sum(torch.abs(delta_scaled), dim=(1, 2))
     return flat_image, flat_error_image, l1_for_subset, alpha
+
+
+def _subset_pair_lists(partition, image_shape, device):
+    """This function returns, for each subset of the partition, the tuple (row_pairs,
+    row_valid, col_pairs, col_valid) on the device.  The pairs come from
+    :func:`vcd_utils.gen_neighbor_pair_lists`.  A valid array holds 1 for each pair of the
+    subset and 0 for each row that pads the list."""
+    lists = []
+    for pairs, counts in vcd_utils.gen_neighbor_pair_lists(partition, image_shape):
+        rows = np.arange(pairs.shape[1])
+        lists.append([(torch.as_tensor(pairs[k], device=device),
+                       torch.as_tensor((rows < counts[k]).astype(np.float32)[:, None],
+                                       device=device))
+                      for k in range(pairs.shape[0])])
+    return [row + col for row, col in zip(*lists)]
 
 
 def _is_stack(image):
@@ -627,6 +647,7 @@ class QGGMRFDenoiser(TomographyModel):
             flat_error_image = (image_t.reshape((-1, image_shape[2]))
                                 - flat_image).contiguous()
             subset_denoiser = maybe_compile(vcd_subset_denoiser, self.compile_enabled)
+            pair_lists = _subset_pair_lists(partition, image_shape, flat_image.device)
             nmae_update = np.zeros(max_iters)
             alpha_values = np.zeros(max_iters)
             num_iters = 0
@@ -637,7 +658,8 @@ class QGGMRFDenoiser(TomographyModel):
                     for k in range(partition.shape[0]):
                         flat_image, flat_error_image, l1_subset, alpha_subset = \
                             subset_denoiser(flat_image, flat_error_image, partition[k],
-                                            fm_constant, qggmrf_params, tuple(image_shape))
+                                            fm_constant, qggmrf_params, tuple(image_shape),
+                                            pair_lists[k])
                         l1_accum = l1_accum + l1_subset
                         alpha_accum = alpha_accum + alpha_subset
 
@@ -696,11 +718,12 @@ class QGGMRFDenoiser(TomographyModel):
             [(a.reshape(num_pixels, a.shape[-1]) - b).contiguous()
              for a, b in zip(image_sh.tensors, flat_image.tensors)], pl)
 
-        grad_hess = [maybe_compile(_qggmrf.qggmrf_gradient_and_hessian_at_indices,
+        grad_hess = [maybe_compile(_qggmrf.qggmrf_terms_at_indices,
                                    self.compile_enabled, instance_key=i)
                      for i in range(n)]
         idx_per_dev = [[torch.as_tensor(partition[k], dtype=torch.int64).to(d)
                         for d in devices] for k in range(partition.shape[0])]
+        pairs_per_dev = [_subset_pair_lists(partition, image_shape, d) for d in devices]
         halos = {'left': [None] * n, 'right': [None] * n}
 
         nmae_update = np.zeros(max_iters)
@@ -722,7 +745,7 @@ class QGGMRFDenoiser(TomographyModel):
                         idx = idx_per_dev[k]
 
                         def terms_worker(j, dev):
-                            grad, hess = grad_hess[j](
+                            grad, hess, slice_b_tilde_2 = grad_hess[j](
                                 flat_image.tensors[j], image_shape, idx[j],
                                 qggmrf_params, left_halo=halos['left'][j],
                                 right_halo=halos['right'][j])
@@ -733,7 +756,11 @@ class QGGMRFDenoiser(TomographyModel):
                             # first device.
                             return (delta,
                                     torch.sum(grad * delta),
-                                    torch.sum(hess * delta ** 2),
+                                    _qggmrf.qggmrf_exact_quadratic(
+                                        hess, slice_b_tilde_2, delta, flat_image.tensors[j],
+                                        idx[j], image_shape, qggmrf_params,
+                                        pairs_per_dev[j][k], halos['left'][j] is None,
+                                        halos['right'][j] is None),
                                     fm_constant * torch.sum(cur_error * delta),
                                     fm_constant * torch.sum(delta * delta))
 
@@ -744,6 +771,18 @@ class QGGMRFDenoiser(TomographyModel):
                         prior_quadratic = combine_on_lead([r[2] for r in results])
                         forward_linear = combine_on_lead([r[3] for r in results])
                         forward_quadratic = combine_on_lead([r[4] for r in results])
+                        # Each device receives the first slice of the direction of the next
+                        # device.  The pairs across each boundary belong to the device before it.
+                        _, delta_right = _sharding.exchange_qggmrf_halos(
+                            _sharding.Shards(deltas, pl), self.dev2dev_safe)
+                        boundary_sums = [
+                            _qggmrf.qggmrf_boundary_pair_sum(
+                                flat_image.tensors[j][idx[j], -1], halos['right'][j][idx[j]],
+                                deltas[j][:, -1], delta_right[j], qggmrf_params)
+                            for j in range(n) if delta_right[j] is not None]
+                        if boundary_sums:
+                            prior_quadratic = prior_quadratic - combine_on_lead(boundary_sums)
+                        prior_quadratic = prior_quadratic.to(torch.float32)
                         alpha = ((forward_linear - prior_linear)
                                  / (forward_quadratic + prior_quadratic + _F32_EPS))
                         alpha = torch.clamp(alpha, _F32_EPS, 1.5)
@@ -999,6 +1038,7 @@ class QGGMRFDenoiser(TomographyModel):
         subset_denoiser = maybe_compile(vcd_subset_denoiser_batched,
                                         self.compile_enabled,
                                         instance_key=self._instance_key)
+        pair_lists = _subset_pair_lists(partition, image_shape, device)
 
         def flat_on_device(block):
             """This function returns a block of volumes as a float32 tensor of shape
@@ -1047,7 +1087,7 @@ class QGGMRFDenoiser(TomographyModel):
                 counts, history = self._sweep_stack(
                     flat_image, flat_error_image, partition, fm_constant,
                     qggmrf_params, image_shape, max_iterations, stop_thresh,
-                    subset_denoiser)
+                    subset_denoiser, pair_lists)
                 real = b1 - b0
                 result = flat_image[:real].reshape((real,) + image_shape)
                 if single:
@@ -1072,10 +1112,10 @@ class QGGMRFDenoiser(TomographyModel):
     @staticmethod
     def _sweep_stack(flat_image, flat_error_image, partition, fm_constant,
                      qggmrf_params, image_shape, max_iters, stop_thresh,
-                     subset_denoiser):
+                     subset_denoiser, pair_lists):
         """This method runs the denoising iterations in place on one batch of volumes.  Each
         volume stops when its change falls below ``stop_thresh`` or after ``max_iters``
-        iterations.
+        iterations.  ``pair_lists`` holds the pair lists of each subset.
 
         Returns:
             (num_iterations, nmae_pct): ``num_iterations`` holds the number of iterations of
@@ -1093,7 +1133,7 @@ class QGGMRFDenoiser(TomographyModel):
             for k in range(partition.shape[0]):
                 flat_image, flat_error_image, l1_subset, _alpha = subset_denoiser(
                     flat_image, flat_error_image, partition[k], fm_constant,
-                    qggmrf_params, tuple(image_shape), active)
+                    qggmrf_params, tuple(image_shape), active, pair_lists[k])
                 l1_accum = l1_accum + l1_subset
             # The code reads from the device once per iteration.  A volume of zeros gives nan.
             stats = torch.stack([l1_accum, stack_l1_norm(flat_image)])

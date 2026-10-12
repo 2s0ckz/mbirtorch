@@ -17,6 +17,7 @@ import warnings
 from .geometry_rules import channel_index, pixel_xy, rotate_about_z, row_index
 from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .projectors import maybe_compile
+from .qggmrf import qggmrf_slice_pair_sum
 from .tomography_model import TomographyModel
 from .vcd_utils import get_support_radius
 
@@ -28,12 +29,18 @@ _DC_DAMPING_DEFAULT = (0.25, 100.0, 0.7, 0.5)
 
 
 def _dc_damped_update_direction(forward_grad, prior_grad, forward_hess,
-                                prior_hess, s_row):
+                                prior_hess, s_row, slice_sums):
     # d = -(g - (1 - s_k) gbar_k) / H.  gbar_k is the mean of g over the slice, weighted by H^-1.
+    # The function also returns the slice term of the exact line search, or None if slice_sums
+    # is None.
     g = forward_grad + prior_grad
     h_inv = 1.0 / (forward_hess + prior_hess)
     gbar = torch.sum(h_inv * g, dim=0) / torch.sum(h_inv, dim=0)
-    return -(g - ((1.0 - s_row) * gbar)[None, :]) * h_inv
+    slice_offsets = (1.0 - s_row) * gbar
+    direction = -(g - slice_offsets[None, :]) * h_inv
+    if slice_sums is None:
+        return direction, None
+    return direction, qggmrf_slice_pair_sum(slice_sums, slice_offsets)
 
 
 def _cone_pixel_xy_mag(pixel_indices, angles, num_rows, num_cols, delta_voxel,
@@ -421,19 +428,20 @@ class ConeBeamModel(TomographyModel):
         return profiles, fns
 
     def _get_update_direction(self, forward_grad, prior_grad, forward_hess,
-                              prior_hess, pixel_indices, dev_index=0):
+                              prior_hess, pixel_indices, dev_index=0, slice_sums=None):
         prof = self._dc_damping_slice_profile()
         if prof is None:
             return super()._get_update_direction(forward_grad, prior_grad,
                                                  forward_hess, prior_hess,
                                                  pixel_indices,
-                                                 dev_index=dev_index)
+                                                 dev_index=dev_index,
+                                                 slice_sums=slice_sums)
         profiles, fns = prof
         prior_hess_t = (prior_hess if torch.is_tensor(prior_hess)
                         else torch.as_tensor(prior_hess, dtype=_F32,
                                              device=forward_grad.device))
         return fns[dev_index](forward_grad, prior_grad, forward_hess,
-                              prior_hess_t, profiles[dev_index])
+                              prior_hess_t, profiles[dev_index], slice_sums)
 
     def _project_points_batch(self, points, view_params):
         # points has shape (N, 3), float64, on the CPU.  view_params has shape (V, 2).

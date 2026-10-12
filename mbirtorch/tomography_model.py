@@ -35,6 +35,12 @@ _F32_EPS = float(np.finfo(np.float32).eps)
 # projection transfers between devices.
 FORWARD_PIXEL_BATCH = 32768
 
+# These two private settings are used only by test scripts.  If _APPROXIMATE_PRIOR_QUADRATIC is
+# True, the line search uses the approximate prior term sum(prior_hess * delta^2).  If
+# _LINE_SEARCH_LOG is a list, each subset update appends a dict of its line search terms.
+_APPROXIMATE_PRIOR_QUADRATIC = False
+_LINE_SEARCH_LOG = None
+
 
 def _warn_deprecated_name(old, new):
     """This function issues a DeprecationWarning that names the old and the new attribute."""
@@ -2173,11 +2179,18 @@ class TomographyModel(ParameterHandler):
 
     # ── the VCD loop ────────────────────────────────────────────────────────
     def _get_update_direction(self, forward_grad, prior_grad, forward_hess,
-                              prior_hess, pixel_indices, dev_index=0):
+                              prior_hess, pixel_indices, dev_index=0, slice_sums=None):
         """This method returns the update direction for one subset of pixels.  The direction
-        is the preconditioned gradient -(forward_grad + prior_grad) / (forward_hess + prior_hess)."""
+        is the preconditioned gradient -(forward_grad + prior_grad) / (forward_hess + prior_hess).
+
+        The method returns the pair (direction, slice_pair_sum).  ``slice_pair_sum`` is the slice
+        term of the exact line search, computed from ``slice_sums`` with
+        :func:`qggmrf.qggmrf_slice_pair_sum`.  It is None when ``slice_sums`` is None."""
         fn = maybe_compile(_diagonal_update_direction, self.compile_enabled)
-        return fn(forward_grad, prior_grad, forward_hess, prior_hess)
+        direction = fn(forward_grad, prior_grad, forward_hess, prior_hess)
+        if slice_sums is None:
+            return direction, None
+        return direction, _qggmrf.qggmrf_slice_pair_sum(slice_sums)
 
     def create_vcd_subset_updater(self, fm_hessian, weights, prox_input=None):
         """
@@ -2193,7 +2206,12 @@ class TomographyModel(ParameterHandler):
 
         Returns:
             (callable) The function vcd_subset_updater(flat_recon, error_sinogram,
-            pixel_indices), which updates the recon and the error sinogram in place.
+            pixel_indices, subset_index), which updates the recon and the error sinogram in
+            place.  ``subset_index`` selects the pair lists of the subset.  Before the subsets
+            of a partition are updated, the function attribute ``stage_halos`` must be called.
+            With the qGGMRF prior, the function attribute ``stage_pair_lists`` must also be
+            called with the pair lists of the partition from
+            :func:`vcd_utils.gen_neighbor_pair_lists`.
         """
         sino_placement, recon_placement = self.sino_placement, self.recon_placement
         devices = sino_placement.devices
@@ -2222,7 +2240,9 @@ class TomographyModel(ParameterHandler):
         def per_dev(fn):
             return [maybe_compile(fn, self.compile_enabled, instance_key=i)
                     for i in range(num_devices)]
-        qggmrf_grad_hess = per_dev(_qggmrf.qggmrf_gradient_and_hessian_at_indices)
+        prior_pass = per_dev(_qggmrf.qggmrf_prior_pass_at_indices)
+        edge_term = per_dev(_qggmrf.qggmrf_edge_term)
+        pair_sum = per_dev(_qggmrf.qggmrf_pair_sum)
         prior_line_terms = per_dev(_prior_line_terms)
         lin_quad_const = per_dev(_forward_lin_quad_const)
         lin_quad_weighted = per_dev(_forward_lin_quad_weighted)
@@ -2246,7 +2266,17 @@ class TomographyModel(ParameterHandler):
             halos['left'], halos['right'] = _sharding.exchange_qggmrf_halos(
                 flat_shards, self.dev2dev_safe)
 
-        def vcd_subset_updater(flat_recon, error_sinogram, pixel_indices):
+        # The pair lists of the current partition hold, for each direction in the slice, the
+        # pairs array on each device, the pair counts, and the neighbor weight of the pairs.
+        pair_lists = []
+
+        def stage_pair_lists(lists):
+            pair_lists[:] = [([torch.as_tensor(pairs).to(dev) for dev in devices], counts,
+                              b_pair)
+                             for (pairs, counts), b_pair in zip(lists, (b[0] + b[1],
+                                                                        b[2] + b[3]))]
+
+        def vcd_subset_updater(flat_recon, error_sinogram, pixel_indices, subset_index=0):
             """This function runs one VCD update on one subset of the partition, in place.  It
             returns flat_recon, error_sinogram, ``l1_for_subset`` (the L1 norm of the update),
             alpha_for_subset, and delta_sumsq_subset."""
@@ -2268,48 +2298,92 @@ class TomographyModel(ParameterHandler):
             if not const_weights:
                 weighted_error_sinogram = None
 
-            # The halos supply the prior terms that cross a boundary between devices.
+            # The halos supply the prior terms that cross a boundary between devices.  The
+            # forward model gradient is computed in place in the output of the back projection.
             def prior_worker(i, dev):
+                forward_grad = back_projected_error.tensors[i].mul_(-fm_constant)
+                forward_hess = fm_constant * fm_hessian.tensors[i][pixel_indices_per_device[i]]
                 if prox_input is None:
-                    grad, hess = _qggmrf.qggmrf_gradient_and_hessian_in_chunks(
+                    grad, hess, slice_sums = _qggmrf.qggmrf_prior_pass_in_chunks(
                         flat_recon.tensors[i], recon_shape, pixel_indices_per_device[i],
-                        qggmrf_params, left_halo=halos['left'][i],
-                        right_halo=halos['right'][i], chunk_function=qggmrf_grad_hess[i])
+                        qggmrf_params, forward_grad, forward_hess,
+                        left_halo=halos['left'][i], right_halo=halos['right'][i],
+                        chunk_function=prior_pass[i])
                 else:
                     grad = _qggmrf.prox_gradient_at_indices(
                         flat_recon.tensors[i], prox_input.tensors[i],
                         pixel_indices_per_device[i], sigma_prox)
                     hess = 1 / (sigma_prox ** 2)
-                return grad, hess
+                    slice_sums = None
+                return forward_grad, forward_hess, grad, hess, slice_sums
 
             prior_terms = _sharding.run_per_device(devices, prior_worker,
                                              executor=self._per_device_pool)
+            del back_projected_error
 
+            # The exact quadratic term of the qGGMRF prior is computed from the approximate
+            # term sum(prior_hess * delta^2).  The code subtracts the edge term and the pair
+            # terms of the slice pairs and of the pairs in each slice.
             def direction_worker(i, dev):
-                prior_grad, prior_hess = prior_terms[i]
-                forward_grad = -fm_constant * back_projected_error.tensors[i]
-                forward_hess = fm_constant * fm_hessian.tensors[i][pixel_indices_per_device[i]]
-                delta_recon = self._get_update_direction(
-                    forward_grad, prior_grad, forward_hess, prior_hess,
-                    pixel_indices_per_device[i], dev_index=i)
+                forward_grad, forward_hess, prior_grad, prior_hess, slice_sums = prior_terms[i]
+                indices = pixel_indices_per_device[i]
+                delta_recon, slice_pair_sum = self._get_update_direction(
+                    forward_grad, prior_grad, forward_hess, prior_hess, indices,
+                    dev_index=i, slice_sums=slice_sums)
                 prior_hess_t = (prior_hess if torch.is_tensor(prior_hess)
                                 else torch.as_tensor(prior_hess,
                                                      dtype=torch.float32,
                                                      device=delta_recon.device))
                 prior_linear_part, prior_quadratic_part = prior_line_terms[i](
                     prior_grad, prior_hess_t, delta_recon)
-                return delta_recon, prior_linear_part, prior_quadratic_part
+                prior_quadratic_approx_part = prior_quadratic_part
+                if prox_input is None:
+                    prior_quadratic_part = (
+                        prior_quadratic_part
+                        - edge_term[i](delta_recon, indices, recon_shape, qggmrf_params,
+                                       halos['left'][i] is None, halos['right'][i] is None)
+                        - slice_pair_sum)
+                    for pairs, counts, b_pair in pair_lists:
+                        prior_quadratic_part = prior_quadratic_part - \
+                            _qggmrf.qggmrf_pair_sum_in_chunks(
+                                flat_recon.tensors[i], indices, delta_recon,
+                                pairs[i][subset_index], int(counts[subset_index]), b_pair,
+                                qggmrf_params, chunk_function=pair_sum[i])
+                return (delta_recon, prior_linear_part, prior_quadratic_part,
+                        prior_quadratic_approx_part)
             direction_results = _sharding.run_per_device(devices, direction_worker,
                                             executor=self._per_device_pool)
-            delta_recon_per_device = [delta for delta, _, _ in direction_results]
-            prior_linear = combine_on_lead(
-                [linear for _, linear, _ in direction_results])
-            prior_quadratic_approx = combine_on_lead(
-                [quadratic for _, _, quadratic in direction_results])
+            delta_recon_per_device = [result[0] for result in direction_results]
+            prior_linear = combine_on_lead([result[1] for result in direction_results])
+            prior_quadratic = combine_on_lead([result[2] for result in direction_results])
+            prior_quadratic_approx = combine_on_lead([result[3] for result in direction_results])
+
+            # The slice pairs that cross a boundary between devices belong to the device before
+            # the boundary.  Each device receives the first slice of the direction of the next
+            # device.
+            if prox_input is None and num_devices > 1:
+                _, delta_right = _sharding.exchange_qggmrf_halos(
+                    _sharding.Shards(delta_recon_per_device, recon_placement),
+                    self.dev2dev_safe)
+
+                def boundary_worker(i, dev):
+                    indices = pixel_indices_per_device[i]
+                    return _qggmrf.qggmrf_boundary_pair_sum(
+                        flat_recon.tensors[i][indices, -1], halos['right'][i][indices],
+                        delta_recon_per_device[i][:, -1], delta_right[i], qggmrf_params)
+                boundary_devices = [i for i in range(num_devices - 1)
+                                    if delta_right[i] is not None]
+                if boundary_devices:
+                    prior_quadratic = prior_quadratic - combine_on_lead(
+                        [boundary_worker(i, devices[i]) for i in boundary_devices])
+                del delta_right
+            prior_quadratic = prior_quadratic.to(torch.float32)
+            if _APPROXIMATE_PRIOR_QUADRATIC:
+                prior_quadratic = prior_quadratic_approx
 
             # These buffers are freed before the projection of the update, because that projection
             # uses much more memory.
-            del prior_terms, back_projected_error, direction_results
+            del prior_terms, direction_results
 
             delta_sinogram = self.sparse_forward_project(
                 _sharding.Shards(delta_recon_per_device, recon_placement), pixel_indices)
@@ -2330,8 +2404,15 @@ class TomographyModel(ParameterHandler):
 
             # alpha stays a tensor on the device, so no subset forces a host synchronization.
             alpha_numerator = forward_linear - prior_linear
-            alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
+            alpha_denominator = forward_quadratic + prior_quadratic + _F32_EPS
             alpha = alpha_numerator / alpha_denominator
+            if _LINE_SEARCH_LOG is not None:
+                _LINE_SEARCH_LOG.append(dict(
+                    forward_linear=float(forward_linear),
+                    forward_quadratic=float(forward_quadratic),
+                    prior_linear=float(prior_linear), prior_quadratic=float(prior_quadratic),
+                    prior_quadratic_approx=float(prior_quadratic_approx),
+                    alpha_unclipped=float(alpha)))
             alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
             alpha_per_device = ([alpha] if num_devices == 1 else
                          [_sharding.move_shard(alpha, dev, self.dev2dev_safe)
@@ -2369,10 +2450,12 @@ class TomographyModel(ParameterHandler):
                     delta_sumsq_subset)
 
         vcd_subset_updater.stage_halos = stage_halos
+        if prox_input is None:
+            vcd_subset_updater.stage_pair_lists = stage_pair_lists
         return vcd_subset_updater
 
     def vcd_partition_iterator(self, vcd_subset_updater, flat_recon, error_sinogram,
-                               partition, rng=None):
+                               partition, rng=None, pair_lists=None):
         """
         This method runs one full iteration of the VCD algorithm over the subsets of the
         partition.  It updates flat_recon and error_sinogram in place.
@@ -2381,6 +2464,8 @@ class TomographyModel(ParameterHandler):
             rng (numpy.random.Generator, optional): The generator that draws the order in which
                 the subsets are visited.  Defaults to None, which uses the global np.random
                 state.
+            pair_lists (tuple, optional): The pair lists of the partition from
+                :func:`vcd_utils.gen_neighbor_pair_lists`.  If None, the method makes them.
 
         Returns:
             (flat_recon, error_sinogram, l1_for_partition, alpha, delta_sumsq_partition): The
@@ -2390,6 +2475,11 @@ class TomographyModel(ParameterHandler):
         """
         if hasattr(vcd_subset_updater, 'stage_halos'):
             vcd_subset_updater.stage_halos(flat_recon)
+        if hasattr(vcd_subset_updater, 'stage_pair_lists'):
+            if pair_lists is None:
+                pair_lists = vcd_utils.gen_neighbor_pair_lists(
+                    partition, self.get_params('recon_shape'))
+            vcd_subset_updater.stage_pair_lists(pair_lists)
         # This random draw must not change, because the tests compare the values at each
         # iteration.
         l1_for_partition = 0
@@ -2401,7 +2491,8 @@ class TomographyModel(ParameterHandler):
         for index in subset_indices:
             subset = partition[index]
             (flat_recon, error_sinogram, l1_for_subset, alpha_for_subset,
-             delta_sumsq_subset) = vcd_subset_updater(flat_recon, error_sinogram, subset)
+             delta_sumsq_subset) = vcd_subset_updater(flat_recon, error_sinogram, subset,
+                                                      subset_index=index)
             l1_for_partition += l1_for_subset
             alpha_sum += alpha_for_subset
             delta_sumsq_partition = delta_sumsq_partition + delta_sumsq_subset
@@ -2576,6 +2667,8 @@ class TomographyModel(ParameterHandler):
             self.logger.debug('--------')
 
         max_iters = partition_sequence.size
+        # The pair lists of each partition are made once, when the partition is first used.
+        pair_lists = {}
         fm_rmse = np.zeros(max_iters)
         pm_loss = np.zeros(max_iters)
         nmae_update = np.zeros(max_iters)
@@ -2588,10 +2681,13 @@ class TomographyModel(ParameterHandler):
         try:
             for i in range(max_iters):
                 partition = partitions[partition_sequence[i]]
+                if prox_input is None and partition_sequence[i] not in pair_lists:
+                    pair_lists[partition_sequence[i]] = vcd_utils.gen_neighbor_pair_lists(
+                        partition, recon_shape)
                 (flat_recon, error_sinogram, l1_for_partition, alpha,
                  delta_sumsq_partition) = self.vcd_partition_iterator(
                     vcd_subset_updater, flat_recon, error_sinogram, partition,
-                    rng=rng)
+                    rng=rng, pair_lists=pair_lists.get(partition_sequence[i]))
 
                 fm_loss_i, recon_l1, es_rmse = self._iteration_stats(
                     error_sinogram, flat_recon, sigma_y, weights,
