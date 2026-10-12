@@ -368,3 +368,31 @@ def test_max_alpha_limits_the_denoiser_step_size(device):
     assert results[None][2] > 0.1
     assert _rel_max(results[0.1][0], results[None][0]) > 1e-3
     assert _rel_max(results[0.1][1], results[None][1]) > 1e-3
+
+
+def test_positivity_flag_keeps_the_denoised_image_non_negative():
+    """With positivity_flag set, the single-device, stack, and two-shard denoisers all
+    return a non-negative image, up to float rounding.  Without it, the same input gives
+    negative values."""
+    shape = (16, 16, 6)
+    noisy = 0.1 * np.random.RandomState(6).randn(*shape).astype(np.float32)
+
+    def run(positivity, devices):
+        denoiser = mbirtorch.QGGMRFDenoiser(shape)
+        denoiser.configure_devices(devices=devices)
+        denoiser.set_params(no_warning=True, verbose=0, positivity_flag=positivity)
+        kwargs = dict(sigma_noise=0.1, max_iterations=3, stop_threshold_change_pct=0.0)
+        np.random.seed(0)
+        if len(devices) > 1:
+            out, _ = denoiser.denoise(denoiser._shard_recon(noisy), output_sharded=True,
+                                      **kwargs)
+            return [np.asarray(out.gather())]
+        single, _ = denoiser.denoise(noisy, **kwargs)
+        np.random.seed(0)
+        stack, _ = denoiser.denoise_stack(noisy[None], **kwargs)
+        return [np.asarray(single), np.asarray(stack)[0]]
+
+    assert min(float(out.min()) for out in run(False, ['cpu'])) < 0
+    # A clipped pixel lands at zero up to float rounding, about 1e-22 here.
+    for out in run(True, ['cpu']) + run(True, ['cpu', 'cpu']):
+        assert float(out.min()) >= -1e-12

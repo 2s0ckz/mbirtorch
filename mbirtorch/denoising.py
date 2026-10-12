@@ -72,11 +72,13 @@ def _sample_tiles(num_rows, num_cols, num_leading, point_budget):
 
 
 def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
-                        fm_constant, qggmrf_params, max_alpha, image_shape, pair_lists):
+                        fm_constant, qggmrf_params, max_alpha, positivity, image_shape,
+                        pair_lists):
     """This function performs one VCD subset update for the identity forward model.  The
     function changes ``flat_image`` and ``flat_error_image`` in place.  It returns
     (flat_image, flat_error_image, l1, alpha), where ``l1`` is the L1 norm of the update.
-    The step size alpha is at most ``max_alpha``.
+    The step size alpha is at most ``max_alpha``.  If ``positivity`` is True, the update
+    keeps every pixel non-negative.
     ``pair_lists`` holds the pair lists of the subset, as for
     :func:`qggmrf.qggmrf_exact_quadratic`.  The tests in tests/test_denoiser.py compare against
     stored values, so the order of operations must not change."""
@@ -107,6 +109,12 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
     alpha = alpha_numerator / alpha_denominator
     alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
 
+    # The positivity constraint clips the update so that image + alpha * delta >= 0.
+    if positivity:
+        delta_recon_at_indices = torch.maximum(
+            -flat_image[pixel_indices] / (alpha + _F32_EPS), delta_recon_at_indices)
+        delta_sinogram = delta_recon_at_indices
+
     delta_recon_at_indices = alpha * delta_recon_at_indices
     flat_image.index_add_(0, pixel_indices, delta_recon_at_indices)
 
@@ -117,8 +125,8 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
 
 
 def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
-                                fm_constant, qggmrf_params, max_alpha, image_shape, active,
-                                pair_lists):
+                                fm_constant, qggmrf_params, max_alpha, positivity,
+                                image_shape, active, pair_lists):
     """This function performs one VCD subset update for a stack of images with the identity
     forward model.  The function computes the same update as :func:`vcd_subset_denoiser`,
     with an added first axis that indexes the volumes.
@@ -163,6 +171,12 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
     alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
     # A volume that has stopped gets a step size of zero.
     alpha = torch.where(active, alpha, torch.zeros_like(alpha))
+
+    # The positivity constraint clips the update so that image + alpha * delta >= 0.
+    if positivity:
+        delta_recon_at_indices = torch.maximum(
+            -flat_image[:, pixel_indices] / (alpha[:, None, None] + _F32_EPS),
+            delta_recon_at_indices)
 
     delta_scaled = alpha[:, None, None] * delta_recon_at_indices
     flat_image.index_add_(1, pixel_indices, delta_scaled)
@@ -629,6 +643,7 @@ class QGGMRFDenoiser(TomographyModel):
         b = _qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts)
         qggmrf_params = (b, sigma_x, p, q, T)
         max_alpha = self.get_params('max_alpha')
+        positivity = bool(self.get_params('positivity_flag'))
         max_iters = max_iterations
         stop_thresh = stop_threshold_change_pct / 100.0
 
@@ -639,7 +654,7 @@ class QGGMRFDenoiser(TomographyModel):
         if isinstance(image_t, _sharding.Shards):
             flat_image, nmae_update, alpha_values, num_iters = self._denoise_sharded(
                 image_t, init_t, partition, fm_constant, qggmrf_params, max_alpha,
-                tuple(image_shape), max_iters, stop_thresh, first_iteration, verbose)
+                positivity, tuple(image_shape), max_iters, stop_thresh, first_iteration, verbose)
             denoised = _sharding.Shards(
                 [t.reshape(s.shape) for t, s in zip(flat_image.tensors, image_t.tensors)],
                 flat_image.placement)
@@ -660,7 +675,7 @@ class QGGMRFDenoiser(TomographyModel):
                         flat_image, flat_error_image, l1_subset, alpha_subset = \
                             subset_denoiser(flat_image, flat_error_image, partition[k],
                                             fm_constant, qggmrf_params, max_alpha,
-                                            tuple(image_shape), pair_lists[k])
+                                            positivity, tuple(image_shape), pair_lists[k])
                         l1_accum = l1_accum + l1_subset
                         alpha_accum = alpha_accum + alpha_subset
 
@@ -691,8 +706,8 @@ class QGGMRFDenoiser(TomographyModel):
         return (denoised if output_sharded else self._gather_recon(denoised)), denoiser_dict
 
     def _denoise_sharded(self, image_sh, init_sh, partition, fm_constant,
-                         qggmrf_params, max_alpha, image_shape, max_iters, stop_thresh,
-                         first_iteration, verbose):
+                         qggmrf_params, max_alpha, positivity, image_shape, max_iters,
+                         stop_thresh, first_iteration, verbose):
         """This method runs the denoising iterations on several devices, with the image
         divided by slices.  The method returns (flat_image, nmae history, alpha history,
         num_iters), where ``flat_image`` is a Shards."""
@@ -794,7 +809,14 @@ class QGGMRFDenoiser(TomographyModel):
                              for dev in devices])
 
                         def apply_worker(j, dev):
-                            step = alpha_per_device[j] * deltas[j]
+                            delta = deltas[j]
+                            # The positivity constraint clips the update so that
+                            # image + alpha * delta >= 0.
+                            if positivity:
+                                delta = torch.maximum(
+                                    -flat_image.tensors[j][idx[j]]
+                                    / (alpha_per_device[j] + _F32_EPS), delta)
+                            step = alpha_per_device[j] * delta
                             flat_image.tensors[j].index_add_(0, idx[j], step)
                             flat_error.tensors[j].index_add_(0, idx[j], -step)
                             return torch.sum(torch.abs(step))
@@ -1035,6 +1057,7 @@ class QGGMRFDenoiser(TomographyModel):
             ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
         qggmrf_params = (_qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts), sigma_x, p, q, T)
         max_alpha = self.get_params('max_alpha')
+        positivity = bool(self.get_params('positivity_flag'))
         stop_thresh = stop_threshold_change_pct / 100.0
         # Each denoiser object gets its own compiled function, named by its own number.
         subset_denoiser = maybe_compile(vcd_subset_denoiser_batched,
@@ -1088,8 +1111,8 @@ class QGGMRFDenoiser(TomographyModel):
                 del flat
                 counts, history = self._sweep_stack(
                     flat_image, flat_error_image, partition, fm_constant,
-                    qggmrf_params, max_alpha, image_shape, max_iterations, stop_thresh,
-                    subset_denoiser, pair_lists)
+                    qggmrf_params, max_alpha, positivity, image_shape, max_iterations,
+                    stop_thresh, subset_denoiser, pair_lists)
                 real = b1 - b0
                 result = flat_image[:real].reshape((real,) + image_shape)
                 if single:
@@ -1113,8 +1136,8 @@ class QGGMRFDenoiser(TomographyModel):
 
     @staticmethod
     def _sweep_stack(flat_image, flat_error_image, partition, fm_constant,
-                     qggmrf_params, max_alpha, image_shape, max_iters, stop_thresh,
-                     subset_denoiser, pair_lists):
+                     qggmrf_params, max_alpha, positivity, image_shape, max_iters,
+                     stop_thresh, subset_denoiser, pair_lists):
         """This method runs the denoising iterations in place on one batch of volumes.  Each
         volume stops when its change falls below ``stop_thresh`` or after ``max_iters``
         iterations.  ``pair_lists`` holds the pair lists of each subset.
@@ -1135,7 +1158,8 @@ class QGGMRFDenoiser(TomographyModel):
             for k in range(partition.shape[0]):
                 flat_image, flat_error_image, l1_subset, _alpha = subset_denoiser(
                     flat_image, flat_error_image, partition[k], fm_constant,
-                    qggmrf_params, max_alpha, tuple(image_shape), active, pair_lists[k])
+                    qggmrf_params, max_alpha, positivity, tuple(image_shape), active,
+                    pair_lists[k])
                 l1_accum = l1_accum + l1_subset
             # The code reads from the device once per iteration.  A volume of zeros gives nan.
             stats = torch.stack([l1_accum, stack_l1_norm(flat_image)])
