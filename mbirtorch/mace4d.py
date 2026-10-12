@@ -353,7 +353,7 @@ class MACE4DModel(ParameterHandler):
 
         self.set_params(no_warning=True, no_compile=True,
                         mace_prior_weight=0.5, rho_mann=0.5, prox_num_iterations=3,
-                        prox_stop_threshold=0.02, prox_partition_advance=1.0,
+                        prox_partition_advance=1.0,
                         prox_warm_start=True, denoiser_warm_start=False, sigma_prox=None,
                         dejitter=True, dejitter_verbose=0,
                         sigma_noise=None, nbr_weight_time=1.0, sharpness=0.0,
@@ -379,7 +379,6 @@ class MACE4DModel(ParameterHandler):
             rho_mann (float): The step size of the consensus iteration.  Defaults to 0.5.
             prox_num_iterations (int): The number of iterations of each data-fit call.
                 Defaults to 3.
-            prox_stop_threshold (float): This parameter has no effect.  Defaults to 0.02.
             prox_partition_advance (float): The number of entries of the partition sequence
                 that each data-fit call moves forward in each iteration.  Defaults to 1.0.
             prox_warm_start (bool): If True, each data-fit call starts from the previous output
@@ -415,6 +414,9 @@ class MACE4DModel(ParameterHandler):
         Example:
             >>> mace.set_params(mace_prior_weight=0.5, rho_mann=0.5, dejitter=True)
         """
+        if kwargs.pop('prox_stop_threshold', None) is not None:
+            warnings.warn('prox_stop_threshold has no effect and will be removed in a future release.',
+                          FutureWarning, stacklevel=2)
         if 'mace_prior_weight' in kwargs:
             _normalize_prior_weights(kwargs['mace_prior_weight'])
         if 'denoise_slab_gb' in kwargs and not float(kwargs['denoise_slab_gb']) > 0:
