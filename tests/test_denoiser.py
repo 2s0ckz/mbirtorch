@@ -339,3 +339,32 @@ def _auto_denoiser(shape, device, sigma_noise=0.1):
 
 def _rel(a, b):
     return abs(float(a) - float(b)) / abs(float(b))
+
+
+def test_max_alpha_limits_the_denoiser_step_size(device):
+    """The model parameter max_alpha bounds the step size of the denoiser.
+    A small max_alpha caps every step, so a short denoise and a short stack
+    denoise both differ from runs with the default."""
+    shape = (16, 16, 4)
+    noisy = 0.1 * np.random.RandomState(5).randn(*shape).astype(np.float32)
+
+    results = {}
+    for max_alpha in (None, 0.1):
+        denoiser = mbirtorch.QGGMRFDenoiser(shape)
+        denoiser.configure_devices(devices=[device])
+        denoiser.set_params(no_warning=True, verbose=0)
+        if max_alpha is not None:
+            denoiser.set_params(no_warning=True, max_alpha=max_alpha)
+        np.random.seed(0)
+        single, d = denoiser.denoise(noisy, sigma_noise=0.1, max_iterations=3,
+                                     stop_threshold_change_pct=0.0)
+        np.random.seed(0)
+        stack, _ = denoiser.denoise_stack(noisy[None], sigma_noise=0.1, max_iterations=3,
+                                          stop_threshold_change_pct=0.0)
+        alphas = d['recon_params']['alpha_values']
+        results[max_alpha] = (np.asarray(single), np.asarray(stack)[0], max(alphas))
+
+    assert results[0.1][2] <= 0.1 + 1e-6
+    assert results[None][2] > 0.1
+    assert _rel_max(results[0.1][0], results[None][0]) > 1e-3
+    assert _rel_max(results[0.1][1], results[None][1]) > 1e-3

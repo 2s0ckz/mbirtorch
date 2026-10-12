@@ -210,7 +210,7 @@ setting ``sharpness`` or ``snr_db`` turns it back on.
        happens.
    * - ``max_alpha``
      - 1.5
-     - The largest step the update of a voxel may take.
+     - The largest step size α of a VCD update.  Each update moves the voxels of one subset by α times their update direction, with α chosen by the line search.  α is reduced to this value when the line search gives a larger one.  Limiting the step reduces the subset noise.
    * - ``granularity``
      - [1, 2, 4, ..., 128]
      - The numbers of subsets into which the voxels are divided for the partitions used by the
