@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from . import _sharding
+from ._memory_estimate import PRIOR_CHUNK_BYTES, QGGMRF_CYLINDERS_EAGER
 
 _F32_EPS = torch.finfo(torch.float32).eps
 
@@ -132,6 +133,60 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
         gradient = gradient + b_tilde_2 * delta
         hessian = hessian + b_tilde_2
 
+    return gradient, hessian
+
+
+def qggmrf_gradient_and_hessian_in_chunks(flat_recon, recon_shape, pixel_indices,
+                                           qggmrf_params, left_halo=None, right_halo=None,
+                                           chunk_function=None,
+                                           max_chunk_bytes=PRIOR_CHUNK_BYTES):
+    """
+    This function computes the same gradient and Hessian diagonal as
+    :func:`qggmrf_gradient_and_hessian_at_indices`, but it works on one chunk of pixels at a
+    time.  The temporary arrays of one chunk use at most ``max_chunk_bytes`` bytes.  The
+    results are written into two arrays of shape (N_indices, num_slices).
+
+    Every chunk has the same number of pixels, so a compiled ``chunk_function`` compiles once.
+    The last chunk is padded by repeating the last pixel index, and the padded results are
+    discarded.
+
+    Args:
+        flat_recon, recon_shape, pixel_indices, qggmrf_params, left_halo, right_halo: The
+            same as for :func:`qggmrf_gradient_and_hessian_at_indices`.
+        chunk_function (callable or None): The function that computes one chunk.  It has the
+            signature of :func:`qggmrf_gradient_and_hessian_at_indices`, and it may be a
+            compiled form of that function.  None uses that function itself.
+        max_chunk_bytes (int): The most bytes that the temporary arrays of one chunk use.
+
+    Returns:
+        tuple of two tensors (first_derivative, second_derivative), each of shape
+        (N_indices, num_slices).
+    """
+    if chunk_function is None:
+        chunk_function = qggmrf_gradient_and_hessian_at_indices
+    num_indices = pixel_indices.shape[0]
+    num_slices = flat_recon.shape[1]
+    # A device can hold no slices.
+    bytes_per_pixel = max(1, QGGMRF_CYLINDERS_EAGER * num_slices * flat_recon.element_size())
+    chunk_size = max(1, int(max_chunk_bytes) // bytes_per_pixel)
+    if num_indices <= chunk_size:
+        return chunk_function(flat_recon, recon_shape, pixel_indices, qggmrf_params,
+                              left_halo=left_halo, right_halo=right_halo)
+
+    gradient = torch.empty((num_indices, num_slices), dtype=flat_recon.dtype,
+                           device=flat_recon.device)
+    hessian = torch.empty_like(gradient)
+    for start in range(0, num_indices, chunk_size):
+        stop = min(start + chunk_size, num_indices)
+        chunk_indices = pixel_indices[start:stop]
+        if stop - start < chunk_size:
+            padding = chunk_indices[-1:].expand(chunk_size - (stop - start))
+            chunk_indices = torch.cat((chunk_indices, padding))
+        chunk_gradient, chunk_hessian = chunk_function(
+            flat_recon, recon_shape, chunk_indices, qggmrf_params,
+            left_halo=left_halo, right_halo=right_halo)
+        gradient[start:stop] = chunk_gradient[:stop - start]
+        hessian[start:stop] = chunk_hessian[:stop - start]
     return gradient, hessian
 
 

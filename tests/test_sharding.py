@@ -268,6 +268,28 @@ def test_qggmrf_halos_match_full_volume():
     assert lh3[2] is None and rh3[2] is None  # the shard with no slices
 
 
+def test_qggmrf_chunks_match_one_call():
+    # The prior computed on chunks of pixels, with a padded last chunk, matches one call on
+    # all of the pixels.  CPU kernels can differ in the last bit, so the check is relative.
+    from mbirtorch import qggmrf
+    from mbirtorch._memory_estimate import QGGMRF_CYLINDERS_EAGER
+    rng = np.random.RandomState(5)
+    rows, cols, S = 9, 7, 6
+    flat = torch.as_tensor(rng.rand(rows * cols, S).astype(np.float32))
+    left = torch.as_tensor(rng.rand(rows * cols).astype(np.float32))
+    right = torch.as_tensor(rng.rand(rows * cols).astype(np.float32))
+    idx = torch.as_tensor(rng.choice(rows * cols, 23, replace=False))
+    params = ((1.0, 1.0, 1.0, 1.0, 0.8, 0.8), 0.3, 2.0, 1.2, 1.0)
+    ref = qggmrf.qggmrf_gradient_and_hessian_at_indices(
+        flat, (rows, cols, S), idx, params, left_halo=left, right_halo=right)
+    out = qggmrf.qggmrf_gradient_and_hessian_in_chunks(
+        flat, (rows, cols, S), idx, params, left_halo=left, right_halo=right,
+        max_chunk_bytes=5 * QGGMRF_CYLINDERS_EAGER * S * 4)
+    for o, r in zip(out, ref):
+        assert o.shape == r.shape
+        assert float((o - r).abs().max() / r.abs().max()) < 1e-6
+
+
 def test_placements_refresh_on_geometry_change():
     # Panel finding: a geometry-changing set_params after configure_devices
     # left the placements' axis lengths stale, and the placement functions silently

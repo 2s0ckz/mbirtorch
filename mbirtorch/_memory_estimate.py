@@ -25,6 +25,9 @@ _INT64_BYTES = 8
 # chooses between the compiled count and the eager count.
 QGGMRF_CYLINDERS_COMPILED = 9
 QGGMRF_CYLINDERS_EAGER = 16
+# The subset update computes the qGGMRF prior on chunks of pixels.  The temporary arrays of
+# one chunk use at most this many bytes.  The chunk size is set with the eager count.
+PRIOR_CHUNK_BYTES = 2 ** 30
 # The proximal map prior acts on each voxel separately.  It holds four cylinder arrays: the
 # recon, the prox input, their difference, and the scaled result.
 PROX_CYLINDERS = 4
@@ -944,23 +947,29 @@ def estimate_peak_device_bytes(plan):
                              base_terms=stats_base_terms))
 
     # ── the subset update, once for each granularity in the sequence ─────────
-    prior_cylinders = PROX_CYLINDERS if plan.prox else plan.qggmrf_cylinders
     for granularity in plan.granularities:
         p_sub = math.ceil(plan.num_pixels_full / max(1, int(granularity)))
         index_bytes = per_dev(lambda i: p_sub * _INT64_BYTES)
+        if plan.prox:
+            prior_terms = [('prior cylinders', per_dev(
+                lambda i: PROX_CYLINDERS * cyl(i, p_sub)))]
+        else:
+            prior_terms = [
+                ('prior gradient and hessian', per_dev(lambda i: 2 * cyl(i, p_sub))),
+                ('prior chunk', per_dev(lambda i: min(
+                    PRIOR_CHUNK_BYTES, plan.qggmrf_cylinders * cyl(i, p_sub)))),
+            ]
         sub_phases = {
-            'prior': [
-                ('prior cylinders', per_dev(
-                    lambda i: prior_cylinders * cyl(i, p_sub))),
-            ],
             # This entry lists only the arrays that the back projection holds throughout.
             # back_phases below builds the two steps of the back projection and their terms.
             'back projection': [
-                ('prior gradient and hessian',
-                 per_dev(lambda i: 2 * cyl(i, p_sub))),
                 ('weighted error sinogram', per_dev(
                     lambda i: sino_dev(i) if plan.weights_supplied else 0)),
             ],
+            # The prior runs after the back projection, so it also holds the output of the
+            # back projection.
+            'prior': [('back projection output', per_dev(lambda i: cyl(i, p_sub)))]
+            + prior_terms,
             'update direction': [
                 ('direction cylinders', per_dev(
                     lambda i: DIRECTION_CYLINDERS * cyl(i, p_sub))),

@@ -2253,23 +2253,6 @@ class TomographyModel(ParameterHandler):
             pixel_indices_per_device = [torch.as_tensor(pixel_indices, dtype=torch.int64).to(dev)
                        for dev in devices]
 
-            # The halos supply the prior terms that cross a boundary between devices.
-            def prior_worker(i, dev):
-                if prox_input is None:
-                    grad, hess = qggmrf_grad_hess[i](
-                        flat_recon.tensors[i], recon_shape, pixel_indices_per_device[i],
-                        qggmrf_params, left_halo=halos['left'][i],
-                        right_halo=halos['right'][i])
-                else:
-                    grad = _qggmrf.prox_gradient_at_indices(
-                        flat_recon.tensors[i], prox_input.tensors[i],
-                        pixel_indices_per_device[i], sigma_prox)
-                    hess = 1 / (sigma_prox ** 2)
-                return grad, hess
-
-            prior_terms = _sharding.run_per_device(devices, prior_worker,
-                                             executor=self._per_device_pool)
-
             # The forward model loss is 1/(2 sigma_y^2) || error_sinogram - A delta ||_weights^2.
             if const_weights:
                 weighted_error_sinogram = error_sinogram
@@ -2284,6 +2267,23 @@ class TomographyModel(ParameterHandler):
             back_projected_error = self.sparse_back_project(weighted_error_sinogram, pixel_indices)
             if not const_weights:
                 weighted_error_sinogram = None
+
+            # The halos supply the prior terms that cross a boundary between devices.
+            def prior_worker(i, dev):
+                if prox_input is None:
+                    grad, hess = _qggmrf.qggmrf_gradient_and_hessian_in_chunks(
+                        flat_recon.tensors[i], recon_shape, pixel_indices_per_device[i],
+                        qggmrf_params, left_halo=halos['left'][i],
+                        right_halo=halos['right'][i], chunk_function=qggmrf_grad_hess[i])
+                else:
+                    grad = _qggmrf.prox_gradient_at_indices(
+                        flat_recon.tensors[i], prox_input.tensors[i],
+                        pixel_indices_per_device[i], sigma_prox)
+                    hess = 1 / (sigma_prox ** 2)
+                return grad, hess
+
+            prior_terms = _sharding.run_per_device(devices, prior_worker,
+                                             executor=self._per_device_pool)
 
             def direction_worker(i, dev):
                 prior_grad, prior_hess = prior_terms[i]
