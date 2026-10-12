@@ -35,12 +35,6 @@ _F32_EPS = float(np.finfo(np.float32).eps)
 # projection transfers between devices.
 FORWARD_PIXEL_BATCH = 32768
 
-# These two private settings are used only by test scripts.  If _APPROXIMATE_PRIOR_QUADRATIC is
-# True, the line search uses the approximate prior term sum(prior_hess * delta^2).  If
-# _LINE_SEARCH_LOG is a list, each subset update appends a dict of its line search terms.
-_APPROXIMATE_PRIOR_QUADRATIC = False
-_LINE_SEARCH_LOG = None
-
 
 def _warn_deprecated_name(old, new):
     """This function issues a DeprecationWarning that names the old and the new attribute."""
@@ -2336,7 +2330,6 @@ class TomographyModel(ParameterHandler):
                                                      device=delta_recon.device))
                 prior_linear_part, prior_quadratic_part = prior_line_terms[i](
                     prior_grad, prior_hess_t, delta_recon)
-                prior_quadratic_approx_part = prior_quadratic_part
                 if prox_input is None:
                     prior_quadratic_part = (
                         prior_quadratic_part
@@ -2349,14 +2342,12 @@ class TomographyModel(ParameterHandler):
                                 flat_recon.tensors[i], indices, delta_recon,
                                 pairs[i][subset_index], int(counts[subset_index]), b_pair,
                                 qggmrf_params, chunk_function=pair_sum[i])
-                return (delta_recon, prior_linear_part, prior_quadratic_part,
-                        prior_quadratic_approx_part)
+                return delta_recon, prior_linear_part, prior_quadratic_part
             direction_results = _sharding.run_per_device(devices, direction_worker,
                                             executor=self._per_device_pool)
             delta_recon_per_device = [result[0] for result in direction_results]
             prior_linear = combine_on_lead([result[1] for result in direction_results])
             prior_quadratic = combine_on_lead([result[2] for result in direction_results])
-            prior_quadratic_approx = combine_on_lead([result[3] for result in direction_results])
 
             # The slice pairs that cross a boundary between devices belong to the device before
             # the boundary.  Each device receives the first slice of the direction of the next
@@ -2378,8 +2369,6 @@ class TomographyModel(ParameterHandler):
                         [boundary_worker(i, devices[i]) for i in boundary_devices])
                 del delta_right
             prior_quadratic = prior_quadratic.to(torch.float32)
-            if _APPROXIMATE_PRIOR_QUADRATIC:
-                prior_quadratic = prior_quadratic_approx
 
             # These buffers are freed before the projection of the update, because that projection
             # uses much more memory.
@@ -2406,13 +2395,6 @@ class TomographyModel(ParameterHandler):
             alpha_numerator = forward_linear - prior_linear
             alpha_denominator = forward_quadratic + prior_quadratic + _F32_EPS
             alpha = alpha_numerator / alpha_denominator
-            if _LINE_SEARCH_LOG is not None:
-                _LINE_SEARCH_LOG.append(dict(
-                    forward_linear=float(forward_linear),
-                    forward_quadratic=float(forward_quadratic),
-                    prior_linear=float(prior_linear), prior_quadratic=float(prior_quadratic),
-                    prior_quadratic_approx=float(prior_quadratic_approx),
-                    alpha_unclipped=float(alpha)))
             alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
             alpha_per_device = ([alpha] if num_devices == 1 else
                          [_sharding.move_shard(alpha, dev, self.dev2dev_safe)
