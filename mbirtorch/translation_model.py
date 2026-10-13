@@ -389,7 +389,7 @@ class TranslationModel(TomographyModel):
         view, so this warning is not needed."""
         return
 
-    def tct_direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
+    def direct_filter_tct(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         This method applies the filter of the TCT direct reconstruction to a sinogram.
 
@@ -449,7 +449,7 @@ class TranslationModel(TomographyModel):
             filtered = filter_views(sinogram)
         return filtered if output_sharded else self._gather_sinogram(filtered)
 
-    def recon_tct_direct(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_direct_tct(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         This method reconstructs a volume from a sinogram by TCT direct reconstruction algorithm.
 
@@ -479,7 +479,7 @@ class TranslationModel(TomographyModel):
         self._apply_device_policy(workload='direct')
         # The filter places the sinogram on the devices.  This method keeps no reference to the
         # device sinogram during the back projection.
-        filtered_sinogram = self.tct_direct_filter(sinogram, filter_name=filter_name,
+        filtered_sinogram = self.direct_filter_tct(sinogram, filter_name=filter_name,
                                                    output_sharded=True)
         recon = self._back_project(filtered_sinogram, output_sharded=True)
         del filtered_sinogram
@@ -501,14 +501,34 @@ class TranslationModel(TomographyModel):
     def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
         """This method reconstructs a volume by the TCT direct reconstruction algorithm.
 
-        This method is the same as :meth:`recon_tct_direct`.  See
+        This method is the same as :meth:`recon_direct_tct`.  See
         :meth:`TomographyModel.recon_direct` for the arguments and return value.
         """
-        return self.recon_tct_direct(sinogram, filter_name=filter_name,
+        return self.recon_direct_tct(sinogram, filter_name=filter_name,
                                      output_sharded=output_sharded)
 
     def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
-        return self.tct_direct_filter(sinogram, filter_name=filter_name,
+        return self.direct_filter_tct(sinogram, filter_name=filter_name,
+                                      output_sharded=output_sharded)
+
+    def recon_fdk(self, sinogram, filter_name="ramp", output_sharded=False):
+        """This method is deprecated.  It warns and then calls :meth:`recon_direct_tct`.
+
+        Earlier releases reconstructed the translation geometry by the FDK algorithm.  The
+        result now differs from that of the earlier releases.
+        """
+        warnings.warn('TranslationModel.recon_fdk is deprecated and will be removed in a future '
+                      'release.  It now returns the TCT direct reconstruction.  Use '
+                      'recon_direct_tct instead.', FutureWarning, stacklevel=2)
+        return self.recon_direct_tct(sinogram, filter_name=filter_name,
+                                     output_sharded=output_sharded)
+
+    def fdk_filter(self, sinogram, filter_name="ramp", output_sharded=False):
+        """This method is deprecated.  It warns and then calls :meth:`direct_filter_tct`."""
+        warnings.warn('TranslationModel.fdk_filter is deprecated and will be removed in a future '
+                      'release.  It now applies the TCT direct filter.  Use direct_filter_tct '
+                      'instead.', FutureWarning, stacklevel=2)
+        return self.direct_filter_tct(sinogram, filter_name=filter_name,
                                       output_sharded=output_sharded)
 
     def _tct_translation_step(self):

@@ -1,5 +1,5 @@
 # This script reconstructs Translation CT BGA data from the Zeiss scanner with the TCT direct reconstruction
-# (TranslationModel.recon_tct_direct) and with MBIR.  The setup follows mbirjax/experiments/translation/TCT_BGA_physical_exp.py.
+# (TranslationModel.recon_direct_tct) and with MBIR.  The setup follows mbirjax/experiments/translation/TCT_BGA_physical_exp.py.
 #
 # Usage: python TCT_BGA_direct_recon_exp.py [path or URL of purdue_BGA_xrm.tgz] [--direct-only]
 # The path defaults to the data depot.  The option --direct-only skips MBIR, for example for a quick test on a
@@ -37,7 +37,7 @@ def main(dataset_url="/depot/bouman/data/Translation/purdue_BGA_xrm.tgz", run_mb
 
     # TCT direct reconstruction
     t0 = time.time()
-    direct_recon = tct_model.recon_tct_direct(sino)
+    direct_recon = tct_model.recon_direct_tct(sino)
     print(f'TCT direct recon time: {time.time() - t0:.1f} s')
     mt.export_recon_hdf5(os.path.join(output_path, "TCT_BGA_direct_recon.h5"), direct_recon,
                          recon_dict=None, top_margin=0, bottom_margin=0)
