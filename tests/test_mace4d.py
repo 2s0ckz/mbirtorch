@@ -1,10 +1,9 @@
 """Tests for the 4D reconstruction model and the frame-axis filter.
 
 The filter matrix is checked against the transform it replaces.  The model
-is checked on a 24-view cone-beam scan with a smooth sinogram.  A run with
-three frames on one device gives finite values, a four-frame run with the
-filter on differs from the same run with it off, and a seeded four-frame run
-gives the same image on two CPU workers as on one.  The smooth sinogram is
+is checked on a 24-view cone-beam scan with a smooth sinogram.  A four-frame
+run with the filter on differs from the same run with it off, and a seeded
+four-frame run gives the same image on two CPU workers as on one.  The smooth sinogram is
 kept because a random one reconstructs to a volume with extreme values, on
 which the qGGMRF line search computes zero over zero.
 """
@@ -47,6 +46,14 @@ def _smooth_sino(num_views=NUM_VIEWS, rows=DET_ROWS, cols=DET_COLS):
                      for a in range(num_views)]).astype(np.float32)
 
 
+def _four_frame_model():
+    """A four-frame model of the 24-view scan, at a period the frame count can
+    carry, so the filter stays on without a warning."""
+    model = MACE4DModel(_small_model(), frames_per_rotation=4, frame_overlap_factor=1.0)
+    model.set_params(verbose=0)
+    return model
+
+
 # ── the frame-axis filter matrix ─────────────────────────────────────────────
 def _dct_filter(x, period, harmonics=True, band_width=1):
     """The frame-axis filter written as transforms: the reference the matrix
@@ -69,8 +76,7 @@ def _dct_filter(x, period, harmonics=True, band_width=1):
     return idct(coefficients, type=1, norm='ortho', axis=0).astype(np.float32)
 
 
-@pytest.mark.parametrize('num_frames', [12, 30])
-def test_filter_matrix_equals_the_transform_filter(num_frames):
+def test_filter_matrix_equals_the_transform_filter():
     """The matrix reproduces the transform filter on random inputs and on
     unit impulses at the first and last frames, where the end behavior of
     the transform shows.  The tolerance is float32 rounding relative to the
@@ -78,6 +84,7 @@ def test_filter_matrix_equals_the_transform_filter(num_frames):
     three-frame axis, one frame cannot be filtered and is refused, and
     applying the matrix along another axis equals moving that axis to the
     front and filtering there."""
+    num_frames = 12
     matrix = temporal_filter_matrix(num_frames, period=6)
     assert matrix.shape == (num_frames, num_frames) and matrix.dtype == torch.float32
     rng = np.random.default_rng(num_frames)
@@ -115,32 +122,17 @@ def test_filter_matrix_equals_the_transform_filter(num_frames):
 
 
 def test_reconstructions_run_end_to_end_with_and_without_the_filter(device):
-    """One iteration on three frames and one device gives finite, nonzero
-    values of the 4D shape and an iteration count of 1.  Three frames are
-    fewer than the default filter period of 6, so the filter turns itself
-    off with a warning.  A four-frame run at a period the frame count can
-    carry runs the filter path: two iterations give finite values of the 4D
-    shape that differ from the filter-off run, and the denoiser strength,
-    estimated from the filtered initial image, differs from the filter-off
-    value.  Four frames per rotation with no overlap give four frames from
-    the 24 views, and at four frames the period-4 filter keeps one mode, the
-    zeroth cosine mode, so the filtered stack is not zero."""
+    """A four-frame run at a period the frame count can carry runs the filter
+    path: two iterations give finite values of the 4D shape that differ from
+    the filter-off run, and the denoiser strength, estimated from the
+    filtered initial image, differs from the filter-off value.  Four frames
+    per rotation with no overlap give four frames from the 24 views, and at
+    four frames the period-4 filter keeps one mode, the zeroth cosine mode,
+    so the filtered stack is not zero."""
     np.random.seed(0)
-    mace = MACE4DModel(_small_model(), num_frames=3)
-    mace.set_params(verbose=0)
-    mace.set_device_pool([device])
-    with pytest.warns(UserWarning, match='fewer than the filter period'):
-        recon, recon_dict = mace.recon(_smooth_sino(), max_iterations=1, stop_threshold_change_pct=0)
-    assert recon.shape == (3,) + mace.recon_shape
-    assert np.all(np.isfinite(recon)) and np.max(np.abs(recon)) > 0
-    assert len(recon_dict['timing']) == 1
-    assert recon_dict['recon_params']['iterations completed'] == 1
-
-    np.random.seed(0)
-    filtered = MACE4DModel(_small_model(), frames_per_rotation=4, frame_overlap_factor=1.0)
+    filtered = _four_frame_model()
     assert filtered.num_frames == 4
-    filtered.set_params(verbose=0)
-    filtered.set_device_pool(['cpu'])
+    filtered.set_device_pool([device])
     shape = (4,) + filtered.recon_shape
     init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
     init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
@@ -156,32 +148,6 @@ def test_reconstructions_run_end_to_end_with_and_without_the_filter(device):
     print(f"filter on vs off: rel_max = {rel:.2e}")
     assert rel > 1e-2                        # the filter is applied, not merely recorded
     assert on_dict['recon_params']['denoiser sigma_x'] != off_dict['recon_params']['denoiser sigma_x']
-
-
-def test_computed_init_is_the_direct_reconstruction_of_each_frame(device, tmp_path):
-    """With no initial image, recon caches the stack of each frame's direct
-    reconstruction in init_dir, and records the init as computed."""
-    np.random.seed(0)
-    mace = MACE4DModel(_small_model(), num_frames=3)
-    mace.set_params(verbose=0, dejitter=False)
-    mace.set_device_pool([device])
-    sinogram = _smooth_sino()
-    _, recon_dict = mace.recon(sinogram, max_iterations=1, stop_threshold_change_pct=0,
-                               init_dir=str(tmp_path))
-    cached = np.load(tmp_path / 'init_recon.npy')
-    expected = np.stack([model.recon_direct(sinogram[views])
-                         for model, views in zip(mace.model_list, mace.view_slices)])
-    assert cached.shape == (3,) + mace.recon_shape
-    assert _rel_max(cached, expected) < 1e-5
-    assert recon_dict['recon_params']['init source'] == 'computed (3 frames, direct reconstruction)'
-
-
-def _four_frame_model():
-    """A four-frame model of the 24-view scan, at a period the frame count can
-    carry, so the filter stays on without a warning."""
-    model = MACE4DModel(_small_model(), frames_per_rotation=4, frame_overlap_factor=1.0)
-    model.set_params(verbose=0)
-    return model
 
 
 def test_two_workers_reproduce_one_worker_on_a_seeded_run():

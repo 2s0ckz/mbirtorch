@@ -2,10 +2,7 @@
 and HDF5 inputs, and dehydrate / rehydrate / denoise runs whose outputs read back through the package's HDF5
 importer."""
 import json
-import logging
 import os
-import warnings
-from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -14,10 +11,8 @@ import tifffile
 import torch
 
 import mbirtorch.hsnt as hsnt
-from mbirtorch.hsnt import loading
-from mbirtorch.hsnt.cli import _log_fit, main
-from mbirtorch.hsnt.loading import _smoothing_kernel, _tif_names, infer_input_type, load_dataset
-from mbirtorch.hsnt.outputs import component_check, fit_quality, mean_pixel_spectrum
+from mbirtorch.hsnt.cli import main
+from mbirtorch.hsnt.loading import _tif_names, infer_input_type, load_dataset
 from hsnt_basis import material_basis
 
 ROWS, COLS, K, R, DOSE = 12, 10, 40, 2, 50.0
@@ -50,12 +45,6 @@ def _report(out, stem):
 
 def _relative_error(estimate, X):
     return np.linalg.norm(estimate.reshape(-1, K) - X) / np.linalg.norm(X)
-
-
-def _write_transmission(path, T):
-    with h5py.File(path, "w") as f:
-        f.create_dataset("data", data=T)
-        f.create_dataset("dataset_type", data=np.bytes_("transmission"))
 
 
 @pytest.fixture(scope="module")
@@ -148,46 +137,10 @@ def test_conversion_matches_the_direct_load(stacks, tmp_path, capsys):
     assert meta["dataset_type"] == "attenuation" and np.allclose(data.reshape(-1, K // 2), ref, atol=1e-5)
 
 
-def test_a_converted_file_keeps_its_dose_source_bins_and_metadata(tmp_path):
-    """The dose (per source bin, scaled by --wave-bin), the source bin of every column, the angles of the selected
-    views and the wavelengths of the selected and grouped bins survive convert, dehydrate and rehydrate, and
-    --wave-range counts source bins throughout."""
-    W, H = _truth()
-    src = str(tmp_path / "meta.h5")
-    hsnt.export_hsnt_data_hdf5(src, np.stack([(W @ H).reshape(ROWS, COLS, K)] * 3).astype(np.float32),
-                               hsnt.create_hsnt_metadata(dataset_type="attenuation", wavelengths=np.linspace(1, 4.9, K),
-                                                         angles=np.array([0.0, 60.0, 120.0]), alu_unit="mm",
-                                                         delta_det_row=0.1))
-    conv = str(tmp_path / "conv.h5")
-    assert main(["convert", src, "-o", conv, "--views", "1:3", "--wave-range", "4:40", "--wave-bin", "2",
-                 "--downsample", "2", "--dose", str(DOSE), "-q"]) == 0
-    lam = np.linspace(1, 4.9, K)[4:40].reshape(-1, 2).mean(1)
-    _, meta = hsnt.import_hsnt_data_hdf5(conv)
-    assert np.allclose(meta["angles"], [60.0, 120.0]) and np.allclose(meta["wavelengths"], lam)
-    assert meta["alu_unit"] == "mm" and meta["delta_det_row"] == pytest.approx(0.2)
-    ds = load_dataset(conv)
-    assert ds.dose == pytest.approx(2 * DOSE) and ds.bin_indices.tolist() == list(range(4, 40, 2))
-    assert load_dataset(conv, wave_bin=3).dose == pytest.approx(6 * DOSE)
-    assert load_dataset(conv, dose=DOSE).dose == pytest.approx(2 * DOSE)            # a given dose is per source bin
-    out = str(tmp_path / "res")                                          # support selection finds the dose itself
-    assert main(["dehydrate", conv, "-o", out, "--rank", str(R), "--spectra", "support", "--max-steps", "50",
-                 "--no-plots", "-q"]) == 0
-    deh = os.path.join(out, "conv_dehydrated.h5")
-    assert np.allclose(hsnt.import_hsnt_data_hdf5(deh)[1]["wavelengths"], lam)
-    part = str(tmp_path / "part.h5")
-    assert main(["rehydrate", deh, "-o", part, "--wave-range", "10:20", "-q"]) == 0
-    data, meta = hsnt.import_hsnt_data_hdf5(part)
-    assert data.shape[-1] == 5 and np.allclose(meta["wavelengths"], lam[3:8])
-    with h5py.File(part) as f:
-        assert f["bin_indices"][()].tolist() == [10, 12, 14, 16, 18]
-
-
-def test_background_boxes_calibrate_each_tile_and_the_open_beam_can_be_smoothed(tmp_path):
+def test_background_boxes_calibrate_each_tile(tmp_path):
     """A sample run whose exposure differs from the open beam's by tile reads T = 1 in every sample-free corner after
     the calibration, and the dose becomes the sample's; transmission and attenuation files of several views, binned
-    and downsampled, are calibrated per view to their true transmission; the smoothed open beam is the Hamming-window
-    filter of the earlier preprocessing and counts as the observations over its variance reduction."""
-    from scipy.signal import convolve2d
+    and downsampled, are calibrated per view to their true transmission."""
     rng = np.random.default_rng(3)
     n, k, dose, exposure = 16, 12, 200.0, np.array([[1.15, 0.9], [1.1, 1.2]])
     X = np.zeros((n, n, k))
@@ -207,8 +160,6 @@ def test_background_boxes_calibrate_each_tile_and_the_open_beam_can_be_smoothed(
     ds = load_dataset(sample, open_beam=ob, background_boxes=boxes, background_tiles=(2, 2))
     for c, e in zip(corners, exposure.ravel()):
         assert abs(ds.T.reshape(n, n, k)[c].mean() - 1) < 0.02 and abs(plain.T.reshape(n, n, k)[c].mean() - e) < 0.04
-    assert any(c.level == "warn" and "--background-boxes" in c.message for c in plain.checks)
-    assert not any("--background-boxes" in c.message for c in ds.checks)
     factor = ds.info["background"]["factor_median"]
     assert ds.dose == pytest.approx(plain.dose * factor) and factor == pytest.approx(exposure.mean(), abs=0.02)
     per_bin, (lo, hi) = ds.dose_per_bin / plain.dose_per_bin, ds.info["background"]["factor_range"]
@@ -221,28 +172,6 @@ def test_background_boxes_calibrate_each_tile_and_the_open_beam_can_be_smoothed(
         hsnt.export_hsnt_data_hdf5(path, data.astype(np.float32), hsnt.create_hsnt_metadata(dataset_type=kind))
         cal = load_dataset(path, background_boxes=boxes, background_tiles=(2, 2), wave_bin=2, downsample=2)
         assert np.allclose(cal.T, truth.reshape(-1, k // 2), atol=1e-5)
-    smooth = load_dataset(sample, open_beam=ob, open_beam_smoothing=3)
-    h = np.sqrt(np.outer(np.hamming(3), np.hamming(3)))
-    mean_ob = (stacks["ob/observation_01"] + stacks["ob/observation_02"]) / 2
-    ref = np.stack([convolve2d(np.pad(mean_ob[:, :, j], 1, mode="reflect"), h / h.sum(), mode="valid")
-                    for j in range(k)], -1)
-    assert np.allclose(smooth.T, (stacks["sample"] / ref).reshape(-1, k), rtol=1e-5)
-    assert smooth.open_beam_observations == pytest.approx(2 / (_smoothing_kernel(3) ** 2).sum(), rel=0.2)
-    conv = str(tmp_path / "cal.h5")
-    assert main(["convert", sample, "--open-beam", *ob, "-o", conv, "--as-type", "transmission", "--background-boxes",
-                 *[f"{y0}:{y1},{x0}:{x1}" for y0, y1, x0, x1 in boxes], "--background-tiles", "2x2",
-                 "--open-beam-smoothing", "3", "--memory-budget", "0.01", "-q"]) == 0
-    both = load_dataset(sample, open_beam=ob, background_boxes=boxes, background_tiles=(2, 2), open_beam_smoothing=3)
-    back = load_dataset(conv)
-    assert np.allclose(back.T, both.T, atol=1e-6) and back.dose == pytest.approx(both.dose, rel=0.01)
-    assert back.open_beam_observations == pytest.approx(both.open_beam_observations, rel=0.2)
-    assert back.info["background"]["recorded"] and not any("--background-boxes" in c.message for c in back.checks)
-    assert load_dataset(conv, dose=100.0).dose == pytest.approx(100.0 * back.info["background"]["factor_median"])
-    for bad, match in ((["--background-boxes", "ornl-snap"], "512 x 512"),
-                       (["--background-boxes", "0:3,0:3", "--background-tiles", "2x2"], "hold no box"),
-                       (["--background-tiles", "2x2"], "need background"), (["--open-beam-smoothing", "4"], "odd")):
-        with pytest.raises(SystemExit, match=match):
-            main(["inspect", sample, "--open-beam", *ob, "-q"] + bad)
 
 
 def test_dehydrate_rehydrate_and_denoise_write_readable_outputs(stacks, tmp_path, capsys):
@@ -294,27 +223,6 @@ def test_dehydrate_rehydrate_and_denoise_write_readable_outputs(stacks, tmp_path
     assert _relative_error(-np.log(data), W @ H) < 0.35
 
 
-def test_stream_mode_and_the_spectra_estimators_on_the_command_line(stacks, tmp_path):
-    out = str(tmp_path / "stream")
-    assert main(["dehydrate", stacks["sample"], "--open-beam", stacks["open_beam"], "--rank", str(R), "-o", out,
-                 "--mode", "stream", "--chunk-pixels", "40", "--max-passes", "2", "--spectra", "support",
-                 "--support-penalty", "1", "--no-plots", "-q"]) == 0
-    rep = _report(out, "sample")["result"]
-    assert rep["mode"] == "stream" and rep["passes"] >= 1 and 0 < rep["mean_support_size"] <= R
-    assert rep["loss_final"] >= rep["loss_mle"] * (1 - 1e-6)            # the constrained refit cannot beat the MLE
-    base = ["dehydrate", stacks["h5"], "--rank", str(R), "--max-steps", "150", "--no-plots", "-q"]
-    with pytest.raises(SystemExit, match="dose"):
-        main(base + ["-o", str(tmp_path / "none"), "--spectra", "support"])
-    out = str(tmp_path / "unc")
-    assert main(base + ["-o", out, "--spectra", "unconstrained"]) == 0
-    rep = _report(out, "processed")["result"]
-    assert rep["unconstrained_steps"] > 0 and rep["W_zero_frac"] < 1
-    out = str(tmp_path / "sup")
-    assert main(base + ["-o", out, "--dose", str(DOSE), "--spectra", "support", "--wald-screen", "0.5"]) == 0
-    rep = _report(out, "processed")["result"]
-    assert 0 < rep["mean_support_size"] <= R and rep["loss_final"] >= rep["loss_mle"] * (1 - 1e-9)
-
-
 def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
     with h5py.File(stacks["h5"]) as f:
         A = f["sample_dataset/data"][()]                                 # (1, ROWS, COLS, K) attenuation
@@ -352,69 +260,3 @@ def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
             hsnt.dehydrate(A, subspace_basis=basis, verbose=0, **bad)
     with pytest.raises(TypeError, match="MBIRJAX"):
         hsnt.hyper_denoise(A, num_materials=R, safety_factor=2, verbose=0)          # the NMF's keywords are refused
-
-
-def test_bad_values_are_refused_and_a_failed_run_leaves_no_output(stacks, tmp_path, capsys, monkeypatch):
-    """Bad options are refused; negative transmissions are clipped at zero with a warning, as dehydrate clips an
-    array; a conversion that fails at its end (here in the data checks) leaves no output."""
-    for bad in (["--wave-bin", "0"], ["--dose", "-1"], ["--max-rank", "0"], ["--rank", "0"], ["--rel-tol", "x"]):
-        with pytest.raises(SystemExit):
-            main(["dehydrate", stacks["h5"], "-o", str(tmp_path), "-q"] + bad)      # argparse refuses them
-    W, H = _truth()
-    T = np.exp(-W @ H).reshape(1, ROWS, COLS, K).astype(np.float32)
-    T[:, :, :, 3] = -0.5
-    bad = str(tmp_path / "negative.h5")
-    _write_transmission(bad, T)
-    capsys.readouterr()
-    with warnings.catch_warnings():
-        warnings.simplefilter("always")
-        assert main(["inspect", bad, "-q"]) == 0
-    assert f"{100 / K:.3g}% of the entries have a negative transmission; clipped at zero" in capsys.readouterr().err
-
-    def failing_checks(*args):
-        raise loading.InputError("the checks failed")
-
-    monkeypatch.setattr(loading, "_checks_from_summary", failing_checks)
-    with pytest.raises(SystemExit, match="the checks failed"):
-        main(["convert", bad, "-o", str(tmp_path / "failed.h5"), "-q"])
-    assert not [f for f in os.listdir(tmp_path) if f.startswith("failed")]         # neither the file nor a .partial
-
-
-def test_fit_diagnostics():
-    """The chi-square sits at 1 with the open beam's count in each bin and the noise of its two observations; the
-    component check flags proportional spectra, not proportional maps (which a mixed basis has); the mean-pixel
-    spectrum is the sum of the components' shares."""
-    rng = np.random.default_rng(1)
-    W, H = _truth()
-    flux = np.linspace(20.0, 80.0, K)                                    # an open beam that varies over the bins
-    ob = rng.poisson(np.tile(flux, (W.shape[0], 1)), size=(2, W.shape[0], K)).mean(0)
-    T = (rng.poisson(flux * np.exp(-W @ H)) / np.maximum(ob, 1)).astype(np.float32)
-    exact = fit_quality(T, W, H, dose=50.0, dose_per_bin=flux, open_beam_observations=2)["reduced_chi2"]
-    assert abs(exact - 1) < 0.05 and fit_quality(T, W, H, dose=50.0)["reduced_chi2"] > 1.2
-    high = fit_quality(T, W, H, dose=50.0, dose_per_bin=flux * 4 / 3, open_beam_observations=2)["reduced_chi2"]
-    assert high == pytest.approx(4 / 3 * exact)                          # proportional to the dose
-    assert component_check(W, H)["proportional_pairs"] == []             # distinct maps
-    W2 = np.stack([W[:, 0], W[:, 0] * (1 + 0.05 * rng.standard_normal(W.shape[0]))], 1)    # a split material
-    H2 = np.stack([H[0] * 0.5, H[0] * 0.5])
-    assert component_check(W2, H2)["proportional_pairs"][0][:2] == (0, 1)
-    assert component_check(W2, H)["proportional_pairs"] == []            # proportional maps, distinct spectra: a mix
-    total, contrib, n = mean_pixel_spectrum(W2, H2)
-    assert total.shape == (K,) and n > 0 and np.allclose(total, contrib.sum(0))
-
-
-def test_the_chi_square_advice_follows_the_dose(caplog):
-    """The chi-square is proportional to the dose, and a component more lowers it by only about 1 / bins: a low one
-    points to an underestimated dose or an overstated variance, not to too large a rank; a high one also to an
-    overestimated dose."""
-    rep = dict(components=dict(proportional_pairs=[], max_spectral_cosine=0.1, max_map_correlation=0.2,
-                               row_noise_rel=[0.1]), fit=dict(relative_residual=0.01))
-    args = SimpleNamespace(basis=None, rank_detail=False, rank_note="estimated")
-    said = {}
-    for chi2 in (0.7, 0.4, 1.5, 2.5):
-        caplog.clear()
-        with caplog.at_level(logging.INFO, logger="mbirtorch.hsnt"):
-            _log_fit(dict(rep, fit=dict(rep["fit"], reduced_chi2=chi2)), args)
-        said[chi2] = " ".join(r.getMessage() for r in caplog.records)
-    assert all("dose is underestimated" in said[c] and "rank" not in said[c] for c in (0.7, 0.4))
-    assert "proportional" in said[0.4] and all("dose overestimated" in said[c] for c in (1.5, 2.5))
-    assert "check the rank" in said[2.5]

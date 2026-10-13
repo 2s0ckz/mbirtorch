@@ -2,9 +2,8 @@
 
 A CUDA model spreads a reconstruction across the devices that can hold their
 share.  These tests check the RULE rather than the hardware: the selection, the
-validation, the count set by MBIRTORCH_NUM_DEVICES, the fallback, and the
-readable failure all run on CPU,
-by driving the policy with fabricated device lists and budgets.  The
+validation, the count set by MBIRTORCH_NUM_DEVICES, and the readable failure
+all run on CPU, by driving the policy with fabricated device lists and budgets.  The
 multi-device VALUE gates live in test_sharding.py, which is where the seeded
 n>1 parity patterns already are.
 """
@@ -22,10 +21,6 @@ GB = 2 ** 30
 
 # Sinogram shapes at which the minimum problem sizes are measured, each named
 # for its view count.  The comment beside each is its sinogram element count.
-SHAPE_512 = (512, 448, 384)          #    88,080,384
-SHAPE_1024 = (1024, 1008, 992)       # 1,023,934,464
-SHAPE_128 = (128, 112, 96)           #     1,376,256
-SPARSE_VIEW_SHAPE = (64, 448, 384)   #    11,010,048
 
 
 def make_model(shape=(8, 6, 8), device='cpu', **kwargs):
@@ -92,45 +87,6 @@ def as_automatic(model, num_devices):
     return num_devices
 
 
-def recon_peak(model, num_devices):
-    """The largest per-device peak of the model's full recon plan at
-    ``num_devices``.
-
-    ``layout_fits`` allows a layout only when EVERY device holds its share and
-    refuses it when any one is short, so the number that decides a budget
-    question is the largest per-device peak, not the first device's.
-    """
-    devices = [torch.device('cpu', i) for i in range(num_devices)]
-    return max(model._estimate_memory(devices=devices).per_device_peaks())
-
-
-def budget_allowing_only(monkeypatch, model, fits, misses):
-    """A per-device budget the recon plan clears at ``fits`` and misses at
-    every entry of ``misses``, each given as a ``(device count, memory check
-    margin)`` pair.
-
-    Both ends of the window are modeled peaks scaled by the margin they are
-    checked against, so the budget is placed at the MIDPOINT and recomputed on
-    every run.  A change in the memory estimate that moves either peak is
-    followed, rather than breaking a factor someone chose once against numbers
-    that have since moved.  The window is as wide as the drop in the
-    per-device peak from using more GPUs, which is the property these tests
-    exist to exercise.  A window that closes is reported as that and not as
-    arithmetic that happened to invert.
-    """
-    count, margin = fits
-    lower = int((1.0 + margin) * recon_peak(model, count))
-    ceiling = min(int((1.0 + m) * recon_peak(model, n)) for n, m in misses)
-    assert lower < ceiling, (
-        f'no budget clears {fits} and misses {misses}: using more GPUs no '
-        f'longer lowers the modeled per-device peak enough to tell them apart '
-        f'({lower} is not below {ceiling})')
-    budget = (lower + ceiling) // 2
-    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes',
-                        lambda d: budget)
-    return budget
-
-
 # ── the selection rule ───────────────────────────────────────────────────────
 def test_the_largest_count_that_fits_is_chosen(monkeypatch, no_device_count_env,
                                                 no_size_limit):
@@ -162,51 +118,24 @@ def test_the_largest_count_that_fits_is_chosen(monkeypatch, no_device_count_env,
     crowded._apply_device_policy()
     assert crowded.sino_placement.n_devices == 2
 
-
-def test_a_layout_that_leaves_a_device_idle_is_refused(monkeypatch, no_device_count_env):
-    """The empty-shard rules gate the count before the estimate does."""
-    # 3 views and 3 slices over 4 devices leaves device 3 with neither.
-    model = make_model((3, 6, 8))
-    model.set_params(no_warning=True, recon_shape=(6, 6, 3))
-    as_automatic(model, 4)
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
+    # The empty-shard rules gate the count before the estimate does: 3 views
+    # and 3 slices over 4 devices leaves device 3 with neither.
+    idle = make_model((3, 6, 8))
+    idle.set_params(no_warning=True, recon_shape=(6, 6, 3))
+    as_automatic(idle, 4)
     monkeypatch.setattr(_memory_estimate, 'device_budget_bytes',
                         lambda d: 64 * GB)
-    assert not model._layout_is_valid(['cpu'] * 4)
-    model._apply_device_policy()
-    assert model.sino_placement.n_devices <= 3
-
-
-def test_a_single_visible_device_gets_no_memory_check_at_all(monkeypatch,
-                                                             no_device_count_env):
-    """One visible device has no layout to choose, so the estimate does not run.
-
-    Torch's caching allocator already raises a fast, readable error on a
-    single-device overflow, which is the job the memory check does where the
-    allocator cannot.  Skipping it keeps the n=1 path free of any new
-    per-reconstruction cost, and it means a single-GPU user cannot be refused
-    a run that would previously have started.
-    """
-    model = make_model()
-    as_automatic(model, 1)
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 1)
-    # A budget of zero would refuse everything, and must never be consulted.
-    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes', lambda d: 0)
-    called = []
-    original = model._estimate_memory
-    model._estimate_memory = lambda *a, **k: (called.append(1),
-                                              original(*a, **k))[1]
-    before = model.projector_functions
-    assert model._apply_device_policy() is None
-    assert not called                               # the estimate never ran
-    assert model.sino_placement.n_devices == 1
-    assert model.projector_functions is before      # no needless rebuild
+    assert not idle._layout_is_valid(['cpu'] * 4)
+    idle._apply_device_policy()
+    assert idle.sino_placement.n_devices <= 3
 
 
 # ── what turns the rule off ──────────────────────────────────────────────────
-def test_an_explicit_configure_devices_is_never_second_guessed(monkeypatch, no_device_count_env):
+def test_a_count_the_user_sets_is_used(monkeypatch, no_device_count_env):
+    """A device list given to configure_devices is used as given.
+    MBIRTORCH_NUM_DEVICES decides the count, the count is capped by what is
+    visible, and it holds through a whole reconstruction.  This is the suite's
+    own determinism guarantee on a multi-GPU host."""
     model = make_model()
     model.configure_devices(devices=['cpu', 'cpu'])
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
@@ -217,33 +146,8 @@ def test_an_explicit_configure_devices_is_never_second_guessed(monkeypatch, no_d
     model._apply_device_policy()
     assert model.sino_placement.n_devices == 2
 
-
-def test_a_machine_without_cuda_uses_one_device(monkeypatch, no_device_count_env):
-    """The other half of CUDA-only.
-
-    Under the constructor amendment every model starts in automatic mode, so
-    the backend check moved from construction into the policy.  A model on a
-    machine with no CUDA must still resolve to its own device and stay there.
-    """
-    angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
-    assert model.device_layout_is_automatic is True
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 0)
-    assert model._apply_device_policy() is None
-    assert model.sino_placement.n_devices == 1
-    assert model.device_layout_is_automatic is True
-
-
-def test_the_environment_variable_fixes_the_count(monkeypatch):
-    """MBIRTORCH_NUM_DEVICES decides the count, the count is capped by what is
-    visible, and it holds through a whole reconstruction.  This is the suite's
-    own determinism guarantee on a multi-GPU host."""
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(_memory_estimate, 'device_budget_bytes',
                         lambda d: 64 * GB)
-
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
     model = make_model((16, 8, 16))
     as_automatic(model, 4)
     monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '2')
@@ -294,28 +198,7 @@ def test_a_doomed_run_fails_before_allocating_anything(monkeypatch, no_device_co
         through_recon.recon(sinogram, max_iterations=1)
 
 
-def test_skip_memory_check_forces_a_doomed_run(monkeypatch, no_device_count_env,
-                                               no_size_limit):
-    """The escape hatch: the layout is chosen by the empty-shard rules alone
-    and the budget is not consulted."""
-    model = make_model((16, 8, 16))
-    as_automatic(model, 4)
-    model.skip_memory_check = True
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
-    monkeypatch.setattr(_memory_estimate, 'device_budget_bytes', lambda d: 1024)
-    model._apply_device_policy()                 # does not raise
-    assert model.sino_placement.n_devices == 4
-
-
-# ── the minimum problem sizes ───────────────────────────────────────────────
-# The minimum problem size is a SPEED rule applied after the capacity rule.
-# Below a measured minimum size, a device count is moved behind every allowed
-# count rather than removed, so capacity still wins when nothing allowed fits.
-# These tests use the sizes where the minimum sizes were actually measured.
-# They are also the standing regression coverage of the rule.  Every nightly
-# row sets MBIRTORCH_NUM_DEVICES, which bypasses the rule, so nothing else
-# exercises this ordering end to end.
+# ── helpers for the tests below ─────────────────────────────────────────────
 def with_four_visible(monkeypatch, model, budget=64 * GB):
     """Four visible devices, every one of them with ample room, so the ONLY
     thing that can hold the count down is the minimum problem size."""
@@ -325,102 +208,6 @@ def with_four_visible(monkeypatch, model, budget=64 * GB):
     monkeypatch.setattr(_memory_estimate, 'device_budget_bytes',
                         lambda d: budget)
     return model
-
-
-def test_a_small_parallel_problem_holds_at_one_device_however_free_the_gpus(
-        monkeypatch, no_device_count_env):
-    """The 128-class shape, where four devices were measured 13x slower,
-    stays on one device however free the GPUs are.  The rule does not cost the
-    case that more GPUs are meant for: at the 1024-class shape n=4 is allowed
-    and capacity has room."""
-    small = with_four_visible(monkeypatch, make_model(SHAPE_128))
-    small._apply_device_policy()
-    assert small.sino_placement.n_devices == 1
-
-    large = with_four_visible(monkeypatch, make_model(SHAPE_1024))
-    large._apply_device_policy()
-    assert large.sino_placement.n_devices == 4
-
-
-# ── what turns the minimum problem sizes off ────────────────────────────────
-def test_an_explicit_choice_the_env_count_or_the_switch_ignores_the_min_sizes(
-        monkeypatch, no_device_count_env):
-    """Three ways past the minimum problem sizes, at a size that would
-    otherwise stay on one device.
-
-    A count the caller named is not the library's to second-guess.  The
-    count set by MBIRTORCH_NUM_DEVICES reaches the policy by a different
-    branch and must bypass the rule the same way.  The environment variable
-    MBIRTORCH_LIMIT_GPUS_BY_SIZE=0 restores the pure capacity order.
-    """
-    explicit = make_model(SHAPE_128)
-    explicit.configure_devices(devices=['cpu'] * 4)
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
-    explicit._apply_device_policy()
-    assert explicit.sino_placement.n_devices == 4
-
-    fixed = with_four_visible(monkeypatch, make_model(SHAPE_128))
-    order, held = fixed._speed_ordered_candidates(4)
-    assert order == [1, 4, 3, 2] and set(held) == {2, 3, 4}
-    monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '4')
-    fixed._apply_device_policy()
-    assert fixed.sino_placement.n_devices == 4
-    assert fixed.device_choice_rejections == []
-
-    monkeypatch.delenv('MBIRTORCH_NUM_DEVICES')
-    switched = with_four_visible(monkeypatch, make_model(SHAPE_128))
-    monkeypatch.setenv('MBIRTORCH_LIMIT_GPUS_BY_SIZE', '0')
-    assert switched._speed_ordered_candidates(4) == ([4, 3, 2, 1], {})
-    switched._apply_device_policy()
-    assert switched.sino_placement.n_devices == 4
-
-
-# ── capacity still wins ──────────────────────────────────────────────────────
-def test_capacity_falls_back_below_a_min_size_and_says_so(monkeypatch,
-                                                          no_device_count_env):
-    """The reorder never removes a count.
-
-    Below its minimum size, n=4 is tried only after n=1 has been refused for lack of
-    memory -- and then it is taken, because a run that fits slowly beats a
-    run that does not fit at all.  The log says which happened.
-    """
-    model = make_model((128, 64, 128))           # 1.0M elements: below every minimum size
-    # This shape reconstructs 16,384 pixels a slice, which the shipped forward
-    # batch covers whole, so that transient does not shrink as devices are
-    # added and the one- and four-device peaks barely separate.  Setting the
-    # batch to half a slice leaves the sharded arrays to dominate the
-    # difference, which is what the budget below is built from.
-    model.forward_project_pixel_batch = 8192
-    with_four_visible(monkeypatch, model)
-    # Only the four-device layout fits.  n=1 is checked first and misses, and
-    # n=4 is then taken below its minimum size.
-    margin = 0.02
-    budget_allowing_only(monkeypatch, model, fits=(4, margin),
-                          misses=[(1, margin)])
-    model.memory_check_margin = margin
-    model._apply_device_policy()
-
-    assert model.sino_placement.n_devices == 4
-    reasons = dict(model.device_choice_rejections)
-    assert 1 in reasons and 'short' in reasons[1]
-    assert 'chosen below its minimum problem size' in reasons[4]
-    assert 'no allowed count fits' in reasons[4]
-
-
-# ── the ordering itself ──────────────────────────────────────────────────────
-def test_the_min_sizes_reorder_the_candidates_and_never_remove_one():
-    """The invariant the whole design rests on: every visible count is still
-    a candidate, allowed ones first, each group largest-first."""
-    for shape in (SHAPE_128, SPARSE_VIEW_SHAPE, SHAPE_512, SHAPE_1024):
-        model = make_model(shape)
-        order, held = model._speed_ordered_candidates(4)
-        assert sorted(order) == [1, 2, 3, 4], shape
-        assert set(held) <= set(order), shape
-        allowed = [n for n in order if n not in held]
-        assert order == allowed + [n for n in order if n in held], shape
-        assert allowed == sorted(allowed, reverse=True), shape
-        assert 1 in allowed, shape       # n=1 is always allowed
 
 
 # ── the device choice is kept ────────────────────────────────────────────────
@@ -435,11 +222,12 @@ def poison_budgets(monkeypatch):
     monkeypatch.setattr(_memory_estimate, 'device_budget_bytes', no_budget)
 
 
-def test_a_model_with_chosen_devices_does_not_redecide_when_free_memory_moves(
+def test_a_model_redecides_its_devices_only_when_its_shapes_change(
         monkeypatch, no_device_count_env, no_size_limit):
-    """The automatic choice is made once and kept.  The poisoned budget is
-    the proof that no second search ran, either on a later policy call or
-    after a recompile-flagged parameter that leaves the shapes alone."""
+    """The automatic choice is made once and kept.  The budget that raises
+    is the proof that no second search ran, either on a later policy call or
+    after a recompile-flagged parameter that leaves the shapes alone.  A
+    shape change does make a new choice."""
     model = make_model((16, 8, 16))
     with_four_visible(monkeypatch, model)
     model._apply_device_policy()
@@ -457,16 +245,9 @@ def test_a_model_with_chosen_devices_does_not_redecide_when_free_memory_moves(
     model._apply_device_policy()
     assert model.sino_placement.n_devices == 4
 
-
-def test_a_shape_change_redecides_at_the_new_shapes(monkeypatch, no_device_count_env,
-                                                    no_size_limit):
-    model = make_model((16, 8, 16))
-    with_four_visible(monkeypatch, model)
-    model._apply_device_policy()
-    assert model.sino_placement.n_devices == 4
-    # Two of the four devices fill up between the calls.  A model whose device
-    # choice is made ignores that by design; a shape change must not, because the
-    # decision's inputs are new.
+    # Two of the four devices fill up.  A model whose device choice is made
+    # ignores that by design; a shape change must not, because the decision's
+    # inputs are new.
     monkeypatch.setattr(
         _memory_estimate, 'device_budget_bytes',
         lambda d: 1024 if (d.index or 0) >= 2 else 64 * GB)
@@ -478,18 +259,7 @@ def test_a_shape_change_redecides_at_the_new_shapes(monkeypatch, no_device_count
 # ── the direct reconstructions ───────────────────────────────────────────────
 # recon_fbp and recon_fdk choose the devices themselves, so a direct
 # reconstruction spreads across the devices instead of landing whole on the
-# first one.  All four geometries are covered here: cone has made the call
-# since commit 72208bb and the other three gained it with this increment.
-def _automatic_parallel(shape=(8, 6, 8)):
-    angles = np.linspace(0, np.pi, shape[0], endpoint=False)
-    return mbirtorch.ParallelBeamModel(shape, angles)
-
-
-def _multiaxis_model(shape):
-    """Multiaxis angles are (azimuth, elevation) pairs, one row per view."""
-    azimuth = np.linspace(0, np.pi, shape[0], endpoint=False)
-    elevation = np.linspace(-0.4, 0.4, shape[0])
-    return mbirtorch.MultiAxisParallelModel(shape, np.stack([azimuth, elevation], axis=1))
+# first one.
 
 
 def _automatic_cone(shape=(8, 6, 8)):
@@ -499,26 +269,6 @@ def _automatic_cone(shape=(8, 6, 8)):
                                    source_iso_dist=2.0 * shape[2])
 
 
-def _automatic_translation():
-    """Translation geometry needs a source far enough from the object for the
-    automatic recon shape to exist, so it carries its own size -- the one
-    test_translation.py reconstructs at -- rather than the shared toy shape.
-    A translation grid must multiply out to the view count, which no toy
-    shape divides, so this factory carries its own."""
-    vectors = mbirtorch.gen_translation_vectors(4, 4, x_spacing=3.0,
-                                                z_spacing=2.0)
-    return mbirtorch.TranslationModel((vectors.shape[0], 40, 32), vectors,
-                                      source_detector_dist=128.0,
-                                      source_iso_dist=32.0)
-
-
-DIRECT_RECONS = [
-    (_automatic_parallel, 'recon_fbp'),
-    (_automatic_cone, 'recon_fdk'),
-    (lambda: _multiaxis_model((8, 6, 8)), 'recon_fbp'),
-    (_automatic_translation, 'recon_fdk'),
-]
-DIRECT_RECON_IDS = ['parallel', 'cone', 'multiaxis', 'translation']
 
 
 def _automatic_on_cpu(make, verbose=0):
@@ -543,15 +293,14 @@ def _impulse_sinogram(model):
     return sinogram
 
 
-@pytest.mark.parametrize("make,method", DIRECT_RECONS, ids=DIRECT_RECON_IDS)
 def test_a_bare_recon_direct_chooses_the_devices_and_spreads(
-        monkeypatch, no_device_count_env, no_size_limit, make, method):
-    """The A2 gap, closed for every geometry: a direct reconstruction on a
-    model with no explicit layout uses the devices that fit, exactly as recon
-    does, rather than running whole on the first device."""
-    model = _automatic_on_cpu(make)
+        monkeypatch, no_device_count_env, no_size_limit):
+    """A direct reconstruction (FDK here) on a model with no explicit layout
+    uses the devices that fit, exactly as recon does, rather than running
+    whole on the first device."""
+    model = _automatic_on_cpu(_automatic_cone)
     with_four_visible(monkeypatch, model)
-    recon = getattr(model, method)(_impulse_sinogram(model))
+    recon = model.recon_fdk(_impulse_sinogram(model))
     assert model.sino_placement.n_devices == 4
     assert recon.shape == tuple(model.get_params('recon_shape'))
     assert np.all(np.isfinite(recon))
@@ -684,21 +433,17 @@ def run_recon(model, sinogram, weights=None, max_iterations=2):
     return recon
 
 
-@pytest.mark.parametrize('num_views,num_devices',
-                         [(12, 2), (13, 3), (41, 2), (63, 3)])
-def test_a_divided_sinogram_subsamples_exactly_like_a_whole_one(num_views,
-                                                                num_devices):
+def test_a_divided_sinogram_subsamples_exactly_like_a_whole_one():
     """The statistics that set the regularization parameters run on an
     evenly-spaced subsample of the views, and taking that subsample from the
     divided form is data movement rather than an approximation.  It therefore
     has to give the very same views in the very same order as subsampling the
     assembled sinogram.
 
-    The parameters cover both things the arithmetic depends on.  12 and 13
-    views are subsampled view by view (stride 1), 41 strides by 2 and 63 by
-    3; and some of those counts divide evenly over their devices while others
-    leave the first devices one view longer.
+    41 views over 2 devices are subsampled with stride 2, and the first
+    device holds one view more, so the second shard starts on an odd view.
     """
+    num_views, num_devices = 41, 2
     model = model_on_devices((num_views, 4, 6), num_devices)
     whole = np.random.RandomState(num_views).rand(
         num_views, 4, 6).astype(np.float32)

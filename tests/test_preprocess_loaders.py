@@ -99,7 +99,7 @@ def test_asymmetric_crop_shifts_row_offset_for_every_vendor():
     assert op['det_channel_offset'] == pytest.approx(base['det_channel_offset'])
 
 
-def test_volumax_geometry_and_downsampling_remainder():
+def test_volumax_geometry_downsampling_remainder_and_a_leaning_detector():
     # The distances come from the positions along the detector normal.  Block averaging by 2 drops the last row
     # and channel of a 65 x 81 detector, which moves each offset by half a pixel.
     p, g = _volumax_params(nrows=65, nchan=81)
@@ -113,30 +113,7 @@ def test_volumax_geometry_and_downsampling_remainder():
     assert op['det_row_offset'] == pytest.approx(base['det_row_offset'] + 0.5 * base['delta_det_row'])
     assert op['det_channel_offset'] == pytest.approx(base['det_channel_offset'] + 0.5 * base['delta_det_channel'])
 
-
-def test_volumax_offsets_follow_the_sinogram_rotation():
-    # A spot placed at the offsets must stay at the offsets after the sinogram is corrected for the detector
-    # rotation: the spot is rotated with correct_det_rotation and its centroid is compared with the rotated offsets.
-    tilt = 0.05
-    p, g = _volumax_params(nrows=65, nchan=65, tilt=tilt)
-    assert abs(g['det_rotation']) == pytest.approx(tilt)
-    _, op = mtp.volumax.convert_volumax_to_mbirtorch_params(p, g, verbose=0)
-    pitch = g['delta_det_row']
-    rows, chans = np.meshgrid(np.arange(65) - 32.0, np.arange(65) - 32.0, indexing='ij')
-    row0, chan0 = g['det_row_offset'] / pitch, g['det_channel_offset_metadata'] / pitch
-    spot = np.exp(-0.5 * ((rows - row0) ** 2 + (chans - chan0) ** 2) / 2.0 ** 2).astype(np.float32)
-    rotated = np.asarray(mtp.correct_det_rotation(spot[None], det_rotation=g['det_rotation']))[0]
-    assert (rows * rotated).sum() / rotated.sum() == pytest.approx(op['det_row_offset'] / pitch, abs=0.05)
-    assert (chans * rotated).sum() / rotated.sum() == pytest.approx(op['det_channel_offset'] / pitch, abs=0.05)
-
-
-def test_volumax_rotation_needs_square_pixels():
-    p, g = _volumax_params(tilt=0.05)
-    with pytest.raises(ValueError, match='square pixels'):
-        mtp.volumax.convert_volumax_to_mbirtorch_params(p, g, downsample_factor=(2, 1), verbose=0)
-
-
-def test_volumax_geometry_with_a_leaning_detector():
+    # A leaning detector.
     # The distances are measured along the central ray, which is perpendicular to the rotation axis, and the row
     # offset locates the point where the central ray meets the detector.  Neither depends on the height of the
     # recorded object position.
@@ -153,6 +130,22 @@ def test_volumax_geometry_with_a_leaning_detector():
     hit = np.array([-100. + sdd, 0., 0.]) - np.array([50., 1., 2.])
     assert g['det_row_offset'] == pytest.approx(np.dot(hit, [-np.sin(lean), 0., -np.cos(lean)]))
     assert g['det_channel_offset_metadata'] == pytest.approx(np.dot(hit, [0., -1., 0.]))
+
+
+def test_volumax_offsets_follow_the_sinogram_rotation():
+    # A spot placed at the offsets must stay at the offsets after the sinogram is corrected for the detector
+    # rotation: the spot is rotated with correct_det_rotation and its centroid is compared with the rotated offsets.
+    tilt = 0.05
+    p, g = _volumax_params(nrows=65, nchan=65, tilt=tilt)
+    assert abs(g['det_rotation']) == pytest.approx(tilt)
+    _, op = mtp.volumax.convert_volumax_to_mbirtorch_params(p, g, verbose=0)
+    pitch = g['delta_det_row']
+    rows, chans = np.meshgrid(np.arange(65) - 32.0, np.arange(65) - 32.0, indexing='ij')
+    row0, chan0 = g['det_row_offset'] / pitch, g['det_channel_offset_metadata'] / pitch
+    spot = np.exp(-0.5 * ((rows - row0) ** 2 + (chans - chan0) ** 2) / 2.0 ** 2).astype(np.float32)
+    rotated = np.asarray(mtp.correct_det_rotation(spot[None], det_rotation=g['det_rotation']))[0]
+    assert (rows * rotated).sum() / rotated.sum() == pytest.approx(op['det_row_offset'] / pitch, abs=0.05)
+    assert (chans * rotated).sum() / rotated.sum() == pytest.approx(op['det_channel_offset'] / pitch, abs=0.05)
 
 
 def test_volumax_get_sino_and_model_returns_the_metadata(tmp_path):

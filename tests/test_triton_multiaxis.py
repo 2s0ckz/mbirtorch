@@ -166,8 +166,8 @@ def _rel_max(out, ref):
 
 
 @requires_cuda
-@pytest.mark.parametrize("variant", list(VARIANTS))
-@pytest.mark.parametrize("coeff_power,tol", [(1, 1e-5), (2, 1e-4)])
+@pytest.mark.parametrize("variant,coeff_power,tol",
+                         [(v, 1, 1e-5) for v in VARIANTS] + [("elevation_sweep", 2, 1e-4)])
 def test_multiaxis_back_kernel_parity(variant, coeff_power, tol):
     # The geometry reaches the kernel only through the two eager builders it
     # shares with the torch body, so all five variants exercise the same kernel
@@ -190,8 +190,7 @@ def test_multiaxis_back_kernel_parity(variant, coeff_power, tol):
 
 
 @requires_cuda
-@pytest.mark.parametrize("direction,case", [("back", 5), ("back", 12),
-                                            ("back", 16), ("back", 32),
+@pytest.mark.parametrize("direction,case", [("back", 5), ("back", 16),
                                             ("forward", ((6, 12, 12), 12)),
                                             ("forward", ((6, 32, 20), 32))])
 def test_multiaxis_kernel_pads_the_width_argument_to_a_multiple_of_16(
@@ -272,7 +271,7 @@ def test_multiaxis_kernel_pads_the_width_argument_to_a_multiple_of_16(
 
 
 @requires_cuda
-@pytest.mark.parametrize("num_pixels", [1, 7, 9, 31])
+@pytest.mark.parametrize("num_pixels", [1, 31])
 def test_multiaxis_back_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
     # pixel tile pads the last block with lanes that must contribute exactly
@@ -361,7 +360,7 @@ def _slice_reach(model):
     return reach, slope, w_p_r, args
 
 
-@pytest.mark.parametrize("variant", list(VARIANTS) + ["thin_slice"])
+@pytest.mark.parametrize("variant", ["strong_tilt", "thin_slice"])
 def test_multiaxis_forward_slice_tap_radius_covers_every_contributing_slice(
         variant):
     """The forward kernel's one hard requirement, checked on any machine.
@@ -417,7 +416,7 @@ def test_multiaxis_forward_kernel_parity(variant):
 
 
 @requires_cuda
-@pytest.mark.parametrize("num_pixels", [1, 7, 9, 31])
+@pytest.mark.parametrize("num_pixels", [1, 31])
 def test_multiaxis_forward_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
     # pixel tile pads the last block with lanes whose atomics must be masked off

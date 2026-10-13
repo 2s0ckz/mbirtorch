@@ -2,7 +2,8 @@
 
 Three things are checked against each other.  The projector itself, through the
 centroid of a voxel's forward-projected footprint; project_points, which is
-meant to state the projector's geometry for points; and an independent numpy
+meant to state the projector's geometry for points (both the model's and the
+geometry viewer's GeometryScene version); and an independent numpy
 prediction written from a plain geometric statement (tests/geometry_probe.py),
 which never calls any of the projector's own formulas.  The centroid
 comparison has a half-pixel gate, because the footprint weights move a centroid
@@ -14,6 +15,7 @@ import numpy as np
 import pytest
 
 import geometry_probe as probe
+from mbirtorch.viewers.geometry_scene import GeometryScene
 
 # The centroid of a footprint is not exactly the projected center: the weights
 # are cut off at the ends of the footprint, which moves the centroid by about a
@@ -68,23 +70,35 @@ def _config_with_stored_view_params(cfg, model):
 
 @pytest.mark.parametrize('name', CONFIG_NAMES)
 def test_project_points_matches_the_projector(name):
-    """A projected point lands where the projector puts the voxel's mass."""
+    """A projected point lands where the projector puts the voxel's mass, both
+    for the model's project_points and for the GeometryScene the geometry
+    viewer draws from.  A viewer that failed this test would draw a geometry
+    the projector does not use."""
     cfg = _config(name)
     model = probe.build_model(cfg)
     g = probe.geometry_scalars(cfg)
     voxels, points = _probe_points(cfg, g)
     num_views = cfg['sinogram_shape'][0]
     row, channel = model.project_points(points, list(range(num_views)))
+    scene = GeometryScene.from_model(model)
 
     compared = 0
     for index, voxel in enumerate(voxels):
         measured = probe.measure_footprint_centroids(model, cfg, voxel)
+        scene_center = scene.voxel_centers([voxel])
         for view, (reason, row_centroid, channel_centroid) in enumerate(measured):
             if reason is not None:
                 # The footprint ran off the detector, so its centroid says
                 # nothing about where the point landed.
                 continue
             compared += 1
+            scene_row, scene_channel = scene.project_points(scene_center, view)
+            assert abs(float(scene_row[0]) - row_centroid) < GATE_PIXELS, (
+                f'{name} voxel {voxel} view {view}: scene row {float(scene_row[0])} '
+                f'against centroid {row_centroid}')
+            assert abs(float(scene_channel[0]) - channel_centroid) < GATE_PIXELS, (
+                f'{name} voxel {voxel} view {view}: scene channel '
+                f'{float(scene_channel[0])} against centroid {channel_centroid}')
             assert abs(row[view, index] - row_centroid) < GATE_PIXELS, (
                 f'{name} voxel {voxel} view {view}: row {row[view, index]} '
                 f'against centroid {row_centroid}')

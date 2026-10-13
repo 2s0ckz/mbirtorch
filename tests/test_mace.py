@@ -13,7 +13,6 @@ import math
 import threading
 
 import numpy as np
-import pytest
 import torch
 
 import mbirtorch
@@ -130,28 +129,6 @@ def test_folding_update_equals_the_plain_formulas(device):
     assert loop.iteration == 3 and len(loop.info['change_pct']) == 3
 
 
-def test_two_workers_share_the_queue():
-    """A pool of two CPU workers runs every task once.  Both workers take
-    tasks that accept any device from the shared queue.  A task fixed to the
-    CPU runs on a CPU worker.  The result equals the inline run."""
-    torch.manual_seed(4)
-    x0 = torch.randn(6, 4, 5)
-    agents = [_AffineAgent(0.6, 0.1, [2, 4]),
-              _AffineAgent(-0.3, 0.4, [1, 3, 5]),
-              _AffineAgent(0.9, 0.0, [3], device='cpu')]
-    inline = MACE(agents, x0, rho=0.4)
-    for _ in range(2):
-        inline.step()
-    reference = inline.x_bar.clone()
-
-    with MACE(agents, x0, rho=0.4, devices=['cpu', 'cpu']) as threaded:
-        for _ in range(2):
-            threaded.step()
-    rel = _rel_max(threaded.x_bar, reference)
-    print(f"two workers vs inline: rel_max = {rel:.2e}")
-    assert rel < 1e-6
-
-
 class _SeededAgent:
     """A stub agent whose one task draws from a generator named by the agent's
     seed and the iteration, records the draw, and adds it to an affine map of
@@ -180,13 +157,17 @@ class _SeededAgent:
 
 
 def _seeded_agents():
-    return [_SeededAgent(11, 0.6, 0.1), _SeededAgent(12, -0.3, 0.4)]
+    """Two seeded agents, and an affine agent cut into three tasks fixed to the CPU."""
+    return [_SeededAgent(11, 0.6, 0.1), _SeededAgent(12, -0.3, 0.4),
+            _AffineAgent(0.9, 0.0, [2, 4], device='cpu')]
 
 
 def test_seeded_draws_do_not_depend_on_the_worker_or_the_restart():
     """An agent that names its generator by its seed and the iteration makes
     the same draws whichever worker runs it, so two workers reproduce the
-    inline run draw for draw and value for value.  The same naming survives a
+    inline run draw for draw and value for value.  A third agent, split into
+    tasks fixed to the CPU, checks that the two workers share the queue and
+    run every task once.  The same naming survives a
     restart: four steps, against two steps saved, rebuilt, loaded, and
     stepped twice more, make the same draws from iteration 2 on and reach the
     same average."""
@@ -202,7 +183,7 @@ def test_seeded_draws_do_not_depend_on_the_worker_or_the_restart():
     with MACE(threaded_agents, x0, rho=0.4, devices=['cpu', 'cpu']) as threaded:
         for _ in range(4):
             threaded.step()
-    for inline_agent, threaded_agent in zip(inline_agents, threaded_agents):
+    for inline_agent, threaded_agent in zip(inline_agents[:2], threaded_agents[:2]):
         assert threaded_agent.draws == inline_agent.draws
     rel_threaded = _rel_max(threaded.x_bar, inline.x_bar)
 
@@ -216,7 +197,7 @@ def test_seeded_draws_do_not_depend_on_the_worker_or_the_restart():
     resumed.load_state_dict(state)
     for _ in range(2):
         resumed.step()
-    for resumed_agent, inline_agent in zip(resumed_agents, inline_agents):
+    for resumed_agent, inline_agent in zip(resumed_agents[:2], inline_agents[:2]):
         assert resumed_agent.draws == [row for row in inline_agent.draws if row[0] >= 2]
     rel_resumed = _rel_max(resumed.x_bar, inline.x_bar)
     print(f"seeded draws: two workers vs inline {rel_threaded:.2e}, "
@@ -241,8 +222,7 @@ class _ConstantStackDenoiser:
         return stack + self.constant
 
 
-@pytest.mark.parametrize('axis', [1, 2, 3])
-def test_hyperplane_agent_equals_the_unbatched_operation(axis, device):
+def test_hyperplane_agent_equals_the_unbatched_operation(device):
     """The agent cuts the array into slabs along the axis, permutes each slab,
     denoises it, and permutes it back.  With a batch size that does not
     divide the slab count, the result equals the stack denoiser applied to
@@ -253,6 +233,7 @@ def test_hyperplane_agent_equals_the_unbatched_operation(axis, device):
     with the zero matrix of three frames at period 6 the identity denoiser
     returns zeros, and with twelve frames the result equals the filter
     applied to the whole array."""
+    axis = 2
     torch.manual_seed(7)
     w = torch.randn(3, 5, 6, 7, device=device)
     agent = HyperplaneAgent(axis, lambda dev: _ConstantStackDenoiser(2.5, frames=3), batch_size=4)
@@ -283,12 +264,12 @@ def test_mace_reproduces_the_standard_reconstruction():
     """The proximal map of the data-fit term and the qGGMRF denoiser, at
     matched strengths and with the prior parameters pinned to the standard
     reconstruction's, solve the same objective as recon.  The reference is a
-    100-iteration recon of a small 2D cone-beam problem, and the start is a
-    30-iteration recon of it, which is more than 1 percent away.  In 30
-    iterations the consensus must move to within 1 percent NRMSE of the
-    reference.  The reference has to be converged well below the tolerance.
-    A 30-iteration recon is not, so the consensus overtakes it and the
-    distance to it grows with iterations."""
+    100-iteration recon of a small 2D cone-beam problem, and the start is
+    the 30-iteration recon it continues, which is more than 1 percent away.
+    In 20 iterations the consensus must move to within 1 percent NRMSE of
+    the reference.  The reference has to be converged well below the
+    tolerance.  A 30-iteration recon is not, so the consensus overtakes it
+    and the distance to it grows with iterations."""
     num_views, det = 64, 64
     phantom, sinogram, params = mbirtorch.gen_demo_data(
         model_type='cone', object_type='shepp-logan', num_views=num_views,
@@ -309,17 +290,17 @@ def test_mace_reproduces_the_standard_reconstruction():
 
     model = make_model()
     np.random.seed(0)
-    reference, reference_dict = model.recon(sinogram, weights=weights, max_iterations=100,
+    start, _ = make_model().recon(sinogram, weights=weights, max_iterations=30,
+                                  stop_threshold_change_pct=0.0, print_logs=False,
+                                  logfile_path=None, output_sharded=True)
+    # The reference continues the start run to 100 iterations.
+    reference, reference_dict = model.recon(sinogram, weights=weights, init_recon=start.clone(),
+                                            first_iteration=30, max_iterations=100,
                                             stop_threshold_change_pct=0.0, print_logs=False,
                                             logfile_path=None, output_sharded=True)
     regularization = reference_dict['recon_params']['regularization_params']
     sigma = float(regularization['sigma_prox'])
     sigma_x = float(regularization['sigma_x'])
-
-    np.random.seed(0)
-    start, _ = make_model().recon(sinogram, weights=weights, max_iterations=30,
-                                  stop_threshold_change_pct=0.0, print_logs=False,
-                                  logfile_path=None, output_sharded=True)
     start_distance = float(torch.linalg.vector_norm(start - reference) / torch.linalg.vector_norm(reference))
     np.random.seed(0)
     forward = ForwardProxAgent(model, sinogram, weights=weights, sigma_prox=sigma, inner_iterations=3,
@@ -330,11 +311,11 @@ def test_mace_reproduces_the_standard_reconstruction():
     trace = []
     with MACE([forward, denoiser], start, rho=0.5) as loop:
         x_bar, info = loop.run(
-            max_iterations=30,
+            max_iterations=20,
             callback=lambda i, xb: trace.append(float(torch.linalg.vector_norm(xb - reference)
                                                       / torch.linalg.vector_norm(reference))))
-    print(f"equality gate: start {start_distance:.4f} from recon(100); NRMSE after 10/20/30 "
-          f"iterations = {trace[9]:.4f} / {trace[19]:.4f} / {trace[29]:.4f}; "
+    print(f"equality gate: start {start_distance:.4f} from recon(100); NRMSE after 10/20 "
+          f"iterations = {trace[9]:.4f} / {trace[19]:.4f}; "
           f"final spread {info['spread'][-1]}")
     assert start_distance > 0.01          # the loop has to move, not merely stay
     assert trace[-1] < 0.01

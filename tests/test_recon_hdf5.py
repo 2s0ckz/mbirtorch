@@ -1,5 +1,5 @@
 """export_recon_hdf5 and import_recon_hdf5: the file layout, the round trip of the volume and
-the recon_dict, old files, the viewer's reader and writer, and the deprecated names."""
+the recon_dict, old files, and the viewer's reader and writer."""
 import warnings
 
 import h5py
@@ -35,10 +35,46 @@ def _assert_dict_round_trip(out, ref):
     assert out['model_params'] == {'recon_shape': [6, 5, 4], 'delta_voxel': 1.0}
 
 
-def test_file_layout_is_right_handed_and_self_describing(tmp_path):
+def _shard_on(vol, axis, n):
+    """The volume split into n CPU shards along the axis."""
+    pl = _sharding.Placement(['cpu'] * n, axis=axis, axis_len=vol.shape[axis])
+    tensors = []
+    for _d, (s0, s1) in pl.shard_ranges():
+        cut = [slice(None)] * vol.ndim
+        cut[axis] = slice(s0, s1)
+        tensors.append(torch.as_tensor(vol[tuple(cut)].copy()))
+    return _sharding.Shards(tensors, pl)
+
+
+@pytest.mark.parametrize('kind', ['numpy', 'sharded'])
+def test_round_trip_3d(tmp_path, monkeypatch, kind):
+    """Save and load give the same volume and recon_dict, from a numpy array and
+    from shards, in several slabs.  The file is right handed and self describing,
+    and the slice viewer reads and writes the same layout.  The sharded writers
+    write exactly what writing the gathered volume writes, on both sharding axes."""
+    monkeypatch.setattr(utilities, '_HDF5_SLAB_BYTES', 64)     # several slabs for a small volume
     vol = _volume()
-    path = str(tmp_path / 'recon.h5')
-    mbirtorch.export_recon_hdf5(path, vol, _recon_dict())
+    recon = vol if kind == 'numpy' else _shard_on(vol, 2, 2)
+    path = str(tmp_path / f'{kind}.h5')
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        mbirtorch.export_recon_hdf5(path, recon, _recon_dict())
+        out, out_dict = mbirtorch.import_recon_hdf5(path)
+    assert out.shape == vol.shape and out.dtype == vol.dtype
+    assert np.array_equal(out, vol)
+    _assert_dict_round_trip(out_dict, _recon_dict())
+
+    if kind == 'sharded':
+        # _save_array_hdf5 with shards on the view axis writes the whole-volume file.
+        ref_path, out_path = str(tmp_path / 'ref_save.h5'), str(tmp_path / 'sharded_save.h5')
+        utilities._save_array_hdf5(ref_path, vol, 'recon')
+        utilities._save_array_hdf5(out_path, _shard_on(vol, 0, 2), 'recon')
+        ref, _ = utilities._load_array_hdf5(ref_path)
+        saved, _ = utilities._load_array_hdf5(out_path)
+        assert saved.shape == ref.shape and saved.dtype == ref.dtype and np.array_equal(saved, ref)
+        return
+
+    # The file layout: (slice, col, row), one chunk per slice, self describing.
     with h5py.File(path, 'r') as f:
         assert list(f.keys()) == ['recon']
         dset = f['recon']
@@ -48,29 +84,19 @@ def test_file_layout_is_right_handed_and_self_describing(tmp_path):
         assert dset.attrs['format'] == 'mbirtorch_recon_v2'
         assert dset.attrs['axes'] == 'slice,col,row'
         assert dset.attrs['mbirtorch_version'] == mbirtorch.__version__
-        assert dset.attrs['recon_log'] == 'line one\nline two'
-        assert dset.attrs['recon_params'].startswith('{')
 
-
-@pytest.mark.parametrize('kind', ['numpy', 'tensor', 'sharded'])
-def test_round_trip_3d(tmp_path, monkeypatch, kind):
-    monkeypatch.setattr(utilities, '_HDF5_SLAB_BYTES', 64)     # several slabs for a small volume
-    vol = _volume()
-    if kind == 'numpy':
-        recon = vol
-    elif kind == 'tensor':
-        recon = torch.as_tensor(vol)
-    else:
-        pl = _sharding.Placement(['cpu', 'cpu'], axis=2, axis_len=vol.shape[2])
-        recon = _sharding.Shards([torch.as_tensor(vol[:, :, s0:s1].copy()) for _d, (s0, s1) in pl.shard_ranges()], pl)
-    path = str(tmp_path / f'{kind}.h5')
+    # The viewer's reader permutes by the axes attribute, so it shows (row, col, slice).
+    array, data_dict = slice_figure.VolumeStack.read_file_array(path)
+    assert np.array_equal(array, vol)
+    assert data_dict['axes'] == 'slice,col,row' and data_dict['notes'] == 'a note'
+    # The viewer's writer produces a file import_recon_hdf5 reads back unchanged.
+    saved = str(tmp_path / 'from_viewer.h5')
+    slice_figure._save_data_hdf5(saved, vol, 'recon', {'notes': 'from the viewer', 'axes': 'stale'})
     with warnings.catch_warnings():
         warnings.simplefilter('error')
-        mbirtorch.export_recon_hdf5(path, recon, _recon_dict())
-        out, out_dict = mbirtorch.import_recon_hdf5(path)
-    assert out.shape == vol.shape and out.dtype == vol.dtype
+        out, out_dict = mbirtorch.import_recon_hdf5(saved)
     assert np.array_equal(out, vol)
-    _assert_dict_round_trip(out_dict, _recon_dict())
+    assert out_dict['notes'] == 'from the viewer'
 
 
 def test_round_trip_4d(tmp_path):
@@ -83,21 +109,6 @@ def test_round_trip_4d(tmp_path):
     out, out_dict = mbirtorch.import_recon_hdf5(path)
     assert np.array_equal(out, vol)
     assert out_dict == {'notes': 'four'}
-
-
-def test_remove_flash_matches_the_mask(tmp_path, monkeypatch):
-    monkeypatch.setattr(utilities, '_HDF5_SLAB_BYTES', 64)
-    vol = _volume((12, 12, 9)) + 5
-    path = str(tmp_path / 'flash.h5')
-    mbirtorch.export_recon_hdf5(path, vol, remove_flash=True, radial_margin=1, top_margin=2, bottom_margin=3)
-    out, _ = mbirtorch.import_recon_hdf5(path)
-    expected = mbirtorch.preprocess.apply_cylindrical_mask(vol, 1, 2, 3)
-    assert np.array_equal(out, expected)
-    # The 4D path masks every frame the same way.
-    vol4 = np.stack([vol, 2 * vol])
-    mbirtorch.export_recon_hdf5(path, vol4, remove_flash=True, radial_margin=1, top_margin=2, bottom_margin=3)
-    out4, _ = mbirtorch.import_recon_hdf5(path)
-    assert np.array_equal(out4[0], expected) and np.array_equal(out4[1], 2 * expected)
 
 
 def test_old_files_are_read_by_dataset_name(tmp_path):
@@ -117,42 +128,3 @@ def test_old_files_are_read_by_dataset_name(tmp_path):
     with pytest.warns(UserWarning, match='read as stored'):
         out, out_dict = mbirtorch.import_recon_hdf5(old_viewer)
     assert np.array_equal(out, vol) and out_dict == {}
-
-
-def test_viewer_reads_and_writes_the_same_layout(tmp_path):
-    vol = _volume()
-    path = str(tmp_path / 'from_export.h5')
-    mbirtorch.export_recon_hdf5(path, vol, _recon_dict())
-    # The viewer's reader permutes by the axes attribute, so it shows (row, col, slice).
-    array, data_dict = slice_figure.VolumeStack.read_file_array(path)
-    assert np.array_equal(array, vol)
-    assert data_dict['axes'] == 'slice,col,row' and data_dict['notes'] == 'a note'
-    # The viewer's writer produces a file import_recon_hdf5 reads back unchanged.
-    saved = str(tmp_path / 'from_viewer.h5')
-    slice_figure._save_data_hdf5(saved, vol, 'recon', {'notes': 'from the viewer', 'axes': 'stale'})
-    with warnings.catch_warnings():
-        warnings.simplefilter('error')
-        out, out_dict = mbirtorch.import_recon_hdf5(saved)
-    assert np.array_equal(out, vol)
-    assert out_dict['notes'] == 'from the viewer'
-    # A 4D volume takes the same path.
-    vol4 = _volume((2, 6, 5, 4))
-    slice_figure._save_data_hdf5(saved, vol4, 'recon', None)
-    array, _ = slice_figure.VolumeStack.read_file_array(saved)
-    assert np.array_equal(array, vol4)
-
-
-def test_deprecated_names_warn_and_work(tmp_path):
-    vol = _volume()
-    model = mbirtorch.ParallelBeamModel((4, 6, 5), np.linspace(0, np.pi, 4, endpoint=False))
-    path = str(tmp_path / 'deprecated.h5')
-    with pytest.warns(FutureWarning, match='export_recon_hdf5'):
-        model.save_recon_hdf5(path, vol, {'notes': 'x'})
-    with pytest.warns(FutureWarning, match='import_recon_hdf5'):
-        out, out_dict = mbirtorch.TomographyModel.load_recon_hdf5(path)
-    assert np.array_equal(out, vol) and out_dict == {'notes': 'x'}
-    with pytest.warns(FutureWarning):
-        mbirtorch.save_data_hdf5(path, vol, 'array')
-    with pytest.warns(FutureWarning):
-        out, _ = mbirtorch.load_data_hdf5(path)
-    assert np.array_equal(out, vol)

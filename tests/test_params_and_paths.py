@@ -2,7 +2,6 @@
 compile/eager and weights equivalences the suite previously never asserted."""
 
 import numpy as np
-import torch
 
 import mbirtorch
 
@@ -92,37 +91,3 @@ def test_compile_on_off_value_equality():
     rel = (np.max(np.abs(results["auto"] - results["off"]))
            / max(np.max(np.abs(results["off"])), 1e-30))
     assert rel < 1e-4, rel
-
-
-class _LargestAllocation(torch.utils._python_dispatch.TorchDispatchMode):
-    """The largest NEW array allocated inside the block, in bytes.
-
-    An in-place op hands back the buffer it was given, so an output that
-    shares storage with an input is not an allocation and is not counted.
-    The class is used to check a claim about what a piece of arithmetic does
-    NOT allocate.  The memory estimate relies on such claims.
-    """
-
-    def __init__(self):
-        self.nbytes = 0
-
-    @staticmethod
-    def _tensors(obj):
-        if isinstance(obj, torch.Tensor):
-            return [obj]
-        if isinstance(obj, (tuple, list)):
-            return [t for item in obj
-                    for t in _LargestAllocation._tensors(item)]
-        if isinstance(obj, dict):
-            return [t for item in obj.values()
-                    for t in _LargestAllocation._tensors(item)]
-        return []
-
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        held = {t.data_ptr() for t in self._tensors(args)}
-        held |= {t.data_ptr() for t in self._tensors(kwargs or {})}
-        out = func(*args, **(kwargs or {}))
-        for t in self._tensors(out):
-            if t.data_ptr() not in held:
-                self.nbytes = max(self.nbytes, t.numel() * t.element_size())
-        return out

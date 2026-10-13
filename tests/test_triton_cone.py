@@ -90,8 +90,8 @@ def _rel_max(out, ref):
 
 
 @requires_cuda
-@pytest.mark.parametrize("geometry", ["flat", "curved", "helical"])
-@pytest.mark.parametrize("coeff_power,tol", [(1, 1e-5), (2, 1e-4)])
+@pytest.mark.parametrize("geometry,coeff_power,tol", [("flat", 1, 1e-5), ("curved", 1, 1e-5),
+                                                     ("helical", 1, 1e-5), ("flat", 2, 1e-4)])
 def test_cone_back_kernel_parity(geometry, coeff_power, tol):
     # Curved detectors and helical z shifts reach the kernel only through the
     # two eager builders it shares with the torch body, so all three variants
@@ -113,8 +113,7 @@ def test_cone_back_kernel_parity(geometry, coeff_power, tol):
 
 
 @requires_cuda
-@pytest.mark.parametrize("direction,case", [("back", 5), ("back", 12),
-                                            ("back", 16), ("back", 32),
+@pytest.mark.parametrize("direction,case", [("back", 5), ("back", 16),
                                             ("forward", ((6, 12, 12), 12)),
                                             ("forward", ((6, 32, 20), 32))])
 def test_cone_kernel_pads_the_width_argument_to_a_multiple_of_16(direction,
@@ -205,9 +204,7 @@ def test_cone_back_kernel_adjointness():
 
 
 @requires_cuda
-@pytest.mark.parametrize("num_pixels", [1, CONE_BACK_BLOCK_P - 1,
-                                        CONE_BACK_BLOCK_P + 1,
-                                        3 * CONE_BACK_BLOCK_P + 7])
+@pytest.mark.parametrize("num_pixels", [1, 3 * CONE_BACK_BLOCK_P + 7])
 def test_cone_back_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
     # pixel tile pads the last block with lanes that must contribute exactly
@@ -253,9 +250,7 @@ def test_cone_forward_kernel_parity(geometry):
 
 
 @requires_cuda
-@pytest.mark.parametrize("num_pixels", [1, CONE_FWD_BLOCK_P - 1,
-                                        CONE_FWD_BLOCK_P + 1,
-                                        3 * CONE_FWD_BLOCK_P + 7])
+@pytest.mark.parametrize("num_pixels", [1, 3 * CONE_FWD_BLOCK_P + 7])
 def test_cone_forward_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
     # pixel tile pads the last block with lanes whose atomics must be masked

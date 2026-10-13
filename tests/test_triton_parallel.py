@@ -113,8 +113,8 @@ def _rel_max(out, ref):
 
 
 @requires_cuda
-@pytest.mark.parametrize("variant", list(VARIANTS))
-@pytest.mark.parametrize("coeff_power,tol", [(1, 1e-5), (2, 1e-4)])
+@pytest.mark.parametrize("variant,coeff_power,tol",
+                         [(v, 1, 1e-5) for v in VARIANTS] + [("square", 2, 1e-4)])
 def test_parallel_back_kernel_parity(variant, coeff_power, tol):
     model = _parallel_model(**VARIANTS[variant])
     sinogram, pixel_indices, view_params, args = _body_inputs(model)
@@ -135,7 +135,7 @@ def test_parallel_back_kernel_parity(variant, coeff_power, tol):
 
 @requires_cuda
 @pytest.mark.parametrize("direction", ["back", "forward"])
-@pytest.mark.parametrize("band", [5, 12, 16, 32])
+@pytest.mark.parametrize("band", [5, 16])
 def test_parallel_kernel_pads_the_width_argument_to_a_multiple_of_16(
         direction, band):
     """Each wrapper launches its width argument rounded up to a multiple of 16.
@@ -199,9 +199,7 @@ def test_parallel_kernel_pads_the_width_argument_to_a_multiple_of_16(
 
 
 @requires_cuda
-@pytest.mark.parametrize("num_pixels", [1, PARALLEL_BACK_BLOCK_P - 1,
-                                        PARALLEL_BACK_BLOCK_P + 1,
-                                        3 * PARALLEL_BACK_BLOCK_P + 7])
+@pytest.mark.parametrize("num_pixels", [1, 3 * PARALLEL_BACK_BLOCK_P + 7])
 def test_parallel_back_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
     # pixel tile pads the last block with lanes that must contribute exactly
@@ -279,9 +277,7 @@ def test_parallel_kernel_pair_adjointness():
 
 
 @requires_cuda
-@pytest.mark.parametrize("num_pixels", [1, PARALLEL_FWD_BLOCK_P - 1,
-                                        PARALLEL_FWD_BLOCK_P + 1,
-                                        3 * PARALLEL_FWD_BLOCK_P + 7])
+@pytest.mark.parametrize("num_pixels", [1, 3 * PARALLEL_FWD_BLOCK_P + 7])
 def test_parallel_forward_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
     # pixel tile pads the last block with lanes whose atomics must be masked

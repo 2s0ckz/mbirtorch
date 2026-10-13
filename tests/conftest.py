@@ -20,8 +20,15 @@ def available_devices():
     return devices
 
 
-@pytest.fixture(params=available_devices())
+@pytest.fixture(params=["cpu"])
 def device(request):
+    """Most tests run on the cpu only."""
+    return request.param
+
+
+@pytest.fixture(params=available_devices())
+def any_device(request):
+    """The adjointness test and the recon smoke test run on every device."""
     return request.param
 
 

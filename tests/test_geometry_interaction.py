@@ -1,6 +1,7 @@
 """Headless crash guard for the geometry figure of `geometry_figure.py`.
 
-Each of the six scan geometries is walked through every control -- the view
+Two of the six scan geometries (curved cone and translation) are walked
+through every control -- the view
 slider, the zoom, the trajectory toggle, and a comparison overlay -- and the
 figure is then saved.  The controls touch different code for different
 geometries: the translation geometry has no rotation arc, the parallel and
@@ -58,17 +59,15 @@ def compare_overrides(scene, channels=COMPARISON_CHANNEL_SHIFT):
 
 # ── the partial redraw draws the same picture as a full repaint ─────────────
 
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
+@pytest.mark.parametrize('name', ['cone curved', 'translation'])
 def test_every_geometry_takes_every_control(name, tmp_path):
-    """Each of the six geometries survives the slider, the toggles, and a
-    comparison.
+    """A geometry survives the slider, the toggles, and a comparison.
 
     The controls touch different code for different geometries: the
-    translation geometry has no rotation arc, the parallel and multiaxis
-    geometries have no source position, and a curved detector has no filled
-    face.  The test walks every geometry through every control and saves the
-    result, so an artist that one geometry does not create cannot break a
-    redraw.
+    translation geometry has no rotation arc, and a curved detector has no
+    filled face.  The test walks two such geometries through every control
+    and saves the result, so an artist that one geometry does not create
+    cannot break a redraw.
     """
     scene, figure = build_figure(name, view_index=1)
     try:

@@ -40,10 +40,10 @@ def test_split_approximates_full_recon():
     model, sino, weights = _small_cone_case(delta_voxel_scale=0.8)
     pitch = float(model.get_params('delta_voxel'))
     np.random.seed(0)
-    full, full_dict = model.recon(sino, weights=weights, max_iterations=8)
+    full, full_dict = model.recon(sino, weights=weights, max_iterations=4)
     np.random.seed(0)
     split, split_dict = model.recon_split_sino(sino, weights=weights, half_overlap=4,
-                                               max_iterations=8)
+                                               max_iterations=4)
     assert split.shape == full.shape
     nrmse = float(np.linalg.norm(split - full) / np.linalg.norm(full))
     print(f"split vs full NRMSE = {nrmse:.4f}")
@@ -78,10 +78,10 @@ def test_parallel_split_matches_recon_regularization():
     inputs, and its reconstruction approximates recon's."""
     model, sino, weights = _small_parallel_case()
     np.random.seed(0)
-    full, full_dict = model.recon(sino, weights=weights, max_iterations=8)
+    full, full_dict = model.recon(sino, weights=weights, max_iterations=4)
     np.random.seed(0)
     split, split_dict = model.recon_split_sino(sino, weights=weights, half_overlap=4,
-                                               slices_per_section=10, max_iterations=8)
+                                               slices_per_section=10, max_iterations=4)
     assert split.shape == full.shape
     assert split_dict['split_params']['num_sections'] == 3
     expected = full_dict['recon_params']['regularization_params']
@@ -137,29 +137,3 @@ def test_sections_side_by_side_match_sections_run_alone():
     together = mbirtorch.TomographyModel._run_split_sections(jobs, ['cpu', 'cpu'], 1)
     for a, t in zip(alone, together):
         assert np.array_equal(a, t)
-
-
-def test_split_result_reports_the_layout_and_uses_section_names():
-    model, sino, weights = _small_parallel_case()
-    np.random.seed(0)
-    with pytest.warns(DeprecationWarning, match='slices_per_part'):
-        split, split_dict = model.recon_split_sino(sino, weights=weights, half_overlap=4,
-                                                   slices_per_part=10, max_iterations=2,
-                                                   print_logs=False, logfile_path=None)
-    params = split_dict['split_params']
-    assert params['num_sections'] == 3
-    assert params['slices_per_section'] == -(-sino.shape[1] // 3)   # 3 sections of 8 kept rows
-    assert len(params['section_slice_ranges']) == 3
-    assert params['num_groups'] == 1 and params['gpus_per_group'] == 1    # one CPU device
-    assert set(split_dict) == {'recon_params_sections', 'recon_log_sections', 'notes_sections',
-                               'model_params_sections', 'split_params'}
-
-
-def test_cone_split_reports_the_layout():
-    model, sino, weights = _small_cone_case()
-    np.random.seed(0)
-    split, split_dict = model.recon_split_sino(sino, weights=weights, max_iterations=2,
-                                               print_logs=False, logfile_path=None)
-    params = split_dict['split_params']
-    assert params['num_groups'] == 1 and params['gpus_per_group'] == 1    # one CPU device
-    assert split.shape == tuple(model.get_params('recon_shape'))

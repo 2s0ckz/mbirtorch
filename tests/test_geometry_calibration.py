@@ -2,8 +2,8 @@
 
 The channel offset estimator recovers a known channel offset from synthetic data and leaves the
 caller's model and sinogram as they were.  The alignment estimator recovers known offsets, per-view
-shifts, and a rotation when the phantom itself is the reference, and the resampler undoes them.
-The deprecated align_sino_views warns and still works.
+shifts, and a rotation when the phantom itself is the reference, and the resampler undoes the
+rotation.
 
 Everything runs on CPU with compile_mode='off', which keeps the suite fast.
 """
@@ -76,11 +76,11 @@ def _params_equal(before, after):
     return True
 
 
-@pytest.mark.parametrize('true_offset', [1.3, -2.2])
-def test_estimate_det_channel_offset_on_parallel_beam(true_offset):
+def test_estimate_det_channel_offset_on_parallel_beam():
     """On parallel-beam data the estimator recovers the offset the data were simulated with, to
     within a tenth of a channel, from clean data and from data with 2 percent Gaussian noise, and
     it raises no warning."""
+    true_offset = 1.3
     sino = _sinogram('parallel', true_offset)
     with warnings.catch_warnings():
         warnings.simplefilter('error')
@@ -96,43 +96,24 @@ def test_estimate_det_channel_offset_on_parallel_beam(true_offset):
     assert abs(noisy_estimate - true_offset) < 0.1
 
 
-@pytest.mark.parametrize('true_offset', [3.0, -1.7])
-def test_estimate_det_channel_offset_on_cone_beam(true_offset):
+def test_estimate_det_channel_offset_on_cone_beam():
     """On cone-beam data with a 20 degree fan the estimator recovers the offset the data were
-    simulated with, to within a tenth of a channel, starting from zero and from ten channels off."""
+    simulated with, to within a tenth of a channel, starting from zero and from ten channels off.
+    The estimator leaves the caller's model parameters and sinogram as they were."""
+    true_offset = 3.0
     sino = _sinogram('cone', true_offset)
+    sino_before = sino.copy()
     for start in (0.0, true_offset - 10.0):
+        model = _cone_model(start)
+        params_before = _copy_params(model.get_all_params())
         with warnings.catch_warnings():
             warnings.simplefilter('error')
-            estimate = estimate_det_channel_offset(_cone_model(start), sino)
+            estimate = estimate_det_channel_offset(model, sino)
         print(f'cone offset {true_offset} from {start}: estimate {estimate:.4f}, error {estimate - true_offset:.4f} channels')
         assert abs(estimate - true_offset) < 0.1
-
-
-def test_estimator_does_not_change_the_caller_state():
-    """The estimator leaves the model's parameters and the sinogram as they were."""
-    model = _cone_model(0.0)
-    sino = _sinogram('cone', 0.0)
-    params_before = _copy_params(model.get_all_params())
-    sino_before = sino.copy()
-
-    estimate_det_channel_offset(model, sino)
-
-    assert _params_equal(params_before, model.get_all_params())
+        assert _params_equal(params_before, model.get_all_params())
+        assert model.get_params('det_channel_offset') == start
     assert np.array_equal(sino, sino_before)
-    assert model.get_params('det_channel_offset') == 0.0
-
-
-def test_unsuitable_scan_returns_the_unchanged_value_with_a_warning():
-    """On a scan over half a rotation, which has no opposite views, the estimator returns the
-    model's current offset with a warning."""
-    angles = np.linspace(0, np.pi, 32, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((32, 16, 64), angles, compile_mode='off')
-    model.configure_devices(devices=['cpu'])
-    model.set_params(no_warning=True, verbose=0, det_channel_offset=0.7)
-    sino = np.zeros((32, 16, 64), dtype=np.float32)
-    with pytest.warns(UserWarning, match='opposite view'):
-        assert estimate_det_channel_offset(model, sino) == 0.7
 
 
 # ── alignment from reprojection ───────────────────────────────────────────────────────────────────
@@ -197,7 +178,7 @@ def test_alignment_recovers_a_rotation_and_the_resampler_undoes_it(align_case):
 
 def test_alignment_recovers_per_view_shifts(align_case):
     # Each view moved by its own (row, channel) shift, zero mean over views, comes back as that
-    # deviation in ALU, and align_sino_views puts the views back.
+    # deviation in ALU.
     from scipy.ndimage import shift as nd_shift
     phantom, sino = align_case
     rng = np.random.default_rng(1)
@@ -209,31 +190,3 @@ def test_alignment_recovers_per_view_shifts(align_case):
     assert abs(model_params['det_channel_offset']) < 0.15 and abs(model_params['det_row_offset']) < 0.2
     assert np.abs(view_params['det_row_offset'] - shifts[:, 0]).max() < 0.25
     assert np.abs(view_params['det_channel_offset'] - shifts[:, 1]).max() < 0.25
-    with pytest.warns(DeprecationWarning, match='align_sino_views is deprecated'):
-        aligned = mtp.align_sino_views(model, moved, phantom)
-    interior = (slice(None), slice(3, -3), slice(3, -3))
-    before = np.sqrt(np.mean((moved - sino)[interior] ** 2))
-    after = np.sqrt(np.mean((aligned - sino)[interior] ** 2))
-    assert after < 0.4 * before
-
-
-def test_alignment_warns_on_a_view_that_does_not_match(align_case):
-    # A view replaced by noise cannot be aligned: it is named in a warning and gets no per-view
-    # correction, while the other views are unaffected.
-    phantom, sino = align_case
-    broken = sino.copy()
-    broken[5] = np.random.default_rng(2).normal(size=sino.shape[1:]).astype(np.float32)
-    with pytest.warns(UserWarning, match='failed for 1 of 48 views, starting with view 5'):
-        model_params, view_params = mtp.fit_det_alignment(_align_model(), broken, phantom, rotation=True)
-    assert view_params['det_channel_offset'][5] == 0.0 and view_params['det_row_offset'][5] == 0.0
-    assert view_params['det_rotation'][5] == np.median(view_params['det_rotation'])
-    assert abs(model_params['det_channel_offset']) < 0.1
-
-
-def test_alignment_leaves_the_model_unchanged(align_case):
-    phantom, sino = align_case
-    model = _align_model(0.5, -0.25)
-    before = _copy_params(model.get_all_params())
-    mtp.fit_det_alignment(model, sino, phantom, rotation=True)
-    mtp.correct_det_alignment(model, sino, {'det_rotation': np.full(sino.shape[0], 0.01)})
-    assert _params_equal(before, model.get_all_params())

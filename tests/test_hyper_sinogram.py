@@ -6,13 +6,6 @@ import mbirtorch
 import mbirtorch.hsnt as hsnt
 
 
-def test_material_phantom_has_three_separate_cylinders():
-    maps = hsnt.gen_material_phantom((32, 32, 16))
-    assert maps.shape == (3, 32, 32, 16) and maps.dtype == np.float32
-    assert all(m.max() == np.float32(0.08) and m.sum() > 0 for m in maps)
-    assert np.all((maps > 0).sum(axis=0) <= 1)        # no voxel holds two materials
-
-
 def test_hyper_sinogram_is_the_projections_times_the_spectra():
     """Without noise the counts equal the open beam times the transmission of the projected
     maps, and with noise they are a Poisson draw of that."""

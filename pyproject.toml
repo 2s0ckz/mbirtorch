@@ -75,6 +75,7 @@ docs = [
 
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
     "performance: timing-gate tests; exclude with -m 'not performance' on loaded machines",
 ]

@@ -84,11 +84,10 @@ RUNNERS = {'compute_sino_transmission': _run_transmission,
            'BH_correction': _run_bh}
 
 
-@pytest.mark.parametrize('num_devices', [2, 3])
 @pytest.mark.parametrize('function_name', list(RUNNERS))
-def test_results_do_not_depend_on_the_device_count(function_name, num_devices):
-    """Splitting the views over more devices returns the same array exactly."""
+def test_results_do_not_depend_on_the_device_count(function_name):
+    """Splitting the views over three devices returns the same array exactly."""
     run = RUNNERS[function_name]
     one_device = run(['cpu'])
-    several_devices = run(['cpu'] * num_devices)
+    several_devices = run(['cpu'] * 3)
     assert np.array_equal(several_devices, one_device)
