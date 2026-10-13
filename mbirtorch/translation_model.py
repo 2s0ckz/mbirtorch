@@ -535,14 +535,22 @@ class TranslationModel(TomographyModel):
         """This method finds the translation step along x.
 
         The step is the median spacing between neighboring object positions along x, in ALU.
+        The method warns when the spacings differ by more than one voxel, because the TCT direct
+        reconstruction assumes one spacing and its scale is then approximate.
         """
         translation_vectors = np.asarray(self.get_params('translation_vectors'), dtype=np.float64)
-        x_positions, _ = _find_obj_positions(translation_vectors, 'x',
-                                             self.get_params('delta_voxel'))
+        delta_voxel = self.get_params('delta_voxel')
+        x_positions, _ = _find_obj_positions(translation_vectors, 'x', delta_voxel)
         if len(x_positions) < 2:
             raise ValueError('The TCT direct reconstruction needs at least two '
                              'distinct x translations.')
-        return float(np.median(np.diff(x_positions)))
+        spacings = np.diff(x_positions)
+        if spacings.max() - spacings.min() > delta_voxel:
+            warnings.warn(f'The x translations are not evenly spaced: the spacings range from '
+                          f'{spacings.min():.3g} to {spacings.max():.3g} ALU.  The TCT direct '
+                          f'reconstruction uses the median spacing, so its scale is approximate.',
+                          stacklevel=2)
+        return float(np.median(spacings))
 
     def _count_translation_rows(self):
         """This method counts the number of translation rows that record each voxel.
