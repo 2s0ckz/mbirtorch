@@ -198,25 +198,20 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     return out
 
 
-def _find_obj_positions(translation_vectors, axis, voxel_pitch):
-    """This function finds the unique object positions along one axis.
+def _find_obj_positions(translation_vectors, axis):
+    """This function finds the distinct object positions along one axis.
 
     ``axis`` is 'x', 'y', or 'z'.  The translations recorded at one position differ by small
-    position errors.  Two translations are the same position when they differ by less than
-    ``voxel_pitch``.  Each position is the mean of its translations.  The function returns the
-    positions in increasing order and the position index of each view, with shape (num_views,).
+    position errors, and the positions are separated by gaps that are much larger than those
+    errors.  The function groups the translations with :func:`utilities._cluster_1d`.  Each
+    position is the mean of its translations.  The function returns the positions in increasing
+    order and the position index of each view, with shape (num_views,).
     """
+    from .utilities import _cluster_1d
     if axis not in ('x', 'y', 'z'):
         raise ValueError(f"axis must be 'x', 'y', or 'z'; got {axis!r}.")
     translations = np.asarray(translation_vectors)[:, 'xyz'.index(axis)]
-    sorted_translations = np.sort(translations)
-    # A new position starts wherever two neighboring sorted translations differ by more than
-    # one voxel pitch.
-    starts = np.concatenate([[0], np.where(np.diff(sorted_translations) > voxel_pitch)[0] + 1])
-    ends = np.append(starts[1:], len(sorted_translations))
-    positions = np.array([sorted_translations[s:e].mean() for s, e in zip(starts, ends)])
-    position_index = np.argmin(np.abs(translations[:, None] - positions[None, :]), axis=1)
-    return positions, position_index
+    return _cluster_1d(translations)
 
 
 class TranslationModel(TomographyModel):
@@ -389,6 +384,11 @@ class TranslationModel(TomographyModel):
         view, so this warning is not needed."""
         return
 
+    def _warn_tct_direct_failed(self):
+        """This method warns that the x translations are not on a regular grid."""
+        warnings.warn('The TCT direct reconstruction failed because the x translations are not '
+                      'on a regular grid.  The result is zeros.', stacklevel=3)
+
     def direct_filter_tct(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         This method applies the filter of the TCT direct reconstruction to a sinogram.
@@ -396,8 +396,14 @@ class TranslationModel(TomographyModel):
         Each detector row is extended at each end by half its length with its end value,
         pre-weighted by the cosine weight, ramp filtered, and cropped back to its length.
         The result is scaled by a factor that depends on the translation step, the voxel
-        size, and the angles of the ray to each detector pixel.
+        size, and the angles of the ray to each detector pixel.  When the x translations are
+        not on a regular grid, the method warns and returns zeros.
         """
+        translation_step = self._tct_translation_step()
+        if translation_step is None:
+            self._warn_tct_direct_failed()
+            zeros = np.zeros(self.get_params('sinogram_shape'), dtype=np.float32)
+            return self._shard_sinogram(zeros) if output_sharded else zeros
         sinogram = self._shard_sinogram(sinogram)
         # The sinogram can be a Shards container, so the shape comes from the parameters.
         _, num_rows, num_channels = (int(x) for x in self.get_params('sinogram_shape'))
@@ -409,8 +415,7 @@ class TranslationModel(TomographyModel):
             ['delta_voxel', 'voxel_row_aspect', 'voxel_slice_aspect'])
         voxel_volume = delta_voxel ** 3 * voxel_row_aspect * voxel_slice_aspect
 
-        filter_scale = (self._tct_translation_step() * delta_det_row
-                        / (source_detector_dist * voxel_volume))
+        filter_scale = translation_step * delta_det_row / (source_detector_dist * voxel_volume)
 
         # Each row is extended at each end by half the detector width, preweighted by cosine
         # weight, ramp filtered, and cropped back to its length.
@@ -473,8 +478,13 @@ class TranslationModel(TomographyModel):
 
         Note:
             Translation tomography is a limited angle geometry, so this reconstruction is
-            approximate.  It is intended as an initial value for ``recon()``.
+            approximate.  It is intended as an initial value for ``recon()``.  When the x
+            translations are not on a regular grid, the method warns and returns zeros.
         """
+        if self._tct_translation_step() is None:
+            self._warn_tct_direct_failed()
+            zeros = np.zeros(self.get_params('recon_shape'), dtype=np.float32)
+            return self._shard_recon(zeros) if output_sharded else zeros
         # This call chooses the GPUs and checks memory for a direct reconstruction before any allocation.
         self._apply_device_policy(workload='direct')
         # The filter places the sinogram on the devices.  This method keeps no reference to the
@@ -535,21 +545,17 @@ class TranslationModel(TomographyModel):
         """This method finds the translation step along x.
 
         The step is the median spacing between neighboring object positions along x, in ALU.
-        The method warns when the spacings differ by more than one voxel, because the TCT direct
-        reconstruction assumes one spacing and its scale is then approximate.
+        The method returns None when the positions are not on a regular grid: there are fewer
+        than two positions, or the spacings differ by more than one voxel.
         """
         translation_vectors = np.asarray(self.get_params('translation_vectors'), dtype=np.float64)
         delta_voxel = self.get_params('delta_voxel')
-        x_positions, _ = _find_obj_positions(translation_vectors, 'x', delta_voxel)
+        x_positions, _ = _find_obj_positions(translation_vectors, 'x')
         if len(x_positions) < 2:
-            raise ValueError('The TCT direct reconstruction needs at least two '
-                             'distinct x translations.')
+            return None
         spacings = np.diff(x_positions)
         if spacings.max() - spacings.min() > delta_voxel:
-            warnings.warn(f'The x translations are not evenly spaced: the spacings range from '
-                          f'{spacings.min():.3g} to {spacings.max():.3g} ALU.  The TCT direct '
-                          f'reconstruction uses the median spacing, so its scale is approximate.',
-                          stacklevel=2)
+            return None
         return float(np.median(spacings))
 
     def _count_translation_rows(self):
@@ -563,13 +569,12 @@ class TranslationModel(TomographyModel):
         num_det_rows = int(self.get_params('sinogram_shape')[1])
         source_detector_dist = self.get_params('source_detector_dist')
         delta_det_row, det_row_offset = self.get_params(['delta_det_row', 'det_row_offset'])
-        delta_voxel, voxel_row_aspect, voxel_slice_aspect, recon_shape = self.get_params(
-            ['delta_voxel', 'voxel_row_aspect', 'voxel_slice_aspect', 'recon_shape'])
+        delta_voxel, voxel_row_aspect, recon_shape = self.get_params(
+            ['delta_voxel', 'voxel_row_aspect', 'recon_shape'])
         num_recon_rows, _, num_recon_slices = (int(x) for x in recon_shape)
         translation_vectors = np.asarray(self.get_params('translation_vectors'),
                                          dtype=np.float64)
-        z_positions, z_position_index = _find_obj_positions(translation_vectors, 'z',
-                                                            delta_voxel * voxel_slice_aspect)
+        z_positions, z_position_index = _find_obj_positions(translation_vectors, 'z')
         # Each translation row has one t_y and one t_z, the means over the views of the row.
         row_means = np.array([translation_vectors[z_position_index == k].mean(axis=0)
                               for k in range(len(z_positions))])

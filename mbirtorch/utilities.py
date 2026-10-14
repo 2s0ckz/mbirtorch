@@ -1799,6 +1799,64 @@ def gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z
     return translation_vectors
 
 
+def _cluster_1d(values):
+    """
+    This function groups numbers on a line into clusters.  The numbers in one cluster differ
+    by small errors, and the gaps between clusters are much larger than those errors.
+
+    The function sorts the values and takes the differences between neighbors.  The
+    differences form a small group, the errors, and a large group, the gaps between clusters.
+    Otsu's method finds the threshold between the two groups.  Each difference above the
+    threshold is a cut between two clusters.  When the differences do not form two groups, all
+    values form one cluster.  Three or fewer values always form one cluster.
+
+    Args:
+        values (array): The numbers to group, with shape (n,).
+
+    Returns:
+        centers (ndarray): The mean of each cluster, in increasing order.
+        labels (ndarray): The cluster index of each value, with shape (n,).
+    """
+    values = np.asarray(values, dtype=np.float64).ravel()
+    order = np.argsort(values, kind='stable')
+    differences = np.diff(values[order])
+    is_cut = np.zeros(len(differences), dtype=bool)
+    if len(values) > 3:
+        threshold = _otsu_threshold(differences)
+        large = differences > threshold
+        small = differences[~large]
+        # Two groups exist when the jump from the small group to the large group is larger than
+        # the spread of the small group.
+        if large.any() and differences[large].min() - small.max() > small.max() - small.min():
+            is_cut = large
+    # The label of each sorted value is the number of cuts before it.
+    sorted_labels = np.concatenate([[0], np.cumsum(is_cut)])
+    labels = np.empty(len(values), dtype=int)
+    labels[order] = sorted_labels
+    num_clusters = int(sorted_labels[-1]) + 1
+    centers = np.array([values[labels == k].mean() for k in range(num_clusters)])
+    return centers, labels
+
+
+def _otsu_threshold(x):
+    """
+    This function returns the threshold that splits the numbers in ``x`` into two groups with
+    the smallest total variance within the groups.  Values above the threshold are in the upper
+    group.  The threshold is the midpoint between the two sorted values that the split
+    separates.  ``x`` has at least two values.
+    """
+    x = np.sort(np.asarray(x, dtype=np.float64).ravel())
+    n = len(x)
+    # For each split i, the lower group is x[:i] and the upper group is x[i:].  The split with
+    # the largest variance between the groups has the smallest variance within them.
+    i = np.arange(1, n)
+    lower_sum = np.cumsum(x)[:-1]
+    upper_sum = x.sum() - lower_sum
+    between_variance = i * (n - i) * (lower_sum / i - upper_sum / (n - i)) ** 2
+    best = int(np.argmax(between_variance))
+    return 0.5 * (x[best] + x[best + 1])
+
+
 def _gen_polygon_phantom(recon_shape):
     """
     This function returns a phantom of one asymmetric polygon with five sides.  Every slice
