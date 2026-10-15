@@ -101,3 +101,36 @@ def test_direct_reconstruction_off_grid_warns_and_returns_zeros():
         filtered = model.direct_filter_tct(sinogram)
     assert filtered.shape == sinogram_shape
     assert not np.any(filtered)
+
+
+def test_direct_reconstruction_of_one_translation_row_has_the_right_scale():
+    """With one translation row the scan has one view at each x position.  The direct
+    reconstruction finds the translation step, and the strip has the right scale.
+
+    One row records only the center slices, so the mean is taken over these slices.  The
+    mean was 0.88 when this test was written.
+    """
+    translation_vectors = mbirtorch.gen_translation_vectors(
+        NUM_X_TRANSLATIONS, 1, x_spacing=X_STEP, z_spacing=Z_STEP)
+    sinogram_shape = (translation_vectors.shape[0], NUM_DET_ROWS, NUM_DET_CHANNELS)
+    model = mbirtorch.TranslationModel(sinogram_shape, translation_vectors,
+                                       source_detector_dist=SOURCE_DETECTOR_DIST,
+                                       source_iso_dist=SOURCE_ISO_DIST)
+    model.configure_devices(devices=["cpu"])
+    model.set_params(no_warning=True, verbose=0, recon_shape=RECON_SHAPE,
+                     delta_voxel=DELTA_VOXEL, voxel_row_aspect=VOXEL_ROW_ASPECT)
+
+    num_rows, num_cols, num_slices = RECON_SHAPE
+    first_col = num_cols // 2 - STRIP_WIDTH // 2
+    strip_cols = slice(first_col, first_col + STRIP_WIDTH)
+    phantom = np.zeros(RECON_SHAPE, dtype=np.float32)
+    phantom[:, strip_cols, :] = STRIP_VALUE
+
+    sinogram = np.asarray(model.forward_project(phantom))
+    recon = model.recon_direct_tct(sinogram)
+
+    assert np.all(np.isfinite(recon))
+    center_slices = slice(3 * num_slices // 8, 5 * num_slices // 8)
+    strip_mean = float(recon[1:-1, strip_cols, center_slices].mean()) / STRIP_VALUE
+    print(f"mean of the reconstructed strip / strip value = {strip_mean:.3f}")
+    assert VALUE_LOWER_BOUND < strip_mean < VALUE_UPPER_BOUND, strip_mean

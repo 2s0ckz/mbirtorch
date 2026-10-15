@@ -552,7 +552,12 @@ class TranslationModel(TomographyModel):
         delta_voxel = self.get_params('delta_voxel')
         x_positions, _ = _find_obj_positions(translation_vectors, 'x')
         if len(x_positions) < 2:
-            return None
+            # For a scan with one translation row, the clustering finds only one x position.
+            # In that case, each view is used as its own x position, unless the views share one
+            # x position.
+            x_positions = np.sort(translation_vectors[:, 0])
+            if len(x_positions) < 2 or np.diff(x_positions).min() <= delta_voxel:
+                return None
         spacings = np.diff(x_positions)
         if spacings.max() - spacings.min() > delta_voxel:
             return None
