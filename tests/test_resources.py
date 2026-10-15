@@ -36,3 +36,17 @@ def test_estimate_reports_and_leaves_the_model_unchanged():
         assert step.time_minutes > 0
     assert 'forward projection' in str(estimate) and 'back projection' in str(estimate)
     assert mbirtorch.estimate_resources(model, gpu_memory_gb=2.0001).recon.fits is False
+
+
+def test_single_device_forward_estimate_counts_every_pixel():
+    """On one device the forward projection passes every pixel to one call, so the pixel
+    batch that moves cylinders between devices must not shrink the estimate."""
+    import torch
+    one = [torch.device('cpu')]
+    model = _small_model()
+    full = max(model._estimate_memory(devices=one, workload='forward',
+                                      weights=None).per_device_peaks())
+    model.forward_project_pixel_batch = 16
+    batched = max(model._estimate_memory(devices=one, workload='forward',
+                                         weights=None).per_device_peaks())
+    assert batched == full

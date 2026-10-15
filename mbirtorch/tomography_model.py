@@ -423,7 +423,9 @@ class TomographyModel(ParameterHandler):
     def _run_split_sections(jobs, devices, gpus_per_group):
         """This method runs the sections of a split reconstruction, and it returns their results
         in order.  If there are several groups, each group runs in its own thread.  In that case,
-        each section gets its own random generator, seeded from the global np.random state.
+        each section gets its own random generator, seeded from the global np.random state, and
+        each thread uses the caller's torch thread count, so that the compiled sums add in the
+        same order as they do when a section runs alone.
         """
         if gpus_per_group >= len(devices):
             return [job(None, None) for job in jobs]
@@ -432,8 +434,10 @@ class TomographyModel(ParameterHandler):
         results = [None] * len(jobs)
         lock = threading.Lock()
         state = {'next': 0, 'failed': False}
+        num_threads = torch.get_num_threads()
 
         def run_group(group):
+            torch.set_num_threads(num_threads)
             while True:
                 with lock:
                     index = state['next']

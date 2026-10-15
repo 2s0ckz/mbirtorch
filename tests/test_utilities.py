@@ -64,3 +64,13 @@ def test_copy_keeps_the_parents_geometry_when_only_the_views_change(make_model):
         for name in ('delta_voxel', 'voxel_row_aspect', 'recon_slice_offset'):
             if name in hand_set:
                 assert float(copy.get_params(name)) == pytest.approx(hand_set[name])
+
+
+def test_copy_keeps_compile_mode_and_view_batch_size():
+    """compile_mode and view_batch_size are not parameters, so the copy must carry them itself."""
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    parent = mbirtorch.ParallelBeamModel((8, 6, 10), angles, compile_mode='off', view_batch_size=3)
+    parent.set_params(no_warning=True, verbose=0)
+    copy = mbirtorch.copy_ct_model(parent, new_num_det_rows=4, no_warning=True)
+    assert copy.compile_mode == 'off' and copy.compile_enabled is False
+    assert copy.view_batch_size == 3
