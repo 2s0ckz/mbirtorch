@@ -1053,7 +1053,7 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     inputs did not change, the copy also keeps ``recon_shape`` and ``recon_slice_offset``.
     Along each axis whose detector size or helical travel changed, ``auto_set_recon_geometry``
     sets these values again.  If ct_model has devices set with configure_devices, the copy
-    uses the same devices.
+    uses the same devices.  The copy also keeps ``compile_mode`` and ``view_batch_size``.
 
     Args:
         ct_model (TomographyModel): The model to copy.
@@ -1202,6 +1202,10 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
             warnings.warn(f"copy_ct_model: the {' and '.join(changed)} changed, so the automatic pass re-derived "
                           f"{' and '.join(lost)}, which the parent had set by hand.  Set them on the copy to keep "
                           "the parent's values, or pass no_warning=True.")
+    # compile_mode and view_batch_size are constructor arguments but not parameters, so
+    # get_all_params does not carry them.  The copy runs the way ct_model runs.
+    new_model.compile_mode = ct_model.compile_mode
+    new_model.view_batch_size = ct_model.view_batch_size
     if not ct_model.device_layout_is_automatic:
         new_model.configure_devices(devices=list(ct_model.sino_placement.devices))
     return new_model
