@@ -108,7 +108,9 @@ def test_group_rule_divides_devices_into_equal_groups():
 
 
 def test_sections_side_by_side_match_sections_run_alone():
-    """Two sections reconstructed in threads give exactly the result of each reconstructed alone."""
+    """Two sections reconstructed in threads give the result of each reconstructed alone, to
+    floating-point rounding.  The compiled sums in the step size add in an order that depends on
+    the torch thread count, so the results need not be bit-equal."""
     model, sino, weights = _small_parallel_case()
     num_rows = sino.shape[1]
     ranges = [(0, num_rows // 2 + 4), (num_rows // 2 - 4, num_rows)]
@@ -136,4 +138,4 @@ def test_sections_side_by_side_match_sections_run_alone():
     np.random.seed(0)
     together = mbirtorch.TomographyModel._run_split_sections(jobs, ['cpu', 'cpu'], 1)
     for a, t in zip(alone, together):
-        assert np.array_equal(a, t)
+        np.testing.assert_allclose(t, a, rtol=1e-5, atol=1e-6)
