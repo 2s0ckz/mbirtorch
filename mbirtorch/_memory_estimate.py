@@ -410,12 +410,15 @@ def estimate_peak_device_bytes(plan):
         """This function returns the number of pixels that one forward projection call
         receives.
 
-        If the plan sets ``pixel_batch``, the number is the smaller of ``pixel_batch`` and
-        ``num_pixels``.  Otherwise, the number is ``num_pixels``.
+        On one device, the forward projection passes every pixel to one call, so the number
+        is ``num_pixels``.  On several devices, the cylinders move between devices in
+        batches of ``pixel_batch`` pixels, so the number is the smaller of ``pixel_batch``
+        and ``num_pixels``.  When the plan has no ``pixel_batch``, the number is
+        ``num_pixels``.
         """
-        if plan.pixel_batch:
-            return min(int(num_pixels), int(plan.pixel_batch))
-        return int(num_pixels)
+        if n == 1 or not plan.pixel_batch:
+            return int(num_pixels)
+        return min(int(num_pixels), int(plan.pixel_batch))
 
     def forward_cols(i):
         """This function returns the number of slices that one forward projection receives.
