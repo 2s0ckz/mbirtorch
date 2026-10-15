@@ -51,6 +51,8 @@ The direct reconstruction methods are renamed so that every reconstruction metho
 
 ``scale_recon_shape`` still works but prints a warning.
 
+``TranslationModel.recon_fdk`` still works but prints a warning.  Its non-iterative reconstruction is now ``recon_direct_tct``.
+
 
 Devices
 -------

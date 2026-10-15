@@ -338,6 +338,29 @@ def test_cone_sharded_fdk_matches_single_device():
         assert rel < 1e-5, (shifts is None, rel)
 
 
+def test_translation_sharded_direct_recon_matches_single_device():
+    # The TCT direct reconstruction on three virtual CPU devices matches the result on one
+    # device.  The four views and the eight slices both split unevenly over three devices.
+    # The filter runs on each device's views, and the division by the translation row
+    # count runs on each device's slices.
+    import mbirtorch
+    sino_shape = (4, 20, 16)
+    tvecs = mbirtorch.gen_translation_vectors(2, 2, x_spacing=3.0, z_spacing=2.0)
+    m = mbirtorch.TranslationModel(sino_shape, tvecs, source_detector_dist=128.0,
+                                   source_iso_dist=32.0)
+    m.configure_devices(devices=["cpu"])
+    m.set_params(no_warning=True, verbose=0)
+    sino = np.random.RandomState(3).rand(*sino_shape).astype(np.float32)
+    ref = m.recon_direct_tct(sino)
+    m.configure_devices(devices=["cpu", "cpu", "cpu"])
+    out = m.recon_direct_tct(sino)
+    assert m.sino_placement.n_devices == 3 and m.recon_placement.n_devices == 3
+    assert isinstance(out, np.ndarray)
+    assert out.shape == ref.shape
+    rel = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
+    assert rel < 1e-5, rel
+
+
 def test_uneven_sharded_vcd_recon_matches_single_device():
     # The decisive uneven gate: a seeded recon with non-dividing views AND
     # slices on two virtual CPUs reproduces the single-device run (weighted

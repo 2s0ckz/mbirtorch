@@ -31,9 +31,9 @@ Constructor
 Reconstruction
 --------------
 
-``recon`` is the iterative reconstruction.  ``recon_fdk`` is the non-iterative reconstruction
-that ``recon`` uses as its starting point.
+``recon`` is the iterative reconstruction.  ``recon_direct_tct`` is the non-iterative reconstruction
+derived for the translation geometry, and ``recon`` uses it as its starting point.
 
 .. automethod:: mbirtorch.TranslationModel.recon
 
-.. automethod:: mbirtorch.TranslationModel.recon_fdk
+.. automethod:: mbirtorch.TranslationModel.recon_direct_tct
