@@ -1,9 +1,11 @@
-"""Tests of the redundancy weighting of cone-beam FDK.
+"""Tests of the redundancy weighting of cone-beam FDK and parallel-beam FBP.
 
-When the views of a circular scan do not cover a whole number of rotations, or when a helical
-scan sees each height over such a range, ``ConeBeamModel.recon_fdk`` multiplies the sinogram by
-the weights of ``redundancy_weights`` or ``helical_redundancy_weights`` before the filter.  The
-tests check the weights themselves, the detection of the scan range, and the reconstruction
+When the views of a circular scan do not cover a whole number of rotations,
+``ConeBeamModel.recon_fdk`` multiplies the sinogram by the weights of ``redundancy_weights`` before
+the filter; a helical scan keeps the FDK that scales each slice by its view coverage.  When the
+views of a parallel-beam scan do not cover a whole number of half rotations,
+``ParallelBeamModel.recon_fbp`` does the same with its own ``redundancy_weights`` (fan angle zero).
+The tests check the weights themselves, the detection of the scan range, and the reconstruction
 of an off-center object against the reconstruction from a full rotation.
 """
 
@@ -33,10 +35,13 @@ _OVERSCAN_MIN_IMPROVEMENT = 1.2
 # The sum of the weights of the measurements of one line, on a fine scan, within this
 # tolerance of its exact value.
 _REDUNDANCY_TOL = 1e-3
-# The helical tests use this many views per rotation and this many rotations.
+# The helical test uses this many views per rotation and this many rotations.
 _HELICAL_VIEWS_PER_ROTATION = 72
 _HELICAL_ROTATIONS = 4
 _HELICAL_NUM_ROWS = 16
+# The plain FBP of a parallel-beam scan over a range that is not a whole number of half rotations
+# must be worse than the weighted FBP by at least this factor.
+_PARALLEL_MIN_IMPROVEMENT = 1.2
 
 
 def _model(angles, device, helical_z_shifts=None):
@@ -202,48 +207,17 @@ def _helical_model(pitch, device):
     return _model(angles, device, helical_z_shifts=z_shifts)
 
 
-def _covered_slices(model):
-    """The slices that the helical scan sees over the whole range of one height."""
-    num_rows = int(model.get_params('sinogram_shape')[1])
-    det_height_iso = num_rows * model.get_params('delta_det_row') / model.get_magnification()
-    z_shifts = np.asarray(model.get_params('view_params_array'))[:, 1]
-    z_k = model.recon_slice_z()
-    covered = (z_k >= z_shifts.min() + 0.5 * det_height_iso) \
-        & (z_k <= z_shifts.max() - 0.5 * det_height_iso)
-    indices = np.flatnonzero(covered)
-    assert indices.size >= 2
-    return slice(int(indices[0]), int(indices[-1]) + 1)
-
-
-@pytest.mark.parametrize('pitch', [1.0, 1.5, 0.8])
-def test_helical_fdk_weights(device, pitch):
-    """At pitch 1 each height is seen over one rotation and no weights apply.  At pitch 1.5
-    (a short scan per height) and at pitch 0.8 (one and a quarter rotations per height) the
-    weights bring the FDK of the covered slices to the accuracy of a circular full rotation,
-    and the plain FDK is worse."""
+@pytest.mark.parametrize('pitch', [1.5, 0.8])
+def test_helical_fdk_has_no_redundancy_weights(device, pitch):
+    """A helical scan gets no redundancy weights: its FDK, which scales each slice by its view
+    coverage, is the same with and without ``redundancy_weighting``."""
     helical = _helical_model(pitch, device)
-    if pitch == 1.0:
-        assert helical.helical_redundancy_weights() is None
-        return
-    weights = helical.helical_redundancy_weights()
-    assert weights.shape == (_HELICAL_NUM_ROWS, _NUM_CHANNELS) and np.all(weights >= 0)
+    assert not hasattr(helical, 'helical_redundancy_weights')
     phantom = _off_center_object(helical)
     sinogram = helical.forward_project(phantom)
-    covered = _covered_slices(helical)
-    weighted_error = _relative_error(helical.recon_fdk(sinogram), phantom, covered)
-    plain_error = _relative_error(helical.recon_fdk(sinogram, redundancy_weighting=False),
-                                  phantom, covered)
-    # The circular reference: a full rotation of the same geometry and volume.
-    num_views = _HELICAL_VIEWS_PER_ROTATION
-    circular = _model(_views(num_views, 0.0, 2 * np.pi), device,
-                      helical_z_shifts=np.zeros(num_views))
-    circular.set_params(recon_shape=helical.get_params('recon_shape'),
-                        recon_slice_offset=helical.get_params('recon_slice_offset'))
-    reference_error = _relative_error(circular.recon_fdk(circular.forward_project(phantom)),
-                                      phantom, covered)
-    assert weighted_error < reference_error + _WEIGHTED_MARGIN, (weighted_error, reference_error)
-    assert plain_error > _OVERSCAN_MIN_IMPROVEMENT * weighted_error, (plain_error,
-                                                                      weighted_error)
+    weighted = np.asarray(helical.recon_fdk(sinogram))
+    plain = np.asarray(helical.recon_fdk(sinogram, redundancy_weighting=False))
+    assert np.array_equal(weighted, plain)
 
 
 def test_recon_fdk_leaves_the_input_unchanged(device):
@@ -254,3 +228,80 @@ def test_recon_fdk_leaves_the_input_unchanged(device):
     before = sinogram.clone()
     model.recon_fdk(sinogram)
     assert torch.equal(sinogram, before)
+
+
+# ---- parallel-beam FBP ----------------------------------------------------------------------------
+
+
+def _parallel_model(angles, device):
+    model = mbirtorch.ParallelBeamModel((len(angles), _NUM_ROWS, _NUM_CHANNELS), angles)
+    model.configure_devices(devices=[device])
+    model.set_params(no_warning=True, verbose=0)
+    return model
+
+
+def test_parallel_scan_range_and_whole_half_rotations(device):
+    """A whole number of half rotations has no weights; 1.3 and 2.6 half rotations have a weight
+    for every view and channel, the same in every channel."""
+    for halves in (1, 2, 3):
+        model = _parallel_model(_views(_NUM_VIEWS * halves, 0.3, halves * np.pi), device)
+        assert model.get_scan_range() == pytest.approx(halves * np.pi, rel=1e-6)
+        assert model.redundancy_weights() is None
+    for halves in (1.3, 2.6):
+        model = _parallel_model(_views(int(_NUM_VIEWS * halves), 0.3, halves * np.pi), device)
+        weights = model.redundancy_weights()
+        assert weights.shape == (int(_NUM_VIEWS * halves), _NUM_CHANNELS) and weights.dtype == np.float32
+        assert np.all(weights >= 0) and np.all(np.isfinite(weights))
+        assert np.all(weights == weights[:, :1])
+
+
+def test_parallel_too_short_scan_warns(device):
+    """A parallel-beam scan shorter than 180 degrees gets no weights and a warning."""
+    model = _parallel_model(_views(_NUM_VIEWS, 0.0, 0.8 * np.pi), device)
+    with pytest.warns(UserWarning, match='less than 180 degrees'):
+        assert model.redundancy_weights() is None
+
+
+@pytest.mark.parametrize('halves', [1.3, 2.6])
+def test_parallel_weights_of_one_line_add_to_one(device, halves):
+    """On a fine scan, the weights of all the measurements of a line (at beta + n pi) add up to the
+    factor scan_range / pi."""
+    num_views = 3000
+    scan_range = halves * np.pi
+    model = _parallel_model(_views(num_views, 0.0, scan_range), device)
+    weights = model.redundancy_weights().astype(np.float64)[:, 0]
+    beta = (np.arange(num_views) + 0.5) * scan_range / num_views
+    total = np.zeros(num_views)
+    for n in range(-3, 4):
+        same = beta + np.pi * n
+        inside = (same >= 0) & (same <= scan_range)
+        total += np.where(inside, np.interp(same, beta, weights), 0.0)
+    keep = (beta > scan_range / num_views) & (beta < scan_range - scan_range / num_views)
+    assert np.allclose(total[keep], scan_range / np.pi, atol=_REDUNDANCY_TOL)
+
+
+@pytest.mark.parametrize('halves', [1.4, 2.5])
+def test_parallel_fbp_matches_half_rotation(device, halves):
+    """FBP of 1.4 and 2.5 half rotations with the weights reconstructs an off-center object as well
+    as FBP of 180 degrees, and better than the plain FBP of the same views."""
+    half = _parallel_model(_views(_NUM_VIEWS, 0.0, np.pi), device)
+    phantom = _off_center_object(half)
+    reference_error = _interior_error(half.recon_fbp(half.forward_project(phantom)), phantom)
+    num_views = int(round(_NUM_VIEWS * halves))
+    model = _parallel_model(_views(num_views, 0.0, halves * np.pi), device)
+    sinogram = model.forward_project(phantom)
+    weighted_error = _interior_error(model.recon_fbp(sinogram), phantom)
+    plain_error = _interior_error(model.recon_fbp(sinogram, redundancy_weighting=False), phantom)
+    assert weighted_error < reference_error + _WEIGHTED_MARGIN, (weighted_error, reference_error)
+    assert plain_error > _PARALLEL_MIN_IMPROVEMENT * weighted_error, (plain_error, weighted_error)
+
+
+def test_recon_fbp_leaves_the_input_unchanged(device):
+    """The weighting makes a new tensor and does not change the caller's sinogram."""
+    model = _parallel_model(_views(_NUM_VIEWS, 0.0, 1.4 * np.pi), device)
+    phantom = _off_center_object(model)
+    sinogram = torch.as_tensor(model.forward_project(phantom), device=model.torch_device)
+    before = sinogram.clone()
+    model.recon_fbp(sinogram)
+    assert torch.equal(sinogram, before)
+
